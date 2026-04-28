@@ -119,11 +119,14 @@ def main() -> None:
     parser.add_argument("--fused-smem-online-full-width-check-only", action="store_true")
     parser.add_argument("--fused-smem-online-split-full-width-check-only", action="store_true")
     parser.add_argument("--fused-smem-online-split-k128-full-width-check-only", action="store_true")
+    parser.add_argument("--fused-tma-pv-online-split-k128-full-width-check-only", action="store_true")
+    parser.add_argument("--fused-tma-qk-tma-pv-online-split-k128-full-width-check-only", action="store_true")
     parser.add_argument("--fused-tma-qk-pv-128-check-only", action="store_true")
     parser.add_argument("--fused-tma-qk-tma-pv-128-check-only", action="store_true")
     parser.add_argument("--fused-smem-online-kv-tiles", type=int, default=4)
     parser.add_argument("--fused-smem-online-splits", type=int, default=8)
     parser.add_argument("--fused-smem-online-q-tiles", type=int, default=1)
+    parser.add_argument("--fused-split-kernel-only", action="store_true")
     parser.add_argument("--smem-atom-data-mode", type=int, default=0)
     parser.add_argument("--smem-atom-scale-mode", type=int, default=0)
     parser.add_argument("--smem-atom-ones", action="store_true")
@@ -837,8 +840,14 @@ def main() -> None:
     if (
         args.fused_smem_online_split_full_width_check_only
         or args.fused_smem_online_split_k128_full_width_check_only
+        or args.fused_tma_pv_online_split_k128_full_width_check_only
+        or args.fused_tma_qk_tma_pv_online_split_k128_full_width_check_only
     ):
-        use_k128 = args.fused_smem_online_split_k128_full_width_check_only
+        use_tma_pv = (
+            args.fused_tma_pv_online_split_k128_full_width_check_only
+            or args.fused_tma_qk_tma_pv_online_split_k128_full_width_check_only
+        )
+        use_k128 = args.fused_smem_online_split_k128_full_width_check_only or use_tma_pv
         num_splits = args.fused_smem_online_splits
         q_tiles = args.fused_smem_online_q_tiles
         kv_tile_tokens = 128 if use_k128 else 256
@@ -855,6 +864,20 @@ def main() -> None:
         v_ref_f32 = nvfp4_rowmajor_to_fp32(v, v_scales)
         v_pv, v_pv_scales = fp32_to_nvfp4_rowmajor(v_ref_f32.T.contiguous())
         v_pv_ref_f32 = nvfp4_rowmajor_to_fp32(v_pv, v_pv_scales)
+        v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = quantize_cutlass(
+            v_ref_f32.T.contiguous().to(torch.bfloat16)
+        )
+        q_cutlass = q_cutlass_scales = qk_alpha = None
+        k_cutlass = k_cutlass_scales = None
+        if use_tma_pv:
+            q_cutlass, q_cutlass_scales, q_cutlass_global = quantize_cutlass(
+                q.reshape(Q_LEN * GROUP, HEAD_DIM)
+            )
+            k_cutlass, k_cutlass_scales, k_cutlass_global = quantize_cutlass(
+                k_ref_f32.to(torch.bfloat16)
+            )
+            qk_alpha = 1.0 / (q_cutlass_global * k_cutlass_global)
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
         partial_out = torch.empty(
             (q_tiles, num_splits, 128, HEAD_DIM),
             device=device,
@@ -865,36 +888,113 @@ def main() -> None:
         )
         partial_l = torch.empty_like(partial_m)
         pv_scratch = torch.empty(
-            (q_tiles, num_splits, 128, 128), device=device, dtype=torch.float32
+            (q_tiles, num_splits, 128, HEAD_DIM)
+            if use_tma_pv
+            else (q_tiles, num_splits, 128, 128),
+            device=device,
+            dtype=torch.float32,
         )
         fused_split = torch.empty((q_rows, HEAD_DIM), device=device, dtype=torch.float32)
-        split_kernel = (
-            ext.fused_cutlass_smem_online_full_width_split_k128
-            if use_k128
-            else ext.fused_cutlass_smem_online_full_width_split
-        )
-        split_kernel(
-            q_actual,
-            q_scales_actual,
-            k,
-            k_scales,
-            v_pv,
-            v_pv_scales,
-            partial_out,
-            partial_m,
-            partial_l,
-            pv_scratch,
-            fused_split,
-            num_splits,
-            q_tiles,
-        )
+        if use_tma_pv:
+            split_kernel = ext.fused_cutlass_tma_qk_tma_pv_online_full_width_split_k128
+
+            def run_split_kernel() -> None:
+                split_kernel(
+                    q_cutlass,
+                    q_cutlass_scales,
+                    k_cutlass,
+                    k_cutlass_scales,
+                    v_pv_cutlass,
+                    v_pv_cutlass_scales,
+                    partial_out,
+                    partial_m,
+                    partial_l,
+                    pv_scratch,
+                    fused_split,
+                    workspace,
+                    float(qk_alpha.item()),
+                    float((1.0 / v_pv_cutlass_global).item()),
+                    num_splits,
+                    q_tiles,
+                )
+
+        else:
+            split_kernel = (
+                ext.fused_cutlass_smem_online_full_width_split_k128
+                if use_k128
+                else ext.fused_cutlass_smem_online_full_width_split
+            )
+
+            def run_split_kernel() -> None:
+                split_kernel(
+                    q_actual,
+                    q_scales_actual,
+                    k,
+                    k_scales,
+                    v_pv,
+                    v_pv_scales,
+                    partial_out,
+                    partial_m,
+                    partial_l,
+                    pv_scratch,
+                    fused_split,
+                    num_splits,
+                    q_tiles,
+                )
+
+        run_split_kernel()
         torch.cuda.synchronize()
+        split_backend = (
+            "tma_qk_tma_pv_128tile_partials"
+            if use_tma_pv
+            else ("smem_k128_online" if use_k128 else "smem_k256_online")
+        )
+
+        if args.fused_split_kernel_only:
+            result = {
+                "fused_split_kernel_only": True,
+                "fused_split_backend": split_backend,
+                "fused_smem_online_split_full_width_tile_k": kv_tile_tokens,
+                "fused_smem_online_split_full_width_tma_pv": use_tma_pv,
+                "fused_smem_online_split_full_width_splits": num_splits,
+                "fused_smem_online_split_full_width_q_tiles": q_tiles,
+                "fused_smem_online_split_full_width_finite": bool(
+                    torch.isfinite(fused_split).all().item()
+                ),
+                "fused_smem_online_split_full_width_min": float(
+                    fused_split.min().item()
+                ),
+                "fused_smem_online_split_full_width_max": float(
+                    fused_split.max().item()
+                ),
+                "partial_m_finite": bool(torch.isfinite(partial_m).all().item()),
+                "partial_l_finite": bool(torch.isfinite(partial_l).all().item()),
+            }
+            print(result)
+            return
 
         online_ref = torch.zeros_like(fused_split)
         online_m = torch.full((q_rows, 1), -float("inf"), device=device)
         online_l = torch.zeros((q_rows, 1), device=device)
         q_ref = q_actual_f32[:q_rows].float()
         v_ref_all = v_pv_ref_f32.float()
+        qk_ref_scores = None
+        if use_tma_pv:
+            qk_ref_scores = torch.empty(
+                (q_rows, kv_tokens), device=device, dtype=torch.bfloat16
+            )
+            tactic = min(2, int(metadata["runner_tactic_count"]) - 1)
+            ext.cutlass_runner_fp4_gemm(
+                q_cutlass[:q_rows].contiguous(),
+                k_cutlass.contiguous(),
+                q_cutlass_scales[:q_rows].contiguous(),
+                k_cutlass_scales.contiguous(),
+                qk_alpha,
+                qk_ref_scores,
+                workspace,
+                tactic,
+            )
+            torch.cuda.synchronize()
         for split in range(num_splits):
             split_start_tile = split * (total_kv_tiles // num_splits)
             split_end_tile = split_start_tile + (total_kv_tiles // num_splits)
@@ -904,10 +1004,13 @@ def main() -> None:
             for tile in range(split_start_tile, split_end_tile):
                 start = tile * kv_tile_tokens
                 end = start + kv_tile_tokens
-                scores = (
-                    torch.matmul(q_ref, k_ref_f32[start:end].float().T)
-                    / (HEAD_DIM**0.5)
-                )
+                if qk_ref_scores is None:
+                    scores = (
+                        torch.matmul(q_ref, k_ref_f32[start:end].float().T)
+                        / (HEAD_DIM**0.5)
+                    )
+                else:
+                    scores = qk_ref_scores[:, start:end].float() / (HEAD_DIM**0.5)
                 tile_m = scores.amax(dim=-1, keepdim=True)
                 new_m = torch.maximum(split_m, tile_m)
                 alpha = torch.where(
@@ -960,7 +1063,9 @@ def main() -> None:
             min=1.0e-20,
         )
         result = {
+            "fused_split_backend": split_backend,
             "fused_smem_online_split_full_width_tile_k": kv_tile_tokens,
+            "fused_smem_online_split_full_width_tma_pv": use_tma_pv,
             "fused_smem_online_split_full_width_splits": num_splits,
             "fused_smem_online_split_full_width_q_tiles": q_tiles,
             "fused_smem_online_split_full_width_finite": bool(
@@ -983,25 +1088,14 @@ def main() -> None:
             ),
         }
         if args.bench:
-            result["bench_fused_smem_online_split_full_width"] = event_ms(
-                lambda: split_kernel(
-                    q_actual,
-                    q_scales_actual,
-                    k,
-                    k_scales,
-                    v_pv,
-                    v_pv_scales,
-                    partial_out,
-                    partial_m,
-                    partial_l,
-                    pv_scratch,
-                    fused_split,
-                    num_splits,
-                    q_tiles,
-                ),
+            bench_result = event_ms(
+                run_split_kernel,
                 warmup=args.warmup,
                 repeat=args.repeat,
             )
+            result["bench_fused_smem_online_split_full_width"] = bench_result
+            if use_tma_pv:
+                result["bench_fused_tma_qk_tma_pv_split_full_width"] = bench_result
         print(result)
         return
     if args.smem_atom_check_only:
@@ -1803,6 +1897,7 @@ def main() -> None:
                 min=1.0e-20,
             )
             qk_collective_result = {
+                "qk_collective_tile_k": 256,
                 "qk_collective_finite": bool(
                     torch.isfinite(qk_collective_scaled).all().item()
                 ),
@@ -1815,16 +1910,17 @@ def main() -> None:
                 "qk_collective_vs_official_cosine": float(qk_collective_cos.item()),
             }
             if args.bench:
+                bench_fn = lambda: ext.qk_cutlass_collective_tile(
+                    q_cutlass,
+                    q_cutlass_scales,
+                    k_cutlass,
+                    k_cutlass_scales,
+                    qk_collective_tile,
+                    workspace,
+                    0,
+                )
                 qk_collective_result["bench_qk_collective_tile"] = event_ms(
-                    lambda: ext.qk_cutlass_collective_tile(
-                        q_cutlass,
-                        q_cutlass_scales,
-                        k_cutlass,
-                        k_cutlass_scales,
-                        qk_collective_tile,
-                        workspace,
-                        0,
-                    ),
+                    bench_fn,
                     warmup=args.warmup,
                     repeat=args.repeat,
                 )

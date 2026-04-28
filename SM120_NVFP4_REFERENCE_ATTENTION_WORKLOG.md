@@ -3376,3 +3376,427 @@ bug less likely. The next useful target is the B/SFB TMA handoff into the K128
 PV collective, or a schedule/consumer assumption exposed only by mixed
 manual-A/TMA-B staging.
 ```
+
+Ran a no-compile output-structure diagnostic on the restored TMA-PV baseline.
+The failure is not a simple output-column permutation:
+
+```text
+TMA-PV vs reference:
+  mean_abs: 0.009541299194097519
+  cosine:   0.6998529434204102
+
+column correlation:
+  identity mean/min/max: 0.30165398120880127 / -0.2583620250225067 / 0.7311226725578308
+  best mean/min/max:     0.43719106912612915 / 0.0 / 0.7311226725578308
+```
+
+The stronger signal is 16-column structure in the output magnitude. TMA-PV
+nearly zeros every even 16-column group and matches the smem-PV baseline in
+every odd 16-column group:
+
+```text
+mean(abs(TMA col group)) / mean(abs(smem col group)), 32 groups of 16 columns:
+[0.008, 1.016, 0.007, 1.004, 0.009, 1.019, 0.008, 1.015,
+ 0.008, 0.992, 0.008, 1.016, 0.008, 1.011, 0.008, 0.980,
+ 0.008, 1.027, 0.007, 0.993, 0.008, 1.021, 0.007, 1.001,
+ 0.005, 0.995, 0.008, 0.995, 0.007, 1.013, 0.008, 0.997]
+```
+
+Conclusion:
+
+```text
+The TMA-PV error has scale-vector granularity: 16 output columns at a time.
+That strongly implicates the B/SFB side of the PV collective, especially the
+SFB scale-factor TMA path or its N-axis interpretation. It is not random numeric
+drift and not a simple output-column permutation.
+```
+
+Tried an isolation patch that TMA-loaded only B data while manually staging SFB
+from row-major V scales. This would have tested whether the SFB TMA path alone
+causes the even-16-column zeros. Both compile attempts timed out while CPU-active:
+
+```text
+attempt 1: timeout 900s
+attempt 2: timeout 1200s after simplifying B-only transaction bytes to literal 8192
+```
+
+Conclusion:
+
+```text
+Reject this isolation patch as an iteration vehicle. It changes the heavyweight
+CUTLASS helper body/signature enough to produce multi-15-minute rebuilds without
+returning a result. Keep the restored baseline and use lighter diagnostics for
+SFB layout/coordinate work.
+```
+
+Tried a one-line transaction-byte diagnostic to test whether
+`tma_transaction_bytes_nk` under-waits the B/SFB TMA transaction:
+
+```text
+pipeline_params.transaction_bytes = tma_transaction_bytes_nk + 8192
+```
+
+This also timed out at 900s while CPU-active in the extension rebuild.
+
+Conclusion:
+
+```text
+No correctness conclusion from this patch. The full
+sm120_nvfp4_cutlass_fused_attention.cu translation unit is now too expensive
+for microdiagnostics in this edit/test loop. Reverted the one-line change.
+Future SFB/TMA diagnostics should use either host-side layout analysis or a
+smaller purpose-built translation unit instead of rebuilding the full fused
+prototype.
+```
+
+Tested a producer-convergence patch that inserted `__syncwarp()` immediately
+before `collective.load_tail(pipeline, pipe_write)` in the hand-coded TMA-V/SFB
+producer:
+
+```text
+fused_tma_qk_tma_pv_128_mean_abs: 0.009540933184325695
+fused_tma_qk_tma_pv_128_max_abs:  0.06659644097089767
+fused_tma_qk_tma_pv_128_cosine:   0.6998542547225952
+tma_vs_smem_mean_abs:             0.009212853386998177
+bench mean_ms:                    0.08429280072450637
+```
+
+This is identical to the restored baseline.
+
+Conclusion:
+
+```text
+Reject the added __syncwarp(). The PV TMA failure is not caused by missing warp
+convergence before load_tail in this producer. Reverted the patch. Continue with
+SFB/TMA layout or a smaller isolation translation unit.
+```
+
+Checked the CUTLASS cooperative launch geometry from the compiled extension:
+
+```text
+QK  ThreadCount:              256
+QK  kernel block threads:     384
+K128 ThreadCount:             256
+K128 kernel block threads:    384
+```
+
+`ThreadCount` is the MMA consumer thread count. `get_block_shape().x` adds the
+extra producer warpgroup. The fused TMA-QK/TMA-PV launcher already uses
+`CutlassGemmKernel::get_block_shape()`, so the 16-column alternating failure is
+not simply caused by launching only the 256 MMA threads.
+
+Fixed the TMA-PV correctness fault. The bug was not in TMA/SFB data movement; it
+was in the output-fragment coordinate mapping. `collective.mma()` receives
+`mma_thread_idx = threadIdx.x % ThreadCount`, but the TMA-PV helper wrote output
+through a `thread_mma` built from `thread_idx`, where the extra producer
+warpgroup caused threads 256-383 to be mapped to thread 0. The second consumer
+warpgroup computed valid accumulators but wrote them through the wrong
+C-fragment coordinates, producing the alternating 16-column output holes.
+
+Patch:
+
+```text
+use tiled_mma.get_thread_slice(mma_thread_idx) for the consumer output mapping
+inside cutlass_smem_pv_k128_reuse_p_tma_v_full_width_body()
+```
+
+Result:
+
+```text
+fused_tma_qk_tma_pv_128_finite:   True
+fused_tma_qk_tma_pv_128_mean_abs: 0.002146251266822219
+fused_tma_qk_tma_pv_128_max_abs:  0.011889606714248657
+fused_tma_qk_tma_pv_128_cosine:   0.9945906400680542
+
+smem_pv_reference_mean_abs:       0.0020574606023728848
+tma_vs_smem_mean_abs:             0.0004941504448652267
+tma_vs_smem_max_abs:              0.0028809793293476105
+
+bench min_ms:                     0.08649600297212601
+bench mean_ms:                    0.08858079984784126
+bench max_ms:                     0.09759999811649323
+```
+
+Conclusion:
+
+```text
+TMA V/SFB staging is now correct for the fixed 128-token Shape-B tile. The
+TMA-PV path is ~1.45x faster than the prior correct smem-PV baseline
+(~0.0886 ms vs ~0.1297 ms) while preserving the same numerical error envelope.
+The next step is scaling this from the one-tile correctness/perf reference into
+the split/full Shape-B path, then measuring against FP8 FA2 cells.
+```
+
+Added a first split-K scaffold that combines:
+
+```text
+QK: existing manual-smem K128 block-scaled QK helper
+PV: corrected CUTLASS TMA V/SFB helper
+```
+
+This was intended to reuse the now-correct TMA-PV primitive while preserving the
+existing online-softmax split/reduction structure.
+
+Results:
+
+```text
+8 splits:    kernel pegged GPU and produced no output; killed after several minutes
+256 splits:  kernel-only path also pegged GPU and produced no output; killed
+```
+
+Conclusion:
+
+```text
+Reject the mixed-helper split scaffold in its current form. The manual-smem QK
+helper was built around a 256-thread MMA CTA, while the CUTLASS TMA-PV helper
+uses the 384-thread cooperative CUTLASS launch shape with an extra producer
+warpgroup. Combining them inside one CTA is not a valid production direction
+unless the QK side is made explicitly 384-thread cooperative-safe.
+
+The cleaner next implementation is a full cooperative TMA-QK + TMA-PV split
+kernel, using the same CUTLASS cooperative launch geometry for both phases.
+The fixed 128-token TMA-QK/TMA-PV kernel already proves that geometry works.
+```
+
+Implemented the full cooperative split rewrite:
+
+```text
+QK: CUTLASS TMA-QK body with CUTLASS-layout Q/K and qk_alpha
+PV: corrected CUTLASS TMA-V/SFB body
+launch: CUTLASS cooperative 384-thread block shape
+```
+
+Kernel-only result for the smallest full-surface split configuration:
+
+```text
+num_splits=256, split_kv_tiles=1, q_tiles=1
+```
+
+The run still pegged GPU2 and produced no output after the extension compiled;
+it was killed rather than letting the 900s timeout expire.
+
+Conclusion:
+
+```text
+The previous row-major-input bug and mixed 256/384-thread helper geometry were
+real issues, but they were not the only hang. The next fault is specific to
+using the cooperative TMA helper bodies across a multi-CTA split grid. The fixed
+one-CTA 128-token TMA-QK/TMA-PV kernel remains correct, so the next isolation
+point is grid behavior and helper assumptions that differ between one CTA and
+256 CTAs.
+```
+
+Added a uniform debug-return stage switch to the split TMA-QK/TMA-PV kernel.
+Results on `num_splits=256, split_kv_tiles=1, q_tiles=1`:
+
+```text
+stage 1, after init:              returns
+stage 2, after TMA-QK:            returns
+stage 3, after softmax/P quant:   returns
+stage 4, after one TMA-PV call:   hangs
+```
+
+Then checked the fixed one-tile TMA-QK/TMA-PV wrapper at nonzero KV tile
+indices:
+
+```text
+kv_tile_128 = 0, 1, 2, 255: all finite and return
+```
+
+Conclusion:
+
+```text
+The split hang is inside the TMA-PV helper when called from the split kernel
+body, but it is not a simple nonzero-KV-tile coordinate bug. The fixed one-tile
+wrapper can call the same TMA-PV helper for nonzero tile indices. The next
+difference to isolate is the split storage/body state around the PV call:
+scratch/output pointer, shared-storage reuse, row-state arrays, or the fact that
+the split body is using the helper after additional online-softmax state work.
+```
+
+Removed the dead inline online split kernel and replaced the split path with a
+stable per-128-token partial kernel derived directly from the known-good fixed
+TMA-QK/TMA-PV 128-token body:
+
+```text
+grid:    one CTA per (q_tile, kv_tile_128)
+QK:      CUTLASS TMA-QK
+softmax: local 128-token row max/sum
+PV:      corrected CUTLASS TMA-V/SFB
+output:  unnormalized partial_out plus partial_m/partial_l
+reduce:  existing row-wise split reducer
+```
+
+This intentionally gives up multi-KV-tile online accumulation inside one CTA for
+now, but keeps the important fused property inside each 128-token tile: QK,
+softmax/P quantization, and PV do not round-trip QK or P through HBM.
+
+Results:
+
+```text
+q_tiles=1,  num_splits=256: finite, mean_abs vs quant 3.6548e-05, cosine 0.999511, mean 0.1892 ms
+q_tiles=4,  num_splits=256: finite, mean_abs vs quant 3.6539e-05, cosine 0.999512, mean 0.6304 ms
+q_tiles=32, num_splits=256: finite, mean_abs vs quant 3.6521e-05, cosine 0.999512, mean 4.1239 ms
+```
+
+For the Shape-B q_len=512 / kv_len=32768 cell (`q_tiles=32`), this per-tile
+TMA-QK/TMA-PV partial baseline is already below the prior FP8 FA2 comparison
+number recorded for this cell (~5.01 ms), while preserving correctness against
+the quantized reference.
+
+Next optimization target:
+
+```text
+The current baseline writes one 128x512 float partial per KV tile and reduces
+256 partials. That is correct and already competitive, but it pays a large HBM
+partial-output round trip. The next ceiling-seeking step is to group multiple
+KV tiles per CTA or per cooperative work unit and do online accumulation before
+writing partial_out, without reintroducing the helper deadlock.
+```
+
+## Corrected Shape-B Success Bar: Two-Stage CUTLASS, Not FP8 FA2
+
+The current production bar for Shape B `q_len=512, kv_len=32768, D=512,
+group=8` is the in-tree two-stage CUTLASS NVFP4 reference, not the older FP8
+FA2 comparison point.
+
+```text
+two-stage CUTLASS NVFP4 reference: ~0.634 ms
+current per-128-token fused partial: 4.1239 ms
+gap: ~6.5x too slow
+```
+
+Conclusion:
+
+```text
+The stable per-128-token TMA-QK/TMA-PV path is a correctness scaffold and a
+diagnostic harness. It is not a shippable ceiling path for Shape B unless the
+partial-output/reduction architecture is eliminated or collapsed enough to beat
+the two-stage CUTLASS reference. If grouped partials do not materially close the
+4.1239 ms -> 0.634 ms gap, the next implementation must move to a
+CUTLASS-granularity fused FMHA mainloop rather than continuing to tune the
+partial-HBM scaffold.
+```
+
+Grouped partial attempt:
+
+```text
+num_splits=128, q_tiles=1, group_kv_tiles=2
+first launch: cudaErrorLaunchOutOfResources
+after removing the extra row_alpha shared-memory array: launched, then pegged
+GPU2 at 100% with no output for >30s; killed
+```
+
+Conclusion:
+
+```text
+Reject grouped partials as the next ceiling path. The grouped CTA still calls
+the cooperative TMA-PV helper more than once from the same CTA body and returns
+to the same dead/pathological behavior seen in earlier inline split attempts.
+Even if that were fixed, this architecture still writes global partial_out and
+pv_scratch and cannot plausibly close a 6.5x gap to the two-stage CUTLASS
+reference.
+
+The active implementation must now move to CUTLASS-granularity fused FMHA:
+producer/consumer mainloop, CUTLASS/CuTe atom-level block-scaled MMA, online
+softmax between QK and PV, and on-chip P tile reuse. The per-128-token partial
+path remains only a correctness harness for QK/P-quant/PV components.
+```
+
+## CUTLASS FMHA Reference Re-Check After Grouped Rejection
+
+Fetched `flashinfer-ai/flashinfer#2598` into `origin/pr/2598` for source
+inspection. The PR itself only changes backend selection in `prefill.py` and
+`utils.py`. Do not use PR #2598's CuTe DSL stack as the implementation
+template for this SM120 C++ kernel.
+
+The CuTe DSL files are useful only as a high-level confirmation that modern
+Blackwell FMHA is role-based:
+
+```text
+flashinfer/cute_dsl/attention/prefill.py
+flashinfer/cute_dsl/attention/mainloop_spec.py
+flashinfer/cute_dsl/attention/roles/mma.py
+```
+
+The useful implementation facts for the C++ SM120 path:
+
+```text
+- The working Blackwell FMHA structure is role-based:
+  loader, MMA, softmax, correction, epilogue.
+- QK and PV are not composed as two GEMM collectives. The MMA role calls two
+  atom-level GEMM primitives inside one interleaved mainloop.
+- The mainloop owns pipeline state across the full KV loop. Re-initializing
+  CUTLASS cooperative pipeline storage inside repeated helper calls is exactly
+  the failure mode seen in grouped partials.
+```
+
+The CuTe DSL code is still not directly portable to the current target because
+it is TCGEN/TMEM-oriented Blackwell code. The SM120 C++ path must use the
+`mma.sync.aligned.kind::mxf4nvf4.block_scale` / CUTLASS
+`OpClassBlockScaledTensorOp` atom path instead of TCGEN05/TMEM.
+
+Primary implementation references remain:
+
+```text
+3rdparty/cutlass/examples/77_blackwell_fmha/collective/
+3rdparty/cutlass/examples/88_hopper_fmha/collective/fmha_collective_tma.hpp
+3rdparty/cutlass/examples/88_hopper_fmha/collective/fmha_collective_softmax.hpp
+include/flashinfer/attention/blackwell/fmha_cutlass_sm100.cuh
+```
+
+Next C++ implementation rule:
+
+```text
+Do not call the existing TMA-PV helper repeatedly inside one CTA. Build a
+single owner mainloop whose pipeline state lives across the whole KV loop, then
+call QK MMA, online softmax/P quant, and PV MMA from that mainloop.
+```
+
+## Rejected PV Pipeline-State Probe
+
+2026-04-28T00:00:00-05:00
+
+Tried a bounded structural cleanup inside
+`cutlass_smem_pv_k128_reuse_p_tma_v_full_width_body`: construct the SM120
+`MainloopPipeline` once for the four PV output-column groups and advance
+producer/consumer pipe states across the group loop, matching the persistent
+state convention in Examples 77/88 more closely than the current helper body.
+
+Results on the Shape-B q_tiles=1 / 256-split TMA-QK/TMA-PV scaffold:
+
+```text
+persistent PV pipe, no per-group load_tail:
+  finite: true
+  mean_abs vs quant: 8.6563e-04
+  cosine vs quant:   0.5478
+  mean_ms:           0.1916
+
+persistent PV pipe, per-group load_tail restored:
+  finite: true
+  mean_abs vs quant: 8.6563e-04
+  cosine vs quant:   0.5478
+  mean_ms:           0.1881
+
+restored helper-local PV pipe baseline:
+  finite: true
+  mean_abs vs quant: 5.9492e-04
+  cosine vs quant:   0.7119
+  mean_ms:           0.1733
+```
+
+Conclusion:
+
+```text
+Do not carry this cleanup forward. Moving only the PV pipeline object/state out
+of the output-group loop regresses both correctness and wall time, even when
+the per-group producer tail is restored. This confirms that the helper-level
+TMA-PV embedding is not the right abstraction boundary for the real fused
+kernel.
+
+The earlier high-cosine per-128-token numbers in this worklog refer to the
+smem/atom split scaffold, not the embedded TMA-QK/TMA-PV partial scaffold.
+The TMA-QK/TMA-PV scaffold remains useful for validating embedded CUTLASS
+pieces and launch mechanics, but it is not the correctness or performance
+target.
+```
