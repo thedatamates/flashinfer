@@ -6086,3 +6086,18 @@ softmax lane has not read. The correct port is to remove the full BF16 score
 tile as a durable object and stage P through the same lifetime boundary that
 77 uses for S/P, not to add another side buffer.
 ```
+
+Rejected follow-up:
+
+```text
+Tried to port SM100-style setmaxnreg role reconfiguration for the active
+SM120 role kernel. The extension built, but the runtime gate hung with no
+nvcc/ptxas/ninja active, so the process was in-kernel. The port was removed.
+
+Interpretation: copying SM100's register reconfiguration mechanically is not
+valid for this SM120 benchmark shape yet. The SM120 CTA has 22 warps, an
+8-warp register-accumulator MMA role, and a partial load/epilogue warpgroup;
+the SM100 path uses TMEM for O and a different role/register pressure model.
+Register reconfiguration should be revisited only after the S/P/PV lifetime
+matches the reference more closely.
+```
