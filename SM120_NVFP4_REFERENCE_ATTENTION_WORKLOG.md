@@ -5761,3 +5761,64 @@ MMA->softmax handoff by moving the QK accumulator into a register/logit handoff
 that feeds softmax/P quantization without materializing the full 128x128 BF16
 score tile through shared memory.
 ```
+
+### Rejected: Direct PipelineAsync Replacement For CTA-Wide Handoffs
+
+2026-04-28T17:24:41-05:00
+
+Tried replacing the four online-owner CTA-wide role handoffs with one-stage
+`cutlass::PipelineAsync<1>` barriers:
+
+```text
+MMA -> Softmax score-ready
+Softmax -> Correction row_m/row_l-ready
+Correction -> Softmax old_scale/tile_scale-ready
+Softmax -> MMA/Load P-ready and logits-lifetime-ended
+```
+
+The implementation kept the same full 128x128 BF16 logits scratch in aliased
+QK shared memory and used role-local named barriers only before committing or
+releasing a pipeline stage.
+
+Validation:
+
+```text
+online register-Q, kv_tiles=2: finite,
+                                   mean_abs=0.00184237165376544,
+                                   max_abs=0.009134171530604362,
+                                   cosine=0.9872949719429016
+full-grid first tile vs exact: finite,
+                               mean_abs=0.00015529035590589046,
+                               max_abs=0.0009055592236109078,
+                               cosine=0.9929453134536743
+```
+
+Performance:
+
+```text
+inline QK/PV atom-body baseline:
+  min_ms: 12.777376
+  mean_ms: 12.878765
+  max_ms: 12.951488
+
+direct PipelineAsync handoffs:
+  min_ms: 12.985120
+  mean_ms: 13.005005
+  max_ms: 13.024000
+```
+
+Decision:
+
+```text
+Rejected and reverted. This proves the barrier primitive is not the main issue
+while the dataflow still materializes a full score tile and blocks K loading on
+the same shared-memory region. Mbarriers add overhead but create no overlap
+because there is still only one score/logits lifetime and one aliased storage
+region.
+
+The next structural target is not another handoff primitive swap. It must
+remove or shrink the full-tile BF16 score handoff itself: either direct
+QK-accumulator-to-P staging inside the MMA/softmax pipeline, or a smaller
+subtile score/P staging scheme that actually permits overlap without requiring
+an impossible second 128x128 BF16 logits buffer.
+```
