@@ -2437,16 +2437,188 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         storage.qk_tensors);
     cute::clear(pv_accum);
 
+    auto qk_tCrB =
+        qk_thread_mma.partition_fragment_B(qk_sB(_, _, cute::Int<0>{}));
+    auto qk_tCrSFB =
+        qk_collective.partition_fragment_SFB(qk_sSFB(_, _, cute::Int<0>{}),
+                                             qk_thread_mma);
+    auto qk_smem_tiled_copy_B = cute::make_tiled_copy_B(
+        typename CutlassCollectiveMainloop::SmemCopyAtomB{}, qk_tiled_mma);
+    auto qk_smem_thr_copy_B =
+        qk_smem_tiled_copy_B.get_thread_slice(qk_mma_thread_idx);
+    auto qk_tCsB = qk_smem_thr_copy_B.partition_S(
+        cute::as_position_independent_swizzle_tensor(qk_sB));
+    auto qk_tCrB_copy_view = qk_smem_thr_copy_B.retile_D(qk_tCrB);
+    auto qk_tile_shape_mnk = cute::tile_shape(qk_tiled_mma);
+    auto qk_smem_tiled_copy_SFB = cute::make_tiled_copy_impl(
+        typename CutlassCollectiveMainloop::SmemCopyAtomSFB{},
+        qk_collective.get_layoutSFB_TV(qk_tiled_mma),
+        cute::make_shape(cute::size<1>(qk_tile_shape_mnk),
+                         cute::size<2>(qk_tile_shape_mnk)));
+    auto qk_smem_thr_copy_SFB =
+        qk_smem_tiled_copy_SFB.get_thread_slice(qk_mma_thread_idx);
+    auto qk_tCsSFB = qk_smem_thr_copy_SFB.partition_S(
+        cute::as_position_independent_swizzle_tensor(qk_sSFB));
+    auto qk_tCrSFB_copy_view = qk_smem_thr_copy_SFB.retile_D(qk_tCrSFB);
+
+    auto qk_consume_k_stage = [&](auto const& q_frag,
+                                  auto const& q_scale_frag, auto& qk_accum) {
+      auto qk_K_BLOCK_MAX = cute::size<2>(q_frag);
+      const int read_stage = k_pipe_read.index();
+      auto qk_tCsB_stage = qk_tCsB(_, _, _, read_stage);
+      auto qk_tCsSFB_stage = qk_tCsSFB(_, _, _, read_stage);
+
+      auto qk_copy_kblock = [&](auto k_block) {
+        cute::copy(qk_smem_tiled_copy_B, qk_tCsB_stage(_, _, k_block),
+                   qk_tCrB_copy_view(_, _, k_block));
+        using MMAOp = typename CutlassCollectiveMainloop::TiledMma::MMA_Op;
+        fp4_shift_B(MMAOp{}, qk_tCrB_copy_view(_, _, k_block));
+        cute::copy(qk_tCsSFB_stage(_, _, k_block),
+                   qk_tCrSFB_copy_view(_, _, k_block));
+      };
+
+      auto qk_gemm_kblock = [&](auto k_block) {
+        cute::gemm(qk_tiled_mma,
+                   cute::make_zip_tensor(q_frag(_, _, k_block),
+                                          q_scale_frag(_, _, k_block)),
+                   cute::make_zip_tensor(qk_tCrB(_, _, k_block),
+                                          qk_tCrSFB(_, _, k_block)),
+                   qk_accum);
+      };
+
+      k_pipeline.consumer_wait(k_pipe_read);
+      qk_copy_kblock(cute::_0{});
+      cute::for_each(cute::make_int_sequence<qk_K_BLOCK_MAX>{},
+                     [&](auto k_block) {
+        auto k_block_next =
+            ((k_block + 1) == qk_K_BLOCK_MAX) ? 0 : (k_block + 1);
+        if (k_block == qk_K_BLOCK_MAX - 1) {
+          cutlass::arch::NamedBarrier::sync(
+              cute::thr_size(qk_tiled_mma),
+              cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+          k_pipeline.consumer_release(k_pipe_read);
+          ++k_pipe_read;
+        }
+        if (k_block_next > 0) {
+          qk_copy_kblock(k_block_next);
+        }
+        qk_gemm_kblock(k_block);
+      });
+    };
+
+    auto pv_smem_tiled_copy_B = cute::make_tiled_copy_B(
+        typename CutlassCollectiveMainloopK128Stage2::SmemCopyAtomB{},
+        pv_tiled_mma);
+    auto pv_smem_thr_copy_B =
+        pv_smem_tiled_copy_B.get_thread_slice(pv_mma_thread_idx);
+    auto pv_tCsB = pv_smem_thr_copy_B.partition_S(
+        cute::as_position_independent_swizzle_tensor(pv_sB));
+    auto pv_tCrB_copy_view = pv_smem_thr_copy_B.retile_D(v_frag);
+    auto pv_tile_shape_mnk = cute::tile_shape(pv_tiled_mma);
+    auto pv_smem_tiled_copy_SFB = cute::make_tiled_copy_impl(
+        typename CutlassCollectiveMainloopK128Stage2::SmemCopyAtomSFB{},
+        pv_collective.get_layoutSFB_TV(pv_tiled_mma),
+        cute::make_shape(cute::size<1>(pv_tile_shape_mnk),
+                         cute::size<2>(pv_tile_shape_mnk)));
+    auto pv_smem_thr_copy_SFB =
+        pv_smem_tiled_copy_SFB.get_thread_slice(pv_mma_thread_idx);
+    auto pv_tCsSFB = pv_smem_thr_copy_SFB.partition_S(
+        cute::as_position_independent_swizzle_tensor(pv_sSFB));
+    auto pv_tCrSFB_copy_view = pv_smem_thr_copy_SFB.retile_D(v_scale_frag);
+
+    auto pv_consume_v_stage = [&]() {
+      auto pv_K_BLOCK_MAX = cute::size<2>(v_frag);
+      const int read_stage = v_pipe_read.index();
+      auto pv_tCsB_stage = pv_tCsB(_, _, _, read_stage);
+      auto pv_tCsSFB_stage = pv_tCsSFB(_, _, _, read_stage);
+
+      v_pipeline.consumer_wait(v_pipe_read);
+      cute::for_each(cute::make_int_sequence<pv_K_BLOCK_MAX>{},
+                     [&](auto k_block) {
+        cute::copy(pv_smem_tiled_copy_B, pv_tCsB_stage(_, _, k_block),
+                   pv_tCrB_copy_view(_, _, k_block));
+        using MMAOp =
+            typename CutlassCollectiveMainloopK128Stage2::TiledMma::MMA_Op;
+        fp4_shift_B(MMAOp{}, pv_tCrB_copy_view(_, _, k_block));
+        cute::copy(pv_tCsSFB_stage(_, _, k_block),
+                   pv_tCrSFB_copy_view(_, _, k_block));
+      });
+
+      cutlass::arch::NamedBarrier::sync(
+          cute::thr_size(pv_tiled_mma),
+          cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+      v_pipeline.consumer_release(v_pipe_read);
+      ++v_pipe_read;
+    };
+
+    auto pv_tCrA =
+        pv_thread_mma.partition_fragment_A(p_sA(_, _, cute::Int<0>{}));
+    auto pv_tCrSFA =
+        pv_collective.partition_fragment_SFA(p_sSFA(_, _, cute::Int<0>{}),
+                                             pv_thread_mma);
+    auto pv_smem_tiled_copy_A = cute::make_tiled_copy_A(
+        typename CutlassCollectiveMainloopK128Stage2::SmemCopyAtomA{},
+        pv_tiled_mma);
+    auto pv_smem_thr_copy_A =
+        pv_smem_tiled_copy_A.get_thread_slice(pv_mma_thread_idx);
+    auto pv_tCsA = pv_smem_thr_copy_A.partition_S(
+        cute::as_position_independent_swizzle_tensor(p_sA));
+    auto pv_tCrA_copy_view = pv_smem_thr_copy_A.retile_D(pv_tCrA);
+    auto pv_smem_tiled_copy_SFA = cute::make_tiled_copy_impl(
+        typename CutlassCollectiveMainloopK128Stage2::SmemCopyAtomSFA{},
+        pv_collective.get_layoutSFA_TV(pv_tiled_mma),
+        cute::make_shape(cute::size<0>(pv_tile_shape_mnk),
+                         cute::size<2>(pv_tile_shape_mnk)));
+    auto pv_smem_thr_copy_SFA =
+        pv_smem_tiled_copy_SFA.get_thread_slice(pv_mma_thread_idx);
+    auto pv_tCsSFA = pv_smem_thr_copy_SFA.partition_S(
+        cute::as_position_independent_swizzle_tensor(p_sSFA));
+    auto pv_tCrSFA_copy_view = pv_smem_thr_copy_SFA.retile_D(pv_tCrSFA);
+
+    auto pv_gemm_p_stage = [&](auto& accum) {
+      auto pv_K_BLOCK_MAX = cute::size<2>(pv_tCrA);
+      auto pv_copy_p_kblock = [&](auto k_block) {
+        cute::copy(pv_smem_tiled_copy_A,
+                   pv_tCsA(_, _, k_block, cute::Int<0>{}),
+                   pv_tCrA_copy_view(_, _, k_block));
+        using MMAOp =
+            typename CutlassCollectiveMainloopK128Stage2::TiledMma::MMA_Op;
+        fp4_shift_A(MMAOp{}, pv_tCrA_copy_view(_, _, k_block));
+        cute::copy(pv_tCsSFA(_, _, k_block, cute::Int<0>{}),
+                   pv_tCrSFA_copy_view(_, _, k_block));
+      };
+
+      auto pv_gemm_kblock = [&](auto k_block) {
+        cute::gemm(pv_tiled_mma,
+                   cute::make_zip_tensor(pv_tCrA(_, _, k_block),
+                                          pv_tCrSFA(_, _, k_block)),
+                   cute::make_zip_tensor(v_frag(_, _, k_block),
+                                          v_scale_frag(_, _, k_block)),
+                   accum);
+      };
+
+      pv_copy_p_kblock(cute::_0{});
+      cute::for_each(cute::make_int_sequence<pv_K_BLOCK_MAX>{},
+                     [&](auto k_block) {
+        auto k_block_next =
+            ((k_block + 1) == pv_K_BLOCK_MAX) ? 0 : (k_block + 1);
+        if (k_block_next > 0) {
+          pv_copy_p_kblock(k_block_next);
+        }
+        pv_gemm_kblock(k_block);
+      });
+    };
+
+    auto pv_cC = cute::make_identity_tensor(
+        cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+    auto pv_tCcC = pv_thread_mma.partition_C(pv_cC);
+
     for (int tile = 0; tile < num_kv_tiles; ++tile) {
       auto qk_accum = cute::partition_fragment_C(
           qk_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShape{}));
       cute::clear(qk_accum);
-      cutlass_qk_tma_k_mma_register_q_stage<false>(
-          k_pipeline, k_pipe_read, q_frag0, q_scale_frag0, qk_accum,
-          qk_mma_thread_idx, storage.qk_tensors);
-      cutlass_qk_tma_k_mma_register_q_stage<false>(
-          k_pipeline, k_pipe_read, q_frag1, q_scale_frag1, qk_accum,
-          qk_mma_thread_idx, storage.qk_tensors);
+      qk_consume_k_stage(q_frag0, q_scale_frag0, qk_accum);
+      qk_consume_k_stage(q_frag1, q_scale_frag1, qk_accum);
 
       auto cC = cute::make_identity_tensor(
           cute::take<0, 2>(CutlassThreadBlockShape{}));
@@ -2467,21 +2639,24 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       cutlass::arch::NamedBarrier::sync(
           kSm120Nvfp4FmhaMmaSoftmaxLoadThreadCount,
           kSm120Nvfp4BarrierSoftmaxMma);
-      cutlass_pv_stage2_tma_v_register_stage(
-          v_pipeline, v_pipe_read, v_frag, v_scale_frag, pv_mma_thread_idx,
-          pv_sB, pv_sSFB);
-      cutlass_pv_stage2_scale_or_clear_accum(
-          pv_accum, storage.old_scale, pv_mma_thread_idx, tile == 0 ? 1 : 0);
-      cutlass_pv_stage2_mma_register_v_stage<false>(
-          v_frag, v_scale_frag, pv_accum, pv_mma_thread_idx, p_sA, p_sSFA);
+      pv_consume_v_stage();
+      for (int i = 0; i < cute::size(pv_accum); ++i) {
+        if (tile == 0) {
+          pv_accum(i) = 0.0f;
+          continue;
+        }
+        auto coord = pv_tCcC(i);
+        const int row = int(cute::get<0>(coord));
+        if (row < kCutlassTileM) {
+          pv_accum(i) *= storage.old_scale[row];
+        }
+      }
+      pv_gemm_p_stage(pv_accum);
     }
 
-    auto cC = cute::make_identity_tensor(
-        cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
-    auto tCcC = pv_thread_mma.partition_C(cC);
     const float pv_base_scale = pv_alpha / kProbGlobalScale;
     for (int i = 0; i < cute::size(pv_accum); ++i) {
-      auto coord = tCcC(i);
+      auto coord = pv_tCcC(i);
       const int row = int(cute::get<0>(coord));
       const int col = int(cute::get<1>(coord));
       if (row < kCutlassTileM && col < kCutlassTileN) {

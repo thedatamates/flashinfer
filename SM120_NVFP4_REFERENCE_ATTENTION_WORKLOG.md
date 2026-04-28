@@ -5652,3 +5652,112 @@ target is the helper body itself: the online MMA role still constructs/copies
 fragment views and runs separate QK0, QK1, V-load, and PV helper bodies per KV
 tile instead of one fused CUTLASS atom loop.
 ```
+
+### Inline QK/PV CUTLASS Atom Bodies In MMA Role
+
+2026-04-28T17:16:12-05:00
+
+The post-tail-barrier profile still showed the same structural bottleneck:
+
+```text
+report:
+  reports/ncu_sm120_online_fullgrid_role_loop_a0ff781.ncu-rep
+
+tensor pipe active:             4.48% active / 2.98% elapsed
+issue slots busy:               22.05%
+SM busy:                        22.05%
+instructions:                   4.969B
+memory throughput:              119.89 GB/s
+L2 hit rate:                    99.81%
+eligible warps / scheduler:     0.38
+no eligible cycles:             66.84%
+stall barrier:                  10.07 cycles / issued instruction
+stall wait:                     2.22
+stall long scoreboard:          1.48
+stall short scoreboard:         0.39
+warp cycles / issued inst:      15.83
+```
+
+Interpretation:
+
+```text
+The role-loop rewrite reduced work, but the CTA still spends most cycles with
+no eligible warp. Tail barrier removal alone was correctly rejected as too
+small. The next structural change is to remove the helper-call-per-tile shape
+inside the MMA role and make the CUTLASS atom sequence explicit in the role
+loop.
+```
+
+Implementation:
+
+```text
+The online owner no longer calls these helpers from the MMA role loop:
+  cutlass_qk_tma_k_mma_register_q_stage<false>
+  cutlass_pv_stage2_tma_v_register_stage
+  cutlass_pv_stage2_scale_or_clear_accum
+  cutlass_pv_stage2_mma_register_v_stage<false>
+
+The MMA role now hoists the CUTLASS copy/MMA views once, then performs the
+sequence inline:
+  QK K-stage wait/copy/SFB-copy/fp4-shift
+  cute::gemm(Q, K, qk_accum)
+  logits write to the aliased BF16 score scratch
+  MmaSoftmax -> SoftmaxMma role handoff
+  V-stage wait/copy/SFB-copy/fp4-shift
+  online PV accumulator rescale/clear
+  P copy/SFA-copy/fp4-shift
+  cute::gemm(P, V, pv_accum)
+
+The reusable helpers remain for older atom/load/role-handoff gates only. The
+online owner is now the first path where the QK/PV atom bodies live directly in
+the role-owned mainloop.
+```
+
+Validation:
+
+```text
+git diff --check: pass
+python py_compile bench harness: pass
+role schedule: pass
+QKV load collective: finite, mean_abs=0.0015516469720751047,
+                     max_abs=0.015534400939941406,
+                     cosine=0.9999986290931702
+role handoff: finite, mean_abs=0.0025383096653968096,
+              max_abs=0.014019200578331947,
+              cosine=0.9895987510681152
+online register-Q, kv_tiles=2: finite,
+                                   mean_abs=0.00184237165376544,
+                                   max_abs=0.009134171530604362,
+                                   cosine=0.9872949719429016
+full-grid first tile vs exact: finite,
+                               mean_abs=0.00015529035590589046,
+                               max_abs=0.0009055592236109078,
+                               cosine=0.9929453134536743
+```
+
+Performance:
+
+```text
+helper-tail-trim baseline:
+  min_ms: 12.896800
+  mean_ms: 12.920973
+  max_ms: 12.945888
+
+inline QK/PV atom bodies:
+  min_ms: 12.777376
+  mean_ms: 12.878765
+  max_ms: 12.951488
+```
+
+Conclusion:
+
+```text
+Correctness is preserved and the inline atom sequence removes the helper
+call-site boundary, but the performance gain is still only ~0.9% on min wall
+time. This means the dominant barrier/no-eligible behavior is not simply helper
+view setup or helper tail sync. The next structural target must change the
+mainloop dataflow itself: remove the smem logits round-trip / block-wide
+MMA->softmax handoff by moving the QK accumulator into a register/logit handoff
+that feeds softmax/P quantization without materializing the full 128x128 BF16
+score tile through shared memory.
+```
