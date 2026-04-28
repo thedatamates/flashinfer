@@ -367,7 +367,7 @@ static_assert(
     sizeof(decltype(
         ((typename CutlassCollectiveMainloop::TensorStorage*)nullptr)->smem_B)) >=
         kCutlassTileM * kCutlassTileN * static_cast<int>(sizeof(__nv_bfloat16)),
-    "QK B smem must be large enough for the on-chip BF16 logits scratch");
+    "QK B smem must be large enough for the aliased BF16 logits/O tile");
 
 __device__ __forceinline__ bool finite_f32(float x) {
   return x == x && fabsf(x) != INFINITY;
@@ -1070,6 +1070,38 @@ __device__ __forceinline__ void correction_role_update_online_state(
       old_scale[row] = prev_scale;
       tile_scale[row] = curr_scale;
     }
+  }
+}
+
+template <class AccumTensor, class CoordTensor>
+__device__ __forceinline__ void sm120_stage_o_fragment_to_epilogue_smem(
+    AccumTensor const& accum,
+    CoordTensor const& coords,
+    __nv_bfloat16* smem_o,
+    const float* global_l,
+    float pv_base_scale) {
+  for (int i = 0; i < int(cute::size(accum)); ++i) {
+    auto coord = coords(i);
+    const int row = int(cute::get<0>(coord));
+    const int col = int(cute::get<1>(coord));
+    if (row < kCutlassTileM && col < kCutlassTileN) {
+      const float normalized =
+          accum(i) * pv_base_scale / fmaxf(global_l[row], 1.0e-20f);
+      smem_o[row * kCutlassTileN + col] = __float2bfloat16(normalized);
+    }
+  }
+}
+
+__device__ __forceinline__ void sm120_epilogue_store_bf16_tile_to_float(
+    const __nv_bfloat16* smem_o,
+    float* out_tile,
+    int out_stride_cols,
+    int epilogue_thread_idx) {
+  for (int idx = epilogue_thread_idx; idx < kCutlassTileM * kCutlassTileN;
+       idx += kSm120Nvfp4FmhaNumWarpsEpilogue * cutlass::NumThreadsPerWarp) {
+    const int row = idx / kCutlassTileN;
+    const int col = idx - row * kCutlassTileN;
+    out_tile[row * out_stride_cols + col] = __bfloat162float(smem_o[idx]);
   }
 }
 
@@ -2231,6 +2263,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                  : 0;
   const int correction_thread_idx =
       is_correction ? sm120_nvfp4_fmha_correction_thread_idx(thread_idx) : 0;
+  const int epilogue_thread_idx =
+      is_epilogue
+          ? thread_idx - kSm120Nvfp4FmhaWarpEpilogue * cutlass::NumThreadsPerWarp
+          : 0;
 
   typename Sm120Nvfp4PipelineS::Params pipeline_mma_s0_params{};
   typename Sm120Nvfp4PipelineS::Params pipeline_mma_s1_params{};
@@ -2425,8 +2461,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto qk_sB = cute::make_tensor(
       cute::make_smem_ptr(storage.qk_tensors.smem_B.begin()),
       typename CutlassCollectiveMainloop::SmemLayoutB{});
+  // SM120 has no TMEM, so the 77 S/O lifetime is represented by aliasing this
+  // region: K while loaded, BF16 scores after QK, BF16 O for epilogue after PV.
   __nv_bfloat16* smem_logits =
       cute::recast_ptr<__nv_bfloat16>(storage.qk_tensors.smem_B.begin());
+  __nv_bfloat16* smem_epilogue_o = smem_logits;
   auto qk_sSFA = cute::make_tensor(
       cute::make_smem_ptr(storage.qk_tensors.smem_SFA.begin()),
       typename CutlassCollectiveMainloop::SmemLayoutSFA{});
@@ -2815,7 +2854,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       pipeline_mma_corr.producer_acquire(pipeline_mma_corr_producer_state);
     };
 
-    auto commit_output_stage = [&]() {
+    auto commit_output_stage = [&](bool final_tile) {
+      if (final_tile) {
+        cutlass::arch::NamedBarrier::sync(
+            CutlassCollectiveMainloopK128Stage2::ThreadCount,
+            cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+        cutlass::arch::fence_view_async_shared();
+      }
       if (qk_mma_thread_idx == 0) {
         pipeline_mma_corr.producer_commit(pipeline_mma_corr_producer_state);
       }
@@ -2860,19 +2905,14 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         }
       }
       pv_gemm_p_stage(pv_accum);
-      commit_output_stage();
-    }
-
-    const float pv_base_scale = pv_alpha / kProbGlobalScale;
-    for (int i = 0; i < cute::size(pv_accum); ++i) {
-      auto coord = pv_tCcC(i);
-      const int row = int(cute::get<0>(coord));
-      const int col = int(cute::get<1>(coord));
-      if (row < kCutlassTileM && col < kCutlassTileN) {
-        out_tile[row * out_stride_cols + col] =
-            pv_accum(i) * pv_base_scale /
-            fmaxf(storage.global_l[row], 1.0e-20f);
+      const bool final_tile = tile == num_kv_tiles - 1;
+      if (final_tile) {
+        const float pv_base_scale = pv_alpha / kProbGlobalScale;
+        sm120_stage_o_fragment_to_epilogue_smem(
+            pv_accum, pv_tCcC, smem_epilogue_o, storage.global_l,
+            pv_base_scale);
       }
+      commit_output_stage(final_tile);
     }
   } else if (is_softmax) {
     auto wait_score_stage = [&](int tile) {
@@ -2974,6 +3014,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     }
   } else if (is_epilogue) {
     pipeline_corr_epi.consumer_wait(pipeline_corr_epi_consumer_state);
+    sm120_epilogue_store_bf16_tile_to_float(
+        smem_epilogue_o, out_tile, out_stride_cols, epilogue_thread_idx);
     pipeline_corr_epi.consumer_release(pipeline_corr_epi_consumer_state);
     ++pipeline_corr_epi_consumer_state;
   }

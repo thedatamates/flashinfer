@@ -6024,3 +6024,65 @@ gap is that the SM120 benchmark still lacks the SM100 mainloop's true overlap
 model: S/P are aliased through one QK tensor region, output remains
 MMA-register-owned, and the epilogue is only a structural placeholder.
 ```
+
+### Epilogue-Owned Output Handoff
+
+2026-04-28T19:05:00-05:00
+
+Ported the next SM100 lifecycle layer in the active SM120 benchmark kernel:
+
+```text
+MMA role:
+  keeps PV/O accumulator in registers across the KV loop
+  stages final normalized O to aliased shared memory only on the final tile
+  commits pipeline_mma_corr only after the final O smem write is complete
+
+Correction role:
+  consumes pipeline_mma_corr
+  commits pipeline_corr_epi on the final tile
+
+Epilogue role:
+  waits pipeline_corr_epi
+  owns the global output write
+```
+
+The aliased shared-memory region is `qk_tensors.smem_B`:
+
+```text
+K tile storage while QK consumes K
+BF16 score/logit scratch after QK
+BF16 O epilogue tile after final PV
+```
+
+This replaces the previous benchmark shortcut where the MMA role wrote global
+output directly after the KV loop. The output handoff now follows the SM100
+ownership model within SM120's no-TMEM constraint.
+
+Validation:
+
+```text
+git diff --check: pass
+python3 -m py_compile benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py: pass
+online kv_tiles=2:  finite, mean_abs=0.00184219, max_abs=0.00911981, cosine=0.987296
+online kv_tiles=16: finite, mean_abs=0.000650525, max_abs=0.00309772, cosine=0.988925
+full grid:          finite first tile, mean_abs=0.000155273, max_abs=0.000907625, cosine=0.992944
+full-grid min:      14.1334 ms
+```
+
+Conclusion:
+
+```text
+The handoff is correct, but the benchmark is slower because it now pays an
+extra BF16 shared-memory write/read epilogue path. This was expected for the
+structural port: it removes the invalid MMA-global-write shortcut but does not
+yet create the SM100 overlap model that hides the cost.
+
+The next missing layer from Example 77 is still the S/P alias and softmax/PV
+interleave. The current SM120 path aliases K/S/O in `smem_B` and aliases Q/P in
+`smem_A`; it does not yet alias score storage and P staging in the same
+producer/consumer lifetime. A direct same-base BF16-logit -> FP4-P in-place
+rewrite is unsafe because the FP4 P writer can clobber BF16 logits that another
+softmax lane has not read. The correct port is to remove the full BF16 score
+tile as a durable object and stage P through the same lifetime boundary that
+77 uses for S/P, not to add another side buffer.
+```
