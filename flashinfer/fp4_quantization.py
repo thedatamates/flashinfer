@@ -20,6 +20,7 @@ from .quantization.fp4_quantization import (
     nvfp4_quantize,
     nvfp4_batched_quantize,
     nvfp4_quantize_paged_kv_cache,
+    nvfp4_softmax_quantize,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
@@ -37,6 +38,7 @@ from .quantization.fp4_quantization import (
     # Private functions needed by some tests
     _pad_scale_factors,
     _compute_swizzled_layout_sf_size,
+    _select_nvfp4_softmax_quant_threads,
 )
 
 __all__ = [
@@ -50,6 +52,7 @@ __all__ = [
     "nvfp4_quantize",
     "nvfp4_batched_quantize",
     "nvfp4_quantize_paged_kv_cache",
+    "nvfp4_softmax_quantize",
     "shuffle_matrix_a",
     "shuffle_matrix_sf_a",
     "scaled_fp4_grouped_quantize",
@@ -66,4 +69,5 @@ __all__ = [
     "nvfp4_kv_quantize",
     "_pad_scale_factors",
     "_compute_swizzled_layout_sf_size",
+    "_select_nvfp4_softmax_quant_threads",
 ]

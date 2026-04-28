@@ -372,6 +372,16 @@ struct Softmax_base {
     }
   }
 
+  inline __device__ void clear() {
+#pragma unroll
+    for (int mi = 0; mi < MMAS_M * 2; ++mi) {
+#pragma unroll
+      for (int ni = 0; ni < MMAS_N * 4; ++ni) {
+        elt_[mi][ni] = 0.f;
+      }
+    }
+  }
+
   // Do a warp-wide reduction.
   template <typename Functor>
   inline __device__ void reduce_Nx1(float (&dst)[MMAS_M * 2]) {
@@ -1380,6 +1390,508 @@ struct Softmax_qmma<fmha::Ada_qmma_e4m3_fp16_traits, Cta_tile, Kernel_traits>
 
 template <typename Traits, typename Cta_tile, typename Kernel_traits, bool Sage = false>
 struct Softmax {};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Cta_tile, typename Kernel_traits>
+struct Softmax<fmha::Blackwell_mma_nvf4_fp32_traits, Cta_tile, Kernel_traits>
+    : public Softmax_base<fmha::Blackwell_mma_nvf4_fp32_traits, Cta_tile, Kernel_traits> {
+  using Traits = fmha::Blackwell_mma_nvf4_fp32_traits;
+  using Base = Softmax_base<Traits, Cta_tile, Kernel_traits>;
+  using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
+  using Accumulator = fmha::Fragment_accumulator<Traits>;
+  using Fragment_a = fmha::Fragment_a<Traits, fmha::Row>;
+
+  enum { MMAS_M = Base::MMAS_M };
+  enum { MMAS_N = Base::MMAS_N };
+
+  template <typename Params>
+  inline __device__ Softmax(Params const& params, void* smem, int bidb, int tidx)
+      : Base(params, smem, bidb, tidx),
+        params_scale_bmm1_(params.scale_bmm1_d ? *params.scale_bmm1_d : params.scale_bmm1) {}
+
+  template <typename Gmem_tile>
+  inline __device__ void store(Gmem_tile& gmem_tile) {
+    Accumulator acc[MMAS_M][MMAS_N];
+#pragma unroll
+    for (int mi = 0; mi < MMAS_M; ++mi) {
+#pragma unroll
+      for (int ni = 0; ni < MMAS_N; ++ni) {
+        acc[mi][ni].elt(0) = this->elt_[2 * mi + 0][4 * ni + 0];
+        acc[mi][ni].elt(1) = this->elt_[2 * mi + 0][4 * ni + 1];
+        acc[mi][ni].elt(4) = this->elt_[2 * mi + 0][4 * ni + 2];
+        acc[mi][ni].elt(5) = this->elt_[2 * mi + 0][4 * ni + 3];
+        acc[mi][ni].elt(2) = this->elt_[2 * mi + 1][4 * ni + 0];
+        acc[mi][ni].elt(3) = this->elt_[2 * mi + 1][4 * ni + 1];
+        acc[mi][ni].elt(6) = this->elt_[2 * mi + 1][4 * ni + 2];
+        acc[mi][ni].elt(7) = this->elt_[2 * mi + 1][4 * ni + 3];
+      }
+    }
+    gmem_tile.store(acc);
+  }
+
+  inline __device__ void unpack(Accumulator const (&acc)[MMAS_M][MMAS_N]) {
+    float const scale = reinterpret_cast<float const&>(params_scale_bmm1_);
+#pragma unroll
+    for (int mi = 0; mi < MMAS_M; ++mi) {
+#pragma unroll
+      for (int ni = 0; ni < MMAS_N; ++ni) {
+#pragma unroll
+        for (int row_slot = 0; row_slot < 2; ++row_slot) {
+#pragma unroll
+          for (int atom = 0; atom < 2; ++atom) {
+#pragma unroll
+            for (int pair = 0; pair < 2; ++pair) {
+              this->elt_[2 * mi + row_slot][4 * ni + atom * 2 + pair] =
+                  acc[mi][ni].elt(4 * atom + 2 * row_slot + pair) * scale;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  template <bool APPLY_MASK = false>
+  inline __device__ void apply_exp_with_mask(float const (&max)[MMAS_M * 2]) {
+#pragma unroll
+    for (int mi = 0; mi < MMAS_M * 2; ++mi) {
+      float const max_val = APPLY_MASK && max[mi] == -FLT_MAX ? 0.f : max[mi];
+#pragma unroll
+      for (int ni = 0; ni < MMAS_N * 4; ++ni) {
+        this->elt_[mi][ni] = __expf(this->elt_[mi][ni] - max_val);
+      }
+    }
+  }
+
+  inline __device__ float get_value(int mi, int row, int col) const {
+    int const ni = col / Mma_tile::N_PER_MMA_PER_CTA;
+    int const col_in_mma = col - ni * Mma_tile::N_PER_MMA_PER_CTA;
+    int const row_slot = row >> 3;
+    int const owner_lane = 4 * (row & 7) + ((col_in_mma >> 1) & 3);
+    int const src_idx = 4 * ni + 2 * (col_in_mma >> 3) + (col_in_mma & 1);
+    float value = 0.f;
+#pragma unroll
+    for (int candidate_row_slot = 0; candidate_row_slot < 2;
+         ++candidate_row_slot) {
+#pragma unroll
+      for (int candidate_idx = 0; candidate_idx < MMAS_N * 4;
+           ++candidate_idx) {
+        float const candidate =
+            this->elt_[2 * mi + candidate_row_slot][candidate_idx];
+        float const fetched =
+            __shfl_sync(uint32_t(-1), candidate, owner_lane);
+        if (candidate_row_slot == row_slot && candidate_idx == src_idx) {
+          value = fetched;
+        }
+      }
+    }
+    return value;
+  }
+
+  static inline __device__ int scale_idx_for_k(int k) {
+    return ((k >> 5) & 1) + 2 * ((k >> 3) & 1);
+  }
+
+  inline __device__ float select_elt(int elt_row, int idx) const {
+    float value = this->elt_[elt_row][0];
+#pragma unroll
+    for (int i = 1; i < MMAS_N * 4; ++i) {
+      if (idx == i) {
+        value = this->elt_[elt_row][i];
+      }
+    }
+    return value;
+  }
+
+  static inline __device__ float quad_reduce_max(float value) {
+    value = fmaxf(value, __shfl_xor_sync(uint32_t(-1), value, 1));
+    value = fmaxf(value, __shfl_xor_sync(uint32_t(-1), value, 2));
+    return value;
+  }
+
+  inline __device__ float local_amax_for_scale_group(int mi, int row_slot,
+                                                     int scale_idx) const {
+    int const atom = scale_idx >> 1;
+    int const base_ni = 2 * (scale_idx & 1);
+    int const elt_row = 2 * mi + row_slot;
+
+    float amax = 0.f;
+#pragma unroll
+    for (int k_pair = 0; k_pair < 2; ++k_pair) {
+      int const ni = base_ni + k_pair;
+      amax = fmaxf(amax, fabsf(this->elt_[elt_row][4 * ni + 2 * atom + 0]));
+      amax = fmaxf(amax, fabsf(this->elt_[elt_row][4 * ni + 2 * atom + 1]));
+    }
+    return quad_reduce_max(amax);
+  }
+
+  inline __device__ float local_amax_for_scale_group_64x128(
+      int mi, int row_slot, int ki, int scale_idx) const {
+    int const atom = scale_idx >> 1;
+    int const base_ni = 4 * ki + 2 * (scale_idx & 1);
+    int const elt_row = 2 * mi + row_slot;
+
+    float amax = 0.f;
+#pragma unroll
+    for (int k_pair = 0; k_pair < 2; ++k_pair) {
+      int const ni = base_ni + k_pair;
+      amax = fmaxf(amax, fabsf(this->elt_[elt_row][4 * ni + 2 * atom + 0]));
+      amax = fmaxf(amax, fabsf(this->elt_[elt_row][4 * ni + 2 * atom + 1]));
+    }
+    return quad_reduce_max(amax);
+  }
+
+  inline __device__ float local_amax_for_scale_group_64x256(
+      int mi, int row_slot, int ki, int scale_idx) const {
+    int const atom = scale_idx >> 1;
+    int const base_ni = 4 * ki + 2 * (scale_idx & 1);
+    int const elt_row = 2 * mi + row_slot;
+
+    float amax = 0.f;
+#pragma unroll
+    for (int k_pair = 0; k_pair < 2; ++k_pair) {
+      int const ni = base_ni + k_pair;
+      amax = fmaxf(amax, fabsf(this->elt_[elt_row][4 * ni + 2 * atom + 0]));
+      amax = fmaxf(amax, fabsf(this->elt_[elt_row][4 * ni + 2 * atom + 1]));
+    }
+    return quad_reduce_max(amax);
+  }
+
+  inline __device__ float gather_pack_value_64(int mi, int row_slot,
+                                               int target_ni, int atom,
+                                               int source_quad, int pair) const {
+    int const elt_row = 2 * mi + row_slot;
+    int const row_base = (threadIdx.x & 31) >> 2;
+    int const owner_lane = 4 * row_base + source_quad;
+    float fetched[4];
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+      float const candidate = this->elt_[elt_row][4 * ni + 2 * atom + pair];
+      fetched[ni] = __shfl_sync(uint32_t(-1), candidate, owner_lane);
+    }
+
+    float value = fetched[0];
+#pragma unroll
+    for (int ni = 1; ni < 4; ++ni) {
+      if (target_ni == ni) {
+        value = fetched[ni];
+      }
+    }
+    return value;
+  }
+
+  inline __device__ float gather_pack_value_64x128(int mi, int row_slot,
+                                                   int target_ni, int atom,
+                                                   int source_quad,
+                                                   int pair) const {
+    int const elt_row = 2 * mi + row_slot;
+    int const row_base = (threadIdx.x & 31) >> 2;
+    int const owner_lane = 4 * row_base + source_quad;
+    float fetched[8];
+#pragma unroll
+    for (int ni = 0; ni < 8; ++ni) {
+      float const candidate = this->elt_[elt_row][4 * ni + 2 * atom + pair];
+      fetched[ni] = __shfl_sync(uint32_t(-1), candidate, owner_lane);
+    }
+
+    float value = fetched[0];
+#pragma unroll
+    for (int ni = 1; ni < 8; ++ni) {
+      if (target_ni == ni) {
+        value = fetched[ni];
+      }
+    }
+    return value;
+  }
+
+  inline __device__ float gather_pack_value_64x256(int mi, int row_slot,
+                                                   int target_ni, int atom,
+                                                   int source_quad,
+                                                   int pair) const {
+    int const elt_row = 2 * mi + row_slot;
+    int const row_base = (threadIdx.x & 31) >> 2;
+    int const owner_lane = 4 * row_base + source_quad;
+    float fetched[16];
+#pragma unroll
+    for (int ni = 0; ni < 16; ++ni) {
+      float const candidate = this->elt_[elt_row][4 * ni + 2 * atom + pair];
+      fetched[ni] = __shfl_sync(uint32_t(-1), candidate, owner_lane);
+    }
+
+    float value = fetched[0];
+#pragma unroll
+    for (int ni = 1; ni < 16; ++ni) {
+      if (target_ni == ni) {
+        value = fetched[ni];
+      }
+    }
+    return value;
+  }
+
+  template <typename Fragment_a_, int K, int M>
+  inline __device__ void pack_64x64_fast(Fragment_a_ (&dst)[K][M]) const {
+    constexpr float PROB_GLOBAL_SCALE = 6.f * 448.f;
+    int const lane = threadIdx.x & 31;
+    int const target_ni = lane & 3;
+
+#pragma unroll
+    for (int mi = 0; mi < M; ++mi) {
+      float sf[2][4];
+      float inv_sf[2][4];
+#pragma unroll
+      for (int row_slot = 0; row_slot < 2; ++row_slot) {
+#pragma unroll
+        for (int scale_idx = 0; scale_idx < 4; ++scale_idx) {
+          float const amax = local_amax_for_scale_group(mi, row_slot, scale_idx);
+          sf[row_slot][scale_idx] =
+              amax > 0.f ? fminf(amax * 448.f, 448.f) : 1.f;
+          inv_sf[row_slot][scale_idx] =
+              amax > 0.f ? 1.f / sf[row_slot][scale_idx] : 0.f;
+        }
+      }
+
+      int const scale_row_slot = lane & 1;
+      dst[0][mi].scale_reg = fmha::make_ue4m3_scale_reg(
+          sf[scale_row_slot][0], sf[scale_row_slot][1],
+          sf[scale_row_slot][2], sf[scale_row_slot][3]);
+
+      uint32_t packed[4];
+#pragma unroll
+      for (int reg = 0; reg < 4; ++reg) {
+        float vals[8];
+        int const row_slot = reg & 1;
+        int const atom = reg >> 1;
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj) {
+          int const source_quad = (jj >> 1) & 3;
+          int const pair = jj & 1;
+          int const local_k = 16 * target_ni + 8 * atom + jj;
+          int const scale_idx = scale_idx_for_k(local_k);
+          float const val =
+              gather_pack_value_64(mi, row_slot, target_ni, atom, source_quad, pair);
+          vals[jj] = val * PROB_GLOBAL_SCALE * inv_sf[row_slot][scale_idx];
+        }
+        packed[reg] = fmha::float8_to_e2m1x8(
+            vals[0], vals[1], vals[2], vals[3],
+            vals[4], vals[5], vals[6], vals[7]);
+      }
+
+      dst[0][mi].reg(0) = packed[0];
+      dst[0][mi].reg(1) = packed[1];
+      dst[0][mi].reg(2) = packed[2];
+      dst[0][mi].reg(3) = packed[3];
+    }
+  }
+
+  template <typename Fragment_a_, int K, int M>
+  inline __device__ void pack_64x128_fast(Fragment_a_ (&dst)[K][M]) const {
+    constexpr float PROB_GLOBAL_SCALE = 6.f * 448.f;
+    int const lane = threadIdx.x & 31;
+    int const target_ni_in_64 = lane & 3;
+
+#pragma unroll
+    for (int ki = 0; ki < 2; ++ki) {
+      float sf[2][4];
+      float inv_sf[2][4];
+#pragma unroll
+      for (int row_slot = 0; row_slot < 2; ++row_slot) {
+#pragma unroll
+        for (int scale_idx = 0; scale_idx < 4; ++scale_idx) {
+          float const amax =
+              local_amax_for_scale_group_64x128(0, row_slot, ki, scale_idx);
+          sf[row_slot][scale_idx] =
+              amax > 0.f ? fminf(amax * 448.f, 448.f) : 1.f;
+          inv_sf[row_slot][scale_idx] =
+              amax > 0.f ? 1.f / sf[row_slot][scale_idx] : 0.f;
+        }
+      }
+
+      int const scale_row_slot = lane & 1;
+      dst[ki][0].scale_reg = fmha::make_ue4m3_scale_reg(
+          sf[scale_row_slot][0], sf[scale_row_slot][1],
+          sf[scale_row_slot][2], sf[scale_row_slot][3]);
+
+      uint32_t packed[4];
+#pragma unroll
+      for (int reg = 0; reg < 4; ++reg) {
+        float vals[8];
+        int const row_slot = reg & 1;
+        int const atom = reg >> 1;
+        int const target_ni = 4 * ki + target_ni_in_64;
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj) {
+          int const source_quad = (jj >> 1) & 3;
+          int const pair = jj & 1;
+          int const local_k = 16 * target_ni_in_64 + 8 * atom + jj;
+          int const scale_idx = scale_idx_for_k(local_k);
+          float const val = gather_pack_value_64x128(
+              0, row_slot, target_ni, atom, source_quad, pair);
+          vals[jj] = val * PROB_GLOBAL_SCALE * inv_sf[row_slot][scale_idx];
+        }
+        packed[reg] = fmha::float8_to_e2m1x8(
+            vals[0], vals[1], vals[2], vals[3],
+            vals[4], vals[5], vals[6], vals[7]);
+      }
+
+      dst[ki][0].reg(0) = packed[0];
+      dst[ki][0].reg(1) = packed[1];
+      dst[ki][0].reg(2) = packed[2];
+      dst[ki][0].reg(3) = packed[3];
+    }
+  }
+
+  template <typename Fragment_a_, int K, int M>
+  inline __device__ void pack_64x256_fast(Fragment_a_ (&dst)[K][M]) const {
+    constexpr float PROB_GLOBAL_SCALE = 6.f * 448.f;
+    int const lane = threadIdx.x & 31;
+    int const target_ni_in_64 = lane & 3;
+
+#pragma unroll
+    for (int ki = 0; ki < 4; ++ki) {
+      float sf[2][4];
+      float inv_sf[2][4];
+#pragma unroll
+      for (int row_slot = 0; row_slot < 2; ++row_slot) {
+#pragma unroll
+        for (int scale_idx = 0; scale_idx < 4; ++scale_idx) {
+          float const amax =
+              local_amax_for_scale_group_64x256(0, row_slot, ki, scale_idx);
+          sf[row_slot][scale_idx] =
+              amax > 0.f ? fminf(amax * 448.f, 448.f) : 1.f;
+          inv_sf[row_slot][scale_idx] =
+              amax > 0.f ? 1.f / sf[row_slot][scale_idx] : 0.f;
+        }
+      }
+
+      int const scale_row_slot = lane & 1;
+      dst[ki][0].scale_reg = fmha::make_ue4m3_scale_reg(
+          sf[scale_row_slot][0], sf[scale_row_slot][1],
+          sf[scale_row_slot][2], sf[scale_row_slot][3]);
+
+      uint32_t packed[4];
+#pragma unroll
+      for (int reg = 0; reg < 4; ++reg) {
+        float vals[8];
+        int const row_slot = reg & 1;
+        int const atom = reg >> 1;
+        int const target_ni = 4 * ki + target_ni_in_64;
+#pragma unroll
+        for (int jj = 0; jj < 8; ++jj) {
+          int const source_quad = (jj >> 1) & 3;
+          int const pair = jj & 1;
+          int const local_k = 16 * target_ni_in_64 + 8 * atom + jj;
+          int const scale_idx = scale_idx_for_k(local_k);
+          float const val = gather_pack_value_64x256(
+              0, row_slot, target_ni, atom, source_quad, pair);
+          vals[jj] = val * PROB_GLOBAL_SCALE * inv_sf[row_slot][scale_idx];
+        }
+        packed[reg] = fmha::float8_to_e2m1x8(
+            vals[0], vals[1], vals[2], vals[3],
+            vals[4], vals[5], vals[6], vals[7]);
+      }
+
+      dst[ki][0].reg(0) = packed[0];
+      dst[ki][0].reg(1) = packed[1];
+      dst[ki][0].reg(2) = packed[2];
+      dst[ki][0].reg(3) = packed[3];
+    }
+  }
+
+  template <typename Fragment_a_, int K, int M>
+  inline __device__ void pack(Fragment_a_ (&dst)[K][M]) const {
+    static_assert(Fragment_a_::NUM_REGS == 4);
+    static_assert(Fragment_a_::NUM_ELTS == 32);
+
+    if constexpr (K == 1 && MMAS_N == 4 &&
+                  (Mma_tile::N_PER_MMA_PER_CTA == 16 ||
+                   (Cta_tile::WARPS_N == 2 &&
+                    Mma_tile::N_PER_MMA_PER_CTA == 32))) {
+      pack_64x64_fast(dst);
+      return;
+    }
+    if constexpr (K == 2 && M == 1 && MMAS_N == 8 &&
+                  Mma_tile::N_PER_MMA_PER_CTA == 16) {
+      pack_64x128_fast(dst);
+      return;
+    }
+    if constexpr (K == 4 && M == 1 && MMAS_N == 16 &&
+                  Mma_tile::N_PER_MMA_PER_CTA == 16) {
+      pack_64x256_fast(dst);
+      return;
+    }
+
+    constexpr float PROB_GLOBAL_SCALE = 6.f * 448.f;
+    int const lane = threadIdx.x & 31;
+
+#pragma unroll
+    for (int mi = 0; mi < M; ++mi) {
+      float sf[2][K][4];
+      float inv_sf[2][K][4];
+      int const row_base = lane >> 2;
+
+#pragma unroll
+      for (int row_slot = 0; row_slot < 2; ++row_slot) {
+        int const row = row_base + 8 * row_slot;
+#pragma unroll
+        for (int ki = 0; ki < K; ++ki) {
+#pragma unroll
+          for (int scale_idx = 0; scale_idx < 4; ++scale_idx) {
+            float amax = 0.f;
+#pragma unroll
+            for (int k_pair = 0; k_pair < 2; ++k_pair) {
+#pragma unroll
+              for (int jj = 0; jj < 8; ++jj) {
+                int const local_k = ki * Traits::K_PER_MMA +
+                                    16 * (2 * (scale_idx & 1) + k_pair) +
+                                    8 * (scale_idx >> 1) + jj;
+                amax = fmaxf(amax, fabsf(get_value(mi, row, local_k)));
+              }
+            }
+            sf[row_slot][ki][scale_idx] =
+                amax > 0.f ? fminf(amax * 448.f, 448.f) : 1.f;
+            inv_sf[row_slot][ki][scale_idx] =
+                amax > 0.f ? 1.f / sf[row_slot][ki][scale_idx] : 0.f;
+          }
+        }
+      }
+
+#pragma unroll
+      for (int ki = 0; ki < K; ++ki) {
+        int const scale_row_slot = lane & 1;
+        float scale_vals[4] = {sf[scale_row_slot][ki][0],
+                               sf[scale_row_slot][ki][1],
+                               sf[scale_row_slot][ki][2],
+                               sf[scale_row_slot][ki][3]};
+        dst[ki][mi].scale_reg = fmha::make_ue4m3_scale_reg(
+            scale_vals[0], scale_vals[1], scale_vals[2], scale_vals[3]);
+
+        uint32_t packed[4];
+#pragma unroll
+        for (int reg = 0; reg < 4; ++reg) {
+          float vals[8];
+          int const row = row_base + 8 * (reg & 1);
+#pragma unroll
+          for (int jj = 0; jj < 8; ++jj) {
+            int const local_k =
+                ki * Traits::K_PER_MMA + 16 * (lane & 3) + 8 * (reg >> 1) + jj;
+            int const scale_idx = scale_idx_for_k(local_k);
+            float const val = get_value(mi, row, local_k);
+            float const inv_scale = inv_sf[reg & 1][ki][scale_idx];
+            vals[jj] = val * PROB_GLOBAL_SCALE * inv_scale;
+          }
+          packed[reg] = fmha::float8_to_e2m1x8(vals[0], vals[1], vals[2], vals[3],
+                                               vals[4], vals[5], vals[6], vals[7]);
+        }
+        dst[ki][mi].reg(0) = packed[0];
+        dst[ki][mi].reg(1) = packed[1];
+        dst[ki][mi].reg(2) = packed[2];
+        dst[ki][mi].reg(3) = packed[3];
+      }
+    }
+  }
+
+  uint32_t const params_scale_bmm1_;
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

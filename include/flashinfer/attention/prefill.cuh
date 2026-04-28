@@ -50,6 +50,15 @@ DEFINE_HAS_MEMBER(token_pos_in_items_len)
 DEFINE_HAS_MEMBER(maybe_max_item_len_ptr)
 DEFINE_HAS_MEMBER(maybe_k_cache_sf)
 DEFINE_HAS_MEMBER(maybe_v_cache_sf)
+DEFINE_HAS_MEMBER(k_cache_sf_stride_page)
+DEFINE_HAS_MEMBER(k_cache_sf_stride_h)
+DEFINE_HAS_MEMBER(k_cache_sf_stride_n)
+DEFINE_HAS_MEMBER(v_cache_sf_stride_page)
+DEFINE_HAS_MEMBER(v_cache_sf_stride_h)
+DEFINE_HAS_MEMBER(v_cache_sf_stride_n)
+DEFINE_HAS_MEMBER(v_cache_sf_layout)
+DEFINE_HAS_MEMBER(v_cache_sf_logical_cols)
+DEFINE_HAS_MEMBER(v_cache_sf_col_offset)
 
 // Type trait to detect packed NVFP4 KV cache types (__nv_fp4x2_e2m1 stores 2 FP4 per byte).
 template <typename T>
@@ -69,8 +78,15 @@ constexpr uint32_t WARP_SIZE = 32;
 // Number of NVFP4 elements sharing one scale factor (UE4M3 byte).
 constexpr uint32_t NVFP4_SF_VEC_SIZE = 16;
 
+enum class NVFP4ScaleLayout : uint32_t {
+  kTRTLLMInterleaved = 0,
+  kLinear = 1,
+};
+
 constexpr uint32_t get_num_warps_q(const uint32_t cta_tile_q) {
-  if (cta_tile_q > 16) {
+  if (cta_tile_q == 32) {
+    return 2;
+  } else if (cta_tile_q > 16) {
     return 4;
   } else {
     return 1;
@@ -78,6 +94,9 @@ constexpr uint32_t get_num_warps_q(const uint32_t cta_tile_q) {
 }
 
 constexpr uint32_t get_num_warps_kv(const uint32_t cta_tile_kv) {
+  if (cta_tile_kv == 32) {
+    return 1;
+  }
   return 4 / get_num_warps_q(cta_tile_kv);
 }
 
@@ -92,6 +111,9 @@ constexpr uint32_t get_num_mma_q(const uint32_t cta_tile_q) {
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO>
 struct SharedStorageQKVO {
+  static constexpr bool SHARE_KV_SF_SMEM =
+      is_fp4_type_v<DTypeKV> && CTA_TILE_Q == 32 && CTA_TILE_KV == 64 && HEAD_DIM_QK == 512 &&
+      HEAD_DIM_VO == 512 && NUM_WARPS_KV == 1;
   union {
     struct {
       alignas(16) DTypeQ q_smem[CTA_TILE_Q * HEAD_DIM_QK];
@@ -112,9 +134,20 @@ struct SharedStorageQKVO {
   alignas(16) std::conditional_t<is_fp4_type_v<DTypeKV>,
                                  uint8_t[CTA_TILE_KV * HEAD_DIM_QK / NVFP4_SF_VEC_SIZE],
                                  uint8_t[1]> k_sf_smem;
-  alignas(16) std::conditional_t<is_fp4_type_v<DTypeKV>,
+  alignas(16) std::conditional_t<is_fp4_type_v<DTypeKV> && !SHARE_KV_SF_SMEM,
                                  uint8_t[CTA_TILE_KV * HEAD_DIM_VO / NVFP4_SF_VEC_SIZE],
                                  uint8_t[1]> v_sf_smem;
+
+  __device__ __forceinline__ uint8_t* k_sf_smem_ptr() { return k_sf_smem; }
+
+  __device__ __forceinline__ uint8_t* v_sf_smem_ptr() {
+    if constexpr (SHARE_KV_SF_SMEM) {
+      return k_sf_smem;
+    } else {
+      return v_sf_smem;
+    }
+  }
+
 };
 
 template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32_t NUM_MMA_KV_,
@@ -155,12 +188,25 @@ struct KernelTraits {
   using IdType = IdType_;
   using AttentionVariant = AttentionVariant_;
 
+  static constexpr bool IsByteKvHeadDim512() {
+    return sizeof(DTypeKV_) == 1 && NUM_MMA_D_QK == 32 && NUM_MMA_D_VO == 32;
+  }
+
+  static constexpr uint32_t RegBudget() {
+    // 512-wide 8-bit KV uses one q fragment and one KV fragment. Its register
+    // footprint is slightly above the generic guard for 32/64-row tiles.
+    return IsByteKvHeadDim512() && NUM_MMA_Q == 1 ? 320 : 256;
+  }
+
   static constexpr bool IsInvalid() {
     return ((NUM_MMA_D_VO < 4) || (NUM_MMA_D_VO == 4 && NUM_MMA_KV % 2 == 1) ||
             (POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && NUM_MMA_D_VO > 4 &&
              NUM_MMA_D_VO % (2 * NUM_WARPS_Q) != 0) ||
-            (NUM_MMA_Q * (8 * NUM_MMA_D_VO + 2 * sizeof(DTypeQKAccum) * NUM_MMA_KV) >= 256) ||
-            (sizeof(DTypeKV) == 1 && NUM_MMA_KV * 2 % NUM_WARPS_Q != 0) ||
+            (NUM_MMA_Q * (8 * NUM_MMA_D_VO + 2 * sizeof(DTypeQKAccum) * NUM_MMA_KV) >=
+             RegBudget()) ||
+            (sizeof(DTypeKV) == 1 &&
+             ((SWIZZLE_MODE_KV == SwizzleMode::k128B && NUM_MMA_KV * 4 % NUM_WARPS_Q != 0) ||
+              (SWIZZLE_MODE_KV != SwizzleMode::k128B && NUM_MMA_KV * 2 % NUM_WARPS_Q != 0))) ||
             (sizeof(DTypeKV) == 1 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama));
   }
 
@@ -436,8 +482,8 @@ __device__ __forceinline__ void page_produce_kv(typename KTraits::SharedStorage*
  * SF bytes per iteration, advancing by NUM_WARPS * 128 bytes across iterations.
  * The SF smem layout is a plain flat byte array — no swizzle.
  *
- * SF strides are KV byte strides divided by SF_CONTAINERS (= NVFP4_SF_VEC_SIZE/2 = 8),
- * which is exact because all NVFP4-compatible head_dims are divisible by 16.
+ * Scale tensors can be independently strided from the packed KV data tensor.
+ * Compact scale tensors can still pass KV-byte-stride/SF_CONTAINERS values here.
  * No-op when KTraits::DTypeKV is not FP4.
  *
  * \tparam produce_v  true → fill v_sf_smem, false → fill k_sf_smem.
@@ -448,9 +494,9 @@ __device__ __forceinline__ void page_produce_kv(typename KTraits::SharedStorage*
  * \param packed_page_iter_base  Packed page-iter for the start of this CTA tile.
  * \param packed_kv_bound     Upper bound for valid packed page-iters (last_indptr * page_size).
  * \param kv_head_idx         KV head index.
- * \param kv_stride_page      Byte stride per page in the KV tensor.
- * \param kv_stride_h         Byte stride per head in the KV tensor.
- * \param kv_stride_n         Byte stride per token in the KV tensor.
+ * \param sf_stride_page      Scale-byte stride per page in the SF tensor.
+ * \param sf_stride_h         Scale-byte stride per head in the SF tensor.
+ * \param sf_stride_n         Scale-byte stride per token in the SF tensor.
  * \param page_size           Page size (fast divisor).
  * \param indices             Page index array.
  * \param kv_idx_base         First KV row index for this tile within the chunk.
@@ -462,8 +508,9 @@ template <bool produce_v, typename KTraits, typename IdType>
 __device__ __forceinline__ void page_produce_kv_sf(
     typename KTraits::SharedStorage* smem_storage, uint8_t* sf_ptr,
     const uint32_t packed_page_iter_base, const uint32_t packed_kv_bound,
-    const uint32_t kv_head_idx, const uint32_t kv_stride_page, const uint32_t kv_stride_h,
-    const uint32_t kv_stride_n, const uint_fastdiv& page_size, const IdType* indices,
+    const uint32_t kv_head_idx, const uint32_t sf_stride_page, const uint32_t sf_stride_h,
+    const uint32_t sf_stride_n, const uint32_t sf_layout, const uint32_t sf_logical_cols,
+    const uint32_t sf_col_offset, const uint_fastdiv& page_size, const IdType* indices,
     const uint32_t kv_idx_base, const uint32_t kv_len, const uint32_t warp_idx,
     const uint32_t lane_idx) {
   if constexpr (!is_fp4_type_v<typename KTraits::DTypeKV>) return;
@@ -472,15 +519,13 @@ __device__ __forceinline__ void page_produce_kv_sf(
   constexpr uint32_t SF_COLS = HEAD_DIM / NVFP4_SF_VEC_SIZE;  // SF bytes per KV row
   constexpr uint32_t NUM_WARPS = KTraits::NUM_WARPS;
   constexpr uint32_t CTA_TILE_KV = KTraits::CTA_TILE_KV;
-  // DTypeKV containers per SF byte: NVFP4_SF_VEC_SIZE FP4 / 2 FP4-per-container.
-  constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;  // = 8
   constexpr uint32_t SF_TOTAL_BYTES = CTA_TILE_KV * SF_COLS;
   static_assert(SF_TOTAL_BYTES % 4 == 0, "SF smem size must be 4-byte aligned for 32-bit LDGSTS");
   // Each thread loads 4 SF bytes (32 bits) per iteration via LDGSTS.32.
   constexpr uint32_t THREADS_PER_CTA = NUM_WARPS * 32;
   constexpr uint32_t NUM_SF_ITERS = (SF_TOTAL_BYTES / 4 + THREADS_PER_CTA - 1) / THREADS_PER_CTA;
 
-  uint8_t* sf_smem = produce_v ? smem_storage->v_sf_smem : smem_storage->k_sf_smem;
+  uint8_t* sf_smem = produce_v ? smem_storage->v_sf_smem_ptr() : smem_storage->k_sf_smem_ptr();
   const uint32_t thread_id = warp_idx * 32 + lane_idx;
 
 #pragma unroll
@@ -494,26 +539,63 @@ __device__ __forceinline__ void page_produce_kv_sf(
     // For k < NUM_SF_ITERS-1, (flat_byte < SF_TOTAL_BYTES) is always true (optimized away).
     const bool in_bounds = (flat_byte < SF_TOTAL_BYTES) && (kv_idx_base + sf_smem_row < kv_len);
 
-    // SF strides are KV byte strides / SF_CONTAINERS (1 SF byte per SF_CONTAINERS KV containers).
     // packed_kv_bound guards indices[] access; returns offset 0 for out-of-range rows.
     uint32_t page_iter, entry_idx;
     const uint32_t packed_block_iter = packed_page_iter_base + sf_smem_row;
     page_size.divmod(packed_block_iter, page_iter, entry_idx);
-    const size_t sf_gmem_offset =
-        static_cast<size_t>(packed_block_iter < packed_kv_bound ? indices[page_iter] : 0) *
-            (kv_stride_page / SF_CONTAINERS) +
-        kv_head_idx * (kv_stride_h / SF_CONTAINERS) + entry_idx * (kv_stride_n / SF_CONTAINERS) +
-        sf_smem_col;
 
     // V SF must zero-fill out-of-bounds entries: compute_sfm_v reads SF for all CTA_TILE_KV rows
     // including padding, and 0 (softmax weight) * NaN (uninitialized SF) = NaN (IEEE 754).
     // K SF can use kNoFill since NaN K scores are replaced by -inf via logits_mask before
     // update_mdo_states, so they never reach the accumulator.
-    constexpr auto fill_mode =
-        produce_v ? cp_async::SharedMemFillMode::kFillZero : cp_async::SharedMemFillMode::kNoFill;
-    cp_async::pred_load_32b<fill_mode>(reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
-                                       reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset),
-                                       in_bounds);
+    if constexpr (produce_v) {
+      static_assert(SF_COLS % 4 == 0, "NVFP4 V scale swizzle requires four column groups");
+      if (sf_layout == static_cast<uint32_t>(NVFP4ScaleLayout::kLinear)) {
+        const size_t sf_gmem_offset =
+            static_cast<size_t>(packed_block_iter < packed_kv_bound ? indices[page_iter] : 0) *
+                sf_stride_page +
+            kv_head_idx * sf_stride_h + entry_idx * sf_stride_n + sf_smem_col;
+        cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
+            reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+            reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset), in_bounds);
+      } else if (flat_byte < SF_TOTAL_BYTES) {
+        const uint32_t logical_sf_cols = sf_logical_cols != 0 ? sf_logical_cols : SF_COLS;
+        const uint32_t sf_group_cols = logical_sf_cols / 4;
+        uint32_t sf_word = 0;
+#pragma unroll
+        for (uint32_t i = 0; i < 4; ++i) {
+          const uint32_t byte_idx = flat_byte + i;
+          const uint32_t sf_smem_row_i = byte_idx / SF_COLS;
+          const uint32_t sf_col = byte_idx % SF_COLS;
+          const uint32_t packed_block_iter_i = packed_page_iter_base + sf_smem_row_i;
+          uint32_t page_iter_i, entry_idx_i;
+          page_size.divmod(packed_block_iter_i, page_iter_i, entry_idx_i);
+          const bool in_bounds_i =
+              (byte_idx < SF_TOTAL_BYTES) && (kv_idx_base + sf_smem_row_i < kv_len);
+          const size_t page_offset =
+              static_cast<size_t>(packed_block_iter_i < packed_kv_bound ? indices[page_iter_i] : 0) *
+              sf_stride_page;
+          const uint32_t logical_sf_col = sf_col_offset + sf_col;
+          const uint32_t swizzled_entry_idx =
+              (entry_idx_i / 4) * 4 + (logical_sf_col / sf_group_cols);
+          const uint32_t swizzled_col = (logical_sf_col % sf_group_cols) * 4 + (entry_idx_i % 4);
+          const size_t sf_gmem_offset =
+              page_offset + kv_head_idx * sf_stride_h + swizzled_entry_idx * sf_stride_n +
+              swizzled_col;
+          const uint32_t sf_byte = in_bounds_i ? sf_ptr[sf_gmem_offset] : 0;
+          sf_word |= sf_byte << (i * 8);
+        }
+        *reinterpret_cast<uint32_t*>(sf_smem + flat_byte) = sf_word;
+      }
+    } else {
+      const size_t sf_gmem_offset =
+          static_cast<size_t>(packed_block_iter < packed_kv_bound ? indices[page_iter] : 0) *
+              sf_stride_page +
+          kv_head_idx * sf_stride_h + entry_idx * sf_stride_n + sf_smem_col;
+      cp_async::pred_load_32b<cp_async::SharedMemFillMode::kNoFill>(
+          reinterpret_cast<uint32_t*>(sf_smem + flat_byte),
+          reinterpret_cast<const uint32_t*>(sf_ptr + sf_gmem_offset), in_bounds);
+    }
   }
 }
 
@@ -561,7 +643,7 @@ __device__ __forceinline__ void produce_kv_sf(typename KTraits::SharedStorage* s
   constexpr uint32_t THREADS_PER_CTA = NUM_WARPS * 32;
   constexpr uint32_t NUM_SF_ITERS = (SF_TOTAL_BYTES / 4 + THREADS_PER_CTA - 1) / THREADS_PER_CTA;
 
-  uint8_t* sf_smem = produce_v ? smem_storage->v_sf_smem : smem_storage->k_sf_smem;
+  uint8_t* sf_smem = produce_v ? smem_storage->v_sf_smem_ptr() : smem_storage->k_sf_smem_ptr();
   const uint32_t thread_id = warp_idx * 32 + lane_idx;
   const uint32_t sf_stride_n = kv_stride_n / SF_CONTAINERS;
   const uint32_t sf_stride_h = kv_stride_h / SF_CONTAINERS;
@@ -820,6 +902,34 @@ __device__ __forceinline__ void k_smem_inplace_apply_rotary(
   }
 }
 
+template <typename DTypeQ>
+__device__ __forceinline__ std::conditional_t<std::is_same_v<DTypeQ, half>, half2,
+                                              __nv_bfloat162>
+make_e4m3_scale2(uint8_t lo, uint8_t hi) {
+  using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 130200)
+  if constexpr (std::is_same_v<DTypeQ, nv_bfloat16>) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
+    uint32_t out;
+    const uint16_t packed = static_cast<uint16_t>(lo) | (static_cast<uint16_t>(hi) << 8);
+    asm volatile("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(out) : "h"(packed));
+    return *reinterpret_cast<__nv_bfloat162*>(&out);
+#endif
+  }
+#endif
+  __nv_fp8_e4m3 lo_fp8, hi_fp8;
+  lo_fp8.__x = lo;
+  hi_fp8.__x = hi;
+  return packed2{static_cast<DTypeQ>(lo_fp8), static_cast<DTypeQ>(hi_fp8)};
+}
+
+template <typename DTypeQ>
+__device__ __forceinline__ std::conditional_t<std::is_same_v<DTypeQ, half>, half2,
+                                              __nv_bfloat162>
+make_duplicated_e4m3_scale2(uint8_t byte) {
+  return make_e4m3_scale2<DTypeQ>(byte, byte);
+}
+
 template <typename KTraits>
 __device__ __forceinline__ void compute_qk(
     smem_t<KTraits::SWIZZLE_MODE_Q>* q_smem, uint32_t* q_smem_offset_r,
@@ -868,11 +978,9 @@ __device__ __forceinline__ void compute_qk(
           using packed2_ = std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
           constexpr uint32_t SF_COLS_K = KTraits::NUM_MMA_D_QK;  // HEAD_DIM_QK / 16
           uint32_t sf_base = (mma_kv * 16 + lane_idx / 4) * SF_COLS_K + mma_d;
-          __nv_fp8_e4m3 sf_a_fp8, sf_b_fp8;
-          sf_a_fp8.__x = k_sf_smem[sf_base];
-          sf_b_fp8.__x = k_sf_smem[sf_base + 8 * SF_COLS_K];
-          packed2_ scale_a{static_cast<DTypeQ_>(sf_a_fp8), static_cast<DTypeQ_>(sf_a_fp8)};
-          packed2_ scale_b{static_cast<DTypeQ_>(sf_b_fp8), static_cast<DTypeQ_>(sf_b_fp8)};
+          packed2_ scale_a = make_duplicated_e4m3_scale2<DTypeQ_>(k_sf_smem[sf_base]);
+          packed2_ scale_b =
+              make_duplicated_e4m3_scale2<DTypeQ_>(k_sf_smem[sf_base + 8 * SF_COLS_K]);
           *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_a);
           *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_a);
           *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_b);
@@ -1185,12 +1293,440 @@ __device__ __forceinline__ void update_mdo_states(
   }
 }
 
+__device__ __forceinline__ float e2m1_nibble_to_float(uint32_t x) {
+  x &= 0xFu;
+  const float mag = (x == 0 || x == 8)   ? 0.f
+                    : (x == 1 || x == 9) ? 0.5f
+                    : (x == 2 || x == 10)
+                        ? 1.f
+                        : (x == 3 || x == 11)
+                            ? 1.5f
+                            : (x == 4 || x == 12)
+                                ? 2.f
+                                : (x == 5 || x == 13) ? 3.f : (x == 6 || x == 14) ? 4.f : 6.f;
+  return (x & 0x8u) ? -mag : mag;
+}
+
+__device__ __forceinline__ bool finite_fp32(float x) {
+  return x == x && fabsf(x) != math::inf;
+}
+
+__device__ __forceinline__ uint8_t fp32_to_ue4m3_byte(float x) {
+  if (!(x > 0.f) || !finite_fp32(x)) {
+    x = 1.f;
+  }
+  x = min(x, 448.f);
+  __nv_fp8_e4m3 y = static_cast<__nv_fp8_e4m3>(x);
+  const uint8_t byte = y.__x;
+  return x > 0.f && byte == 0 ? 1 : byte;
+}
+
+__device__ __forceinline__ float ue4m3_byte_to_fp32(uint8_t x) {
+  __nv_fp8_e4m3 y;
+  y.__x = x;
+  return static_cast<float>(y);
+}
+
+__device__ __forceinline__ float finite_or_zero(float x) {
+  return finite_fp32(x) ? x : 0.f;
+}
+
+__device__ __forceinline__ float clamp_e2m1_finite(float x) {
+  x = finite_or_zero(x);
+  return min(max(x, -6.f), 6.f);
+}
+
+__device__ __forceinline__ float round_e2m1_to_float(float x) {
+  x = clamp_e2m1_finite(x);
+  const float sign = x < 0.f ? -1.f : 1.f;
+  const float ax = fabsf(x);
+  const float mag = ax < 0.25f     ? 0.f
+                    : ax < 0.75f   ? 0.5f
+                    : ax < 1.25f   ? 1.f
+                    : ax < 1.75f   ? 1.5f
+                    : ax < 2.5f    ? 2.f
+                    : ax < 3.5f    ? 3.f
+                    : ax < 5.f     ? 4.f
+                                      : 6.f;
+  return sign * mag;
+}
+
+template <uint32_t N>
+__device__ __forceinline__ uint8_t choose_e2m1_scale_byte(const float (&values)[N],
+                                                          float max_abs) {
+  if (!(max_abs > 0.f) || !finite_fp32(max_abs)) {
+    return fp32_to_ue4m3_byte(1.f);
+  }
+
+  const float denominators[6] = {1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+  float best_error = math::inf;
+  uint8_t best_byte = fp32_to_ue4m3_byte(max_abs / 6.f);
+
+#pragma unroll
+  for (uint32_t candidate = 0; candidate < 6; ++candidate) {
+    const uint8_t scale_byte = fp32_to_ue4m3_byte(max_abs / denominators[candidate]);
+    const float scale = ue4m3_byte_to_fp32(scale_byte);
+    if (!(scale > 0.f) || !finite_fp32(scale)) {
+      continue;
+    }
+    float error = 0.f;
+#pragma unroll
+    for (uint32_t i = 0; i < N; ++i) {
+      const float reconstructed = round_e2m1_to_float(values[i] / scale) * scale;
+      const float diff = reconstructed - values[i];
+      error += diff * diff;
+    }
+    if (error < best_error) {
+      best_error = error;
+      best_byte = scale_byte;
+    }
+  }
+  return best_byte;
+}
+
+template <typename KTraits>
+static constexpr bool use_native_fp4_pv() {
+  return is_fp4_type_v<typename KTraits::DTypeKV> &&
+         std::is_same_v<typename KTraits::DTypeQKAccum, float> &&
+         KTraits::NUM_MMA_KV == 4 && KTraits::NUM_WARPS_KV == 1 &&
+         KTraits::SWIZZLE_MODE_KV == SwizzleMode::k128B &&
+         KTraits::HEAD_DIM_QK == 512 && KTraits::HEAD_DIM_VO == 256;
+}
+
+template <typename DTypeKV, uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO>
+static constexpr bool prefer_native_fp4_pv_tile() {
+  return is_fp4_type_v<DTypeKV> && CTA_TILE_Q == 32 && HEAD_DIM_QK == 512 && HEAD_DIM_VO == 256;
+}
+
+template <typename KTraits>
+__device__ __forceinline__ float get_s_frag_value(
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], uint32_t mma_q,
+    uint32_t row, uint32_t col) {
+  static_assert(std::is_same_v<typename KTraits::DTypeQKAccum, float>);
+  const uint32_t mma_kv = col / 16;
+  const uint32_t col_in_mma = col % 16;
+  const uint32_t row_group = row >> 3;
+  const uint32_t owner_lane = 4 * (row & 0x7u) + ((col_in_mma >> 1) & 0x3u);
+  float value = 0.f;
+#pragma unroll
+  for (uint32_t candidate_mma_kv = 0; candidate_mma_kv < KTraits::NUM_MMA_KV;
+       ++candidate_mma_kv) {
+#pragma unroll
+    for (uint32_t candidate_row_group = 0; candidate_row_group < 2; ++candidate_row_group) {
+      const uint32_t candidate_reg =
+          (col_in_mma >> 3) * 4 + candidate_row_group * 2 + (col_in_mma & 0x1u);
+      const float fetched = __shfl_sync(
+          0xffffffff, s_frag[mma_q][candidate_mma_kv][candidate_reg], owner_lane);
+      value = candidate_mma_kv == mma_kv && candidate_row_group == row_group ? fetched : value;
+    }
+  }
+  return value;
+}
+
+__device__ __forceinline__ float get_s_row_boost(const float* row_boost, uint32_t row) {
+  const uint32_t owner_lane = 4 * (row & 0x7u);
+  const uint32_t row_group = row >> 3;
+  float value = 1.f;
+#pragma unroll
+  for (uint32_t candidate_group = 0; candidate_group < 2; ++candidate_group) {
+    const float fetched = __shfl_sync(0xffffffff, row_boost[candidate_group], owner_lane);
+    value = candidate_group == row_group ? fetched : value;
+  }
+  return value;
+}
+
+template <typename KTraits>
+__device__ __forceinline__ uint8_t quantized_s_scale_byte(
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], uint32_t mma_q,
+    uint32_t row, uint32_t scale_idx, float row_boost) {
+  float values[16];
+  float max_abs = 0.f;
+  uint32_t value_idx = 0;
+#pragma unroll
+  for (uint32_t k_pair = 0; k_pair < 2; ++k_pair) {
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      const uint32_t col =
+          16 * (2 * (scale_idx & 0x1u) + k_pair) + 8 * (scale_idx >> 1) + i;
+      const float value =
+          finite_or_zero(get_s_frag_value<KTraits>(s_frag, mma_q, row, col)) * row_boost;
+      values[value_idx++] = value;
+      max_abs = max(max_abs, fabsf(value));
+    }
+  }
+  return choose_e2m1_scale_byte(values, max_abs);
+}
+
+template <typename KTraits>
+__device__ __forceinline__ uint8_t load_fp4_v_byte(
+    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t row, uint32_t packed_col) {
+  constexpr uint32_t UPCAST_STRIDE_V = KTraits::UPCAST_STRIDE_V;
+  const uint32_t smem_col = packed_col / 8;
+  const uint32_t byte_in_vec = packed_col % 8;
+  const uint32_t offset =
+      smem_t<KTraits::SWIZZLE_MODE_KV>::template get_permuted_offset<UPCAST_STRIDE_V>(row, smem_col);
+  const auto* ptr = reinterpret_cast<const uint8_t*>(v_smem->base + offset);
+  return ptr[byte_in_vec];
+}
+
+template <typename KTraits>
+__device__ __forceinline__ float get_v_value(smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem,
+                                             uint8_t* v_sf_smem, uint32_t row,
+                                             uint32_t col) {
+  constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;
+  const uint8_t packed = load_fp4_v_byte<KTraits>(v_smem, row, col / 2);
+  const uint32_t nibble = (col & 1u) ? (packed >> 4) : (packed & 0xFu);
+  const float scale = ue4m3_byte_to_fp32(v_sf_smem[row * SF_COLS_V + col / NVFP4_SF_VEC_SIZE]);
+  return e2m1_nibble_to_float(nibble) * scale;
+}
+
+template <typename KTraits>
+__device__ __forceinline__ uint8_t quantized_v_scale_byte(
+    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint8_t* v_sf_smem, uint32_t col,
+    uint32_t k_group) {
+  float values[16];
+  float max_abs = 0.f;
+#pragma unroll
+  for (uint32_t i = 0; i < 16; ++i) {
+    const uint32_t row = k_group * 16 + i;
+    const float value = finite_or_zero(get_v_value<KTraits>(v_smem, v_sf_smem, row, col));
+    values[i] = value;
+    max_abs = max(max_abs, fabsf(value));
+  }
+  return choose_e2m1_scale_byte(values, max_abs);
+}
+
+__device__ __forceinline__ uint32_t nvfp4_mma_scale_idx_for_k(uint32_t k) {
+  return ((k >> 5) & 0x1u) + 2 * ((k >> 3) & 0x1u);
+}
+
+template <typename KTraits>
+__device__ __forceinline__ uint32_t make_s_scale_reg(
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], uint32_t mma_q,
+    const float* row_boost) {
+  const uint32_t lane_idx = threadIdx.x;
+  const uint32_t row = (lane_idx >> 2) + 8 * (lane_idx & 0x1u);
+  uint8_t scale_bytes[4];
+#pragma unroll
+  for (uint32_t scale_idx = 0; scale_idx < 4; ++scale_idx) {
+    scale_bytes[scale_idx] =
+        quantized_s_scale_byte<KTraits>(s_frag, mma_q, row, scale_idx,
+                                        get_s_row_boost(row_boost, row));
+  }
+  return mma::pack_e4m3_scale_reg(scale_bytes[0], scale_bytes[1], scale_bytes[2],
+                                  scale_bytes[3]);
+}
+
+template <typename KTraits>
+__device__ __forceinline__ uint32_t make_v_scale_reg(
+    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint8_t* v_sf_smem, uint32_t mma_d,
+    uint32_t atom_n_offset) {
+  const uint32_t lane_idx = threadIdx.x;
+  const uint32_t k_group = (lane_idx >> 2) & 0x3u;
+  uint8_t scale_bytes[4];
+#pragma unroll
+  for (uint32_t scale_idx = 0; scale_idx < 4; ++scale_idx) {
+    const uint32_t n = atom_n_offset + 2 * scale_idx + ((lane_idx >> 4) & 0x1u);
+    scale_bytes[scale_idx] = quantized_v_scale_byte<KTraits>(
+        v_smem, v_sf_smem, mma_d * 16 + n, k_group);
+  }
+  return mma::pack_e4m3_scale_reg(scale_bytes[0], scale_bytes[1], scale_bytes[2],
+                                  scale_bytes[3]);
+}
+
+template <typename KTraits>
+__device__ __forceinline__ float get_quantized_s_scale(
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], uint32_t mma_q,
+    uint32_t row, uint32_t scale_idx, float row_boost) {
+  return ue4m3_byte_to_fp32(
+      quantized_s_scale_byte<KTraits>(s_frag, mma_q, row, scale_idx, row_boost));
+}
+
+__device__ __forceinline__ uint8_t get_s_scale_byte_from_reg(uint32_t scale_reg, uint32_t row,
+                                                             uint32_t k) {
+  const uint32_t owner_lane = 4 * (row & 0x7u) + (row >> 3);
+  const uint32_t scale_idx = nvfp4_mma_scale_idx_for_k(k);
+  const uint32_t owner_scale_reg = __shfl_sync(0xffffffff, scale_reg, owner_lane);
+  return static_cast<uint8_t>((owner_scale_reg >> (8 * scale_idx)) & 0xffu);
+}
+
+__device__ __forceinline__ uint8_t get_v_scale_byte_from_reg(uint32_t scale_reg, uint32_t n,
+                                                             uint32_t k) {
+  const uint32_t n_local = n & 0x7u;
+  const uint32_t k_group = k >> 4;
+  const uint32_t owner_lane = ((n_local & 0x1u) << 4) | (k_group << 2);
+  const uint32_t scale_idx = n_local >> 1;
+  const uint32_t owner_scale_reg = __shfl_sync(0xffffffff, scale_reg, owner_lane);
+  return static_cast<uint8_t>((owner_scale_reg >> (8 * scale_idx)) & 0xffu);
+}
+
+template <typename KTraits>
+__device__ __forceinline__ float get_quantized_v_scale(
+    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint8_t* v_sf_smem, uint32_t col,
+    uint32_t scale_idx) {
+  return ue4m3_byte_to_fp32(quantized_v_scale_byte<KTraits>(v_smem, v_sf_smem, col, scale_idx));
+}
+
+template <typename KTraits>
+__device__ __forceinline__ void make_s_frag_fp4(
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8], uint32_t mma_q,
+    uint32_t scale_reg, const float* row_boost, uint32_t* a_frag) {
+  const uint32_t lane_idx = threadIdx.x;
+#pragma unroll
+  for (uint32_t reg = 0; reg < 4; ++reg) {
+    float vals[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      const uint32_t row = (lane_idx >> 2) + 8 * (reg & 0x1u);
+      const uint32_t col = 16 * (lane_idx & 0x3u) + 8 * (reg >> 1) + i;
+      const float scale = ue4m3_byte_to_fp32(get_s_scale_byte_from_reg(scale_reg, row, col));
+      vals[i] =
+          clamp_e2m1_finite(scale > 0.f ? get_s_frag_value<KTraits>(s_frag, mma_q, row, col) *
+                                               get_s_row_boost(row_boost, row) / scale
+                                         : 0.f);
+    }
+    a_frag[reg] = mma::float8_to_e2m1x8(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5],
+                                        vals[6], vals[7]);
+  }
+}
+
+template <typename KTraits>
+__device__ __forceinline__ void make_v_frag_fp4(smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem,
+                                                uint8_t* v_sf_smem, uint32_t mma_d,
+                                                uint32_t atom_n_offset, uint32_t scale_reg,
+                                                uint32_t* b_frag) {
+  const uint32_t lane_idx = threadIdx.x;
+#pragma unroll
+  for (uint32_t reg = 0; reg < 2; ++reg) {
+    float vals[8];
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      const uint32_t n = lane_idx >> 2;
+      const uint32_t k = 16 * (lane_idx & 0x3u) + 8 * reg + i;
+      const uint32_t col = mma_d * 16 + atom_n_offset + n;
+      const float scale = ue4m3_byte_to_fp32(get_v_scale_byte_from_reg(scale_reg, n, k));
+      vals[i] =
+          clamp_e2m1_finite(scale > 0.f ? get_v_value<KTraits>(v_smem, v_sf_smem, k, col) /
+                                               scale
+                                         : 0.f);
+    }
+    b_frag[reg] = mma::float8_to_e2m1x8(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5],
+                                        vals[6], vals[7]);
+  }
+}
+
+template <typename KTraits>
+__device__ __forceinline__ void compute_sfm_v_native_fp4(
+    smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint8_t* v_sf_smem,
+    typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
+    float (*o_frag)[KTraits::NUM_MMA_D_VO][8], float (*d)[2]) {
+#if defined(FLASHINFER_MMA_F4F4F32_M16N8K64_ENABLED)
+  static_assert(use_native_fp4_pv<KTraits>());
+  float current_d[KTraits::NUM_MMA_Q][2];
+  uint32_t a_frag[KTraits::NUM_MMA_Q][4];
+  uint32_t scale_a[KTraits::NUM_MMA_Q];
+  float row_boost[KTraits::NUM_MMA_Q][2];
+  float quant_d[KTraits::NUM_MMA_Q][8];
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+    for (uint32_t row_group = 0; row_group < 2; ++row_group) {
+      float row_sum = 0.f;
+      float row_max = 0.f;
+#pragma unroll
+      for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
+        const float s0 = finite_or_zero(s_frag[mma_q][mma_kv][row_group * 2 + 0]);
+        const float s1 = finite_or_zero(s_frag[mma_q][mma_kv][row_group * 2 + 1]);
+        const float s2 = finite_or_zero(s_frag[mma_q][mma_kv][row_group * 2 + 4]);
+        const float s3 = finite_or_zero(s_frag[mma_q][mma_kv][row_group * 2 + 5]);
+        row_sum += s0 + s1 + s2 + s3;
+        row_max = max(row_max, max(max(fabsf(s0), fabsf(s1)), max(fabsf(s2), fabsf(s3))));
+      }
+      row_sum += math::shfl_xor_sync(row_sum, 0x2);
+      row_sum += math::shfl_xor_sync(row_sum, 0x1);
+      row_max = max(row_max, math::shfl_xor_sync(row_max, 0x2));
+      row_max = max(row_max, math::shfl_xor_sync(row_max, 0x1));
+      current_d[mma_q][row_group] = row_sum;
+      float boost = 1.f;
+      if constexpr (KTraits::AttentionVariant::use_softmax) {
+        if (row_max > 0.f && finite_fp32(row_max)) {
+          const float row_max_rcp = 1.f / row_max;
+          boost = finite_fp32(row_max_rcp) ? row_max_rcp : 1.f;
+        }
+      }
+      row_boost[mma_q][row_group] = boost;
+      if constexpr (KTraits::AttentionVariant::use_softmax) {
+        d[mma_q][row_group] += row_sum;
+      }
+    }
+    scale_a[mma_q] = make_s_scale_reg<KTraits>(s_frag, mma_q, row_boost[mma_q]);
+    make_s_frag_fp4<KTraits>(s_frag, mma_q, scale_a[mma_q], row_boost[mma_q], a_frag[mma_q]);
+#pragma unroll
+    for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+      quant_d[mma_q][reg_id] = 0.f;
+    }
+  }
+
+  uint32_t ones_frag[4] = {0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u};
+  constexpr uint32_t ones_scale = 0x38383838u;
+#pragma unroll
+  for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+    mma::mma_sync_m16n16k64_row_col_f4f4f32<mma::MMAMode::kInit>(
+        quant_d[mma_q], a_frag[mma_q], ones_frag, scale_a[mma_q], ones_scale, ones_scale);
+  }
+#pragma unroll
+  for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO; ++mma_d) {
+    uint32_t b_frag[4];
+    float pv_frag[KTraits::NUM_MMA_Q][8];
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        pv_frag[mma_q][reg_id] = 0.f;
+      }
+    }
+    const uint32_t scale_b0 = make_v_scale_reg<KTraits>(v_smem, v_sf_smem, mma_d, 0);
+    const uint32_t scale_b1 = make_v_scale_reg<KTraits>(v_smem, v_sf_smem, mma_d, 8);
+    make_v_frag_fp4<KTraits>(v_smem, v_sf_smem, mma_d, 0, scale_b0, b_frag);
+    make_v_frag_fp4<KTraits>(v_smem, v_sf_smem, mma_d, 8, scale_b1, b_frag + 2);
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+      mma::mma_sync_m16n16k64_row_col_f4f4f32<mma::MMAMode::kInit>(
+          pv_frag[mma_q], a_frag[mma_q], b_frag, scale_a[mma_q], scale_b0, scale_b1);
+    }
+#pragma unroll
+    for (uint32_t mma_q = 0; mma_q < KTraits::NUM_MMA_Q; ++mma_q) {
+#pragma unroll
+      for (uint32_t reg_id = 0; reg_id < 8; ++reg_id) {
+        const uint32_t row_group = (reg_id % 4) / 2;
+        const float denom = quant_d[mma_q][reg_id];
+        float correction = 1.f;
+        if constexpr (KTraits::AttentionVariant::use_softmax) {
+          correction = denom > 1.0e-6f && finite_fp32(denom) &&
+                               finite_fp32(current_d[mma_q][row_group])
+                           ? current_d[mma_q][row_group] / denom
+                           : 0.f;
+        }
+        o_frag[mma_q][mma_d][reg_id] += pv_frag[mma_q][reg_id] * correction;
+      }
+    }
+  }
+#else
+  FLASHINFER_RUNTIME_ASSERT("Native FP4 PV requires CUDA 12.8+ SM120/SM121 MMA support.");
+#endif
+}
+
 template <typename KTraits>
 __device__ __forceinline__ void compute_sfm_v(
     smem_t<KTraits::SWIZZLE_MODE_KV>* v_smem, uint32_t* v_smem_offset_r, uint8_t* v_sf_smem,
     uint32_t lane_idx, typename KTraits::DTypeQKAccum (*s_frag)[KTraits::NUM_MMA_KV][8],
     float (*o_frag)[KTraits::NUM_MMA_D_VO][8], float (*d)[2]) {
   constexpr uint32_t UPCAST_STRIDE_V = KTraits::UPCAST_STRIDE_V;
+
+  if constexpr (use_native_fp4_pv<KTraits>()) {
+    compute_sfm_v_native_fp4<KTraits>(v_smem, v_sf_smem, s_frag, o_frag, d);
+    return;
+  }
 
   typename KTraits::DTypeQ s_frag_f16[KTraits::NUM_MMA_Q][KTraits::NUM_MMA_KV][8];
   if constexpr (std::is_same_v<typename KTraits::DTypeQKAccum, float>) {
@@ -1251,13 +1787,10 @@ __device__ __forceinline__ void compute_sfm_v(
           using packed2_ = std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
           constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;  // HEAD_DIM_VO / 16
           uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + mma_d;
-          __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
-          sf0_fp8.__x = v_sf_smem[sf_base];
-          sf1_fp8.__x = v_sf_smem[sf_base + SF_COLS_V];
-          sf2_fp8.__x = v_sf_smem[sf_base + 8 * SF_COLS_V];
-          sf3_fp8.__x = v_sf_smem[sf_base + 9 * SF_COLS_V];
-          packed2_ scale_lo{static_cast<DTypeQ_>(sf0_fp8), static_cast<DTypeQ_>(sf1_fp8)};
-          packed2_ scale_hi{static_cast<DTypeQ_>(sf2_fp8), static_cast<DTypeQ_>(sf3_fp8)};
+          packed2_ scale_lo =
+              make_e4m3_scale2<DTypeQ_>(v_sf_smem[sf_base], v_sf_smem[sf_base + SF_COLS_V]);
+          packed2_ scale_hi = make_e4m3_scale2<DTypeQ_>(
+              v_sf_smem[sf_base + 8 * SF_COLS_V], v_sf_smem[sf_base + 9 * SF_COLS_V]);
           *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_lo);
           *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_hi);
           *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_lo);
@@ -1775,9 +2308,9 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-                          smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
-                                                       KTraits::NUM_MMA_KV * 16 *
-                                                       KTraits::NUM_MMA_D_QK,
+                          smem_storage.k_sf_smem_ptr() + get_warp_idx_kv<KTraits>(tid.z) *
+                                                             KTraits::NUM_MMA_KV * 16 *
+                                                             KTraits::NUM_MMA_D_QK,
                           lane_idx, s_frag);
       uint32_t kv_idx_base =
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
@@ -1805,9 +2338,9 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
 
       // compute sfm*v
       compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r,
-                             smem_storage.v_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
-                                                          KTraits::NUM_MMA_KV * 16 *
-                                                          KTraits::NUM_MMA_D_VO,
+                             smem_storage.v_sf_smem_ptr() + get_warp_idx_kv<KTraits>(tid.z) *
+                                                                KTraits::NUM_MMA_KV * 16 *
+                                                                KTraits::NUM_MMA_D_VO,
                              lane_idx, s_frag, o_frag, d);
 
       block.sync();
@@ -1900,7 +2433,8 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
   constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
   constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
   int64_t packed_qo_len = qo_len * group_size;
-  uint32_t cta_tile_q = FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_VO);
+  uint32_t cta_tile_q =
+      FA2DetermineCtaTileQ(packed_qo_len, HEAD_DIM_QK > HEAD_DIM_VO ? HEAD_DIM_QK : HEAD_DIM_VO);
 
   DISPATCH_CTA_TILE_Q(cta_tile_q, CTA_TILE_Q, {
     constexpr uint32_t NUM_WARPS_Q = get_num_warps_q(CTA_TILE_Q);
@@ -1916,19 +2450,29 @@ cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::D
     int max_smem_per_sm = 0;
     FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(
         &max_smem_per_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
-    // we expect each sm execute two threadblocks
+    constexpr bool prefer_native_fp4_pv =
+        prefer_native_fp4_pv_tile<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>();
+    // The native FP4 PV path needs a K64 V tile resident in shared memory. Prefer one CTA/SM
+    // for this shape; the generic path keeps the existing two-CTA occupancy heuristic.
     const int num_ctas_per_sm =
-        max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                                (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-            ? 2
-            : 1;
+        prefer_native_fp4_pv
+            ? 1
+            : (max_smem_per_sm >=
+                       2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+                            (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+                ? 2
+                : 1);
     const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
     const uint32_t max_num_mma_kv_reg =
-        (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
-         !USE_FP16_QK_REDUCTION)
-            ? 2
-            : (8 / NUM_MMA_Q);
+        prefer_native_fp4_pv
+            ? 4
+            : ((is_fp4_type_v<DTypeKV> && HEAD_DIM_QK == 512 && HEAD_DIM_VO == 512)
+                   ? 2
+                   : ((HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 &&
+                       POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && !USE_FP16_QK_REDUCTION)
+                          ? 2
+                          : (8 / NUM_MMA_Q)));
     const uint32_t max_num_mma_kv_smem =
         (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
         ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
@@ -2121,7 +2665,10 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     const uint32_t qo_packed_idx_base =
         (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) * NUM_MMA_Q * 16;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
-    const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
+    const uint32_t compact_o_stride_n = num_qo_heads * HEAD_DIM_VO;
+    const uint32_t compact_o_stride_h = HEAD_DIM_VO;
+    const uint32_t o_stride_n = partition_kv ? compact_o_stride_n : params.o_stride_n;
+    const uint32_t o_stride_h = partition_kv ? compact_o_stride_h : params.o_stride_h;
 
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + kv_head_idx * group_size * q_stride_h;
@@ -2244,9 +2791,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-                          smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
-                                                       KTraits::NUM_MMA_KV * 16 *
-                                                       KTraits::NUM_MMA_D_QK,
+                          smem_storage.k_sf_smem_ptr() + get_warp_idx_kv<KTraits>(tid.z) *
+                                                             KTraits::NUM_MMA_KV * 16 *
+                                                             KTraits::NUM_MMA_D_QK,
                           lane_idx, s_frag);
       uint32_t kv_idx_base =
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
@@ -2275,9 +2822,9 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
 
       // compute sfm*v
       compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r,
-                             smem_storage.v_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
-                                                          KTraits::NUM_MMA_KV * 16 *
-                                                          KTraits::NUM_MMA_D_VO,
+                             smem_storage.v_sf_smem_ptr() + get_warp_idx_kv<KTraits>(tid.z) *
+                                                                KTraits::NUM_MMA_KV * 16 *
+                                                                KTraits::NUM_MMA_D_VO,
                              lane_idx, s_frag, o_frag, d);
 
       block.sync();
@@ -2306,7 +2853,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
     // write back
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
                               /*o_stride_n=*/
-                              partition_kv ? num_kv_chunks * o_stride_n : o_stride_n,
+                              partition_kv ? num_kv_chunks * compact_o_stride_n : o_stride_n,
                               /*o_stride_h=*/o_stride_h, group_size, tid);
 
     // write lse
@@ -2417,6 +2964,37 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     if constexpr (has_maybe_v_cache_sf_v<Params>) {
       maybe_v_cache_sf = params.maybe_v_cache_sf;
     }
+    constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;
+    uint32_t k_cache_sf_stride_page = paged_kv.stride_page / SF_CONTAINERS;
+    uint32_t k_cache_sf_stride_h = paged_kv.stride_h / SF_CONTAINERS;
+    uint32_t k_cache_sf_stride_n = paged_kv.stride_n / SF_CONTAINERS;
+    uint32_t v_cache_sf_stride_page = paged_kv.stride_page / SF_CONTAINERS;
+    uint32_t v_cache_sf_stride_h = paged_kv.stride_h / SF_CONTAINERS;
+    uint32_t v_cache_sf_stride_n = paged_kv.stride_n / SF_CONTAINERS;
+    uint32_t v_cache_sf_layout = static_cast<uint32_t>(NVFP4ScaleLayout::kTRTLLMInterleaved);
+    uint32_t v_cache_sf_logical_cols = 0;
+    uint32_t v_cache_sf_col_offset = 0;
+    if constexpr (has_k_cache_sf_stride_page_v<Params>) {
+      if (params.k_cache_sf_stride_page != 0) {
+        k_cache_sf_stride_page = params.k_cache_sf_stride_page;
+        k_cache_sf_stride_h = params.k_cache_sf_stride_h;
+        k_cache_sf_stride_n = params.k_cache_sf_stride_n;
+      }
+    }
+    if constexpr (has_v_cache_sf_stride_page_v<Params>) {
+      if (params.v_cache_sf_stride_page != 0) {
+        v_cache_sf_stride_page = params.v_cache_sf_stride_page;
+        v_cache_sf_stride_h = params.v_cache_sf_stride_h;
+        v_cache_sf_stride_n = params.v_cache_sf_stride_n;
+      }
+    }
+    if constexpr (has_v_cache_sf_layout_v<Params>) {
+      v_cache_sf_layout = params.v_cache_sf_layout;
+    }
+    if constexpr (has_v_cache_sf_logical_cols_v<Params>) {
+      v_cache_sf_logical_cols = params.v_cache_sf_logical_cols;
+      v_cache_sf_col_offset = params.v_cache_sf_col_offset;
+    }
 
     static_assert(sizeof(DTypeQ) == 2);
     auto block = cg::this_thread_block();
@@ -2463,7 +3041,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
         (qo_tile_idx * NUM_WARPS_Q + get_warp_idx_q<KTraits>(tid.y)) * NUM_MMA_Q * 16;
     const uint32_t q_stride_n = params.q_stride_n, q_stride_h = params.q_stride_h;
     smem_t<SWIZZLE_MODE_Q> qo_smem(smem_storage.q_smem);
-    const uint32_t o_stride_n = num_qo_heads * HEAD_DIM_VO, o_stride_h = HEAD_DIM_VO;
+    const uint32_t compact_o_stride_n = num_qo_heads * HEAD_DIM_VO;
+    const uint32_t compact_o_stride_h = HEAD_DIM_VO;
+    const uint32_t o_stride_n = partition_kv ? compact_o_stride_n : params.o_stride_n;
+    const uint32_t o_stride_h = partition_kv ? compact_o_stride_h : params.o_stride_h;
 
     DTypeQ* q_ptr_base =
         q + q_indptr[request_idx] * q_stride_n + (kv_head_idx * group_size) * q_stride_h;
@@ -2538,17 +3119,21 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                                     thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
     page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
                                        last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-                                       paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
-                                       paged_kv.page_size, paged_kv.indices, 0, chunk_size,
-                                       warp_idx, lane_idx);
+                                       k_cache_sf_stride_page, k_cache_sf_stride_h,
+                                       k_cache_sf_stride_n, 0, 0, 0, paged_kv.page_size,
+                                       paged_kv.indices, 0, chunk_size, warp_idx, lane_idx);
     cp_async::commit_group();
     page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
                                    thr_local_kv_offset, chunk_size, warp_idx, lane_idx);
-    page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
-                                      last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-                                      paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
-                                      paged_kv.page_size, paged_kv.indices, 0, chunk_size, warp_idx,
-                                      lane_idx);
+    if constexpr (!KTraits::SharedStorage::SHARE_KV_SF_SMEM) {
+      page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
+                                        last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                                        v_cache_sf_stride_page, v_cache_sf_stride_h,
+                                        v_cache_sf_stride_n, v_cache_sf_layout,
+                                        v_cache_sf_logical_cols,
+                                        v_cache_sf_col_offset, paged_kv.page_size,
+                                        paged_kv.indices, 0, chunk_size, warp_idx, lane_idx);
+    }
     cp_async::commit_group();
 
     uint32_t num_iterations_prefix;
@@ -2615,6 +3200,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
               ? ((iter + 1 == num_iterations_prefix) ? (num_iterations_mask - num_iterations_prefix)
                                                      : 0)
               : 0;
+      const uint32_t current_packed_page_iter_base = packed_page_iter_base;
       packed_page_iter_base += (1 + prefetch_skip_step) * CTA_TILE_KV;
 #pragma unroll
       for (uint32_t i = 0;
@@ -2643,9 +3229,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 
       // compute attention score
       compute_qk<KTraits>(&qo_smem, &q_smem_offset_r, &k_smem, &k_smem_offset_r,
-                          smem_storage.k_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
-                                                       KTraits::NUM_MMA_KV * 16 *
-                                                       KTraits::NUM_MMA_D_QK,
+                          smem_storage.k_sf_smem_ptr() + get_warp_idx_kv<KTraits>(tid.z) *
+                                                             KTraits::NUM_MMA_KV * 16 *
+                                                             KTraits::NUM_MMA_D_QK,
                           lane_idx, s_frag);
       uint32_t kv_idx_base =
           chunk_start + (iter * NUM_WARPS_KV + get_warp_idx_kv<KTraits>(tid.z)) * NUM_MMA_KV * 16;
@@ -2685,35 +3271,65 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // compute m,d states in online softmax
       update_mdo_states<KTraits>(variant, s_frag, o_frag, m, d);
 
+      if constexpr (KTraits::SharedStorage::SHARE_KV_SF_SMEM) {
+        page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf,
+                                          current_packed_page_iter_base,
+                                          last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                                          v_cache_sf_stride_page, v_cache_sf_stride_h,
+                                          v_cache_sf_stride_n, v_cache_sf_layout,
+                                          v_cache_sf_logical_cols,
+                                          v_cache_sf_col_offset, paged_kv.page_size,
+                                          paged_kv.indices, iter * CTA_TILE_KV, chunk_size,
+                                          warp_idx, lane_idx);
+        cp_async::commit_group();
+      }
+
       block.sync();
       page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data,
                                       (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
                                       warp_idx, lane_idx);
-      page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
-                                         last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-                                         paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
-                                         paged_kv.page_size, paged_kv.indices,
-                                         (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+      if constexpr (!KTraits::SharedStorage::SHARE_KV_SF_SMEM) {
+        page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
+                                           last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                                           k_cache_sf_stride_page, k_cache_sf_stride_h,
+                                           k_cache_sf_stride_n, 0, 0, 0, paged_kv.page_size,
+                                           paged_kv.indices, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                           warp_idx, lane_idx);
+      }
       cp_async::commit_group();
       cp_async::wait_group<1>();
       block.sync();
 
       // compute sfm*v
       compute_sfm_v<KTraits>(&v_smem, &v_smem_offset_r,
-                             smem_storage.v_sf_smem + get_warp_idx_kv<KTraits>(tid.z) *
-                                                          KTraits::NUM_MMA_KV * 16 *
-                                                          KTraits::NUM_MMA_D_VO,
+                             smem_storage.v_sf_smem_ptr() + get_warp_idx_kv<KTraits>(tid.z) *
+                                                                KTraits::NUM_MMA_KV * 16 *
+                                                                KTraits::NUM_MMA_D_VO,
                              lane_idx, s_frag, o_frag, d);
 
       block.sync();
+      if constexpr (KTraits::SharedStorage::SHARE_KV_SF_SMEM) {
+        page_produce_kv_sf<false, KTraits>(&smem_storage, maybe_k_cache_sf, packed_page_iter_base,
+                                           last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                                           k_cache_sf_stride_page, k_cache_sf_stride_h,
+                                           k_cache_sf_stride_n, 0, 0, 0, paged_kv.page_size,
+                                           paged_kv.indices, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                           warp_idx, lane_idx);
+        cp_async::commit_group();
+      }
       page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
                                      (iter + 1) * CTA_TILE_KV, thr_local_kv_offset, chunk_size,
                                      warp_idx, lane_idx);
-      page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
-                                        last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
-                                        paged_kv.stride_page, paged_kv.stride_h, paged_kv.stride_n,
-                                        paged_kv.page_size, paged_kv.indices,
-                                        (iter + 1) * CTA_TILE_KV, chunk_size, warp_idx, lane_idx);
+      if constexpr (!KTraits::SharedStorage::SHARE_KV_SF_SMEM) {
+        page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
+                                          last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
+                                          v_cache_sf_stride_page, v_cache_sf_stride_h,
+                                          v_cache_sf_stride_n, v_cache_sf_layout,
+                                          v_cache_sf_logical_cols,
+                                          v_cache_sf_col_offset, paged_kv.page_size,
+                                          paged_kv.indices, (iter + 1) * CTA_TILE_KV, chunk_size,
+                                          warp_idx, lane_idx);
+      }
       cp_async::commit_group();
     }
     cp_async::wait_group<0>();
@@ -2735,7 +3351,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     // write_back
     write_o_reg_gmem<KTraits>(o_frag, &qo_smem, o_ptr_base, qo_packed_idx_base, qo_len,
                               /*o_stride_n=*/
-                              partition_kv ? num_kv_chunks * o_stride_n : o_stride_n,
+                              partition_kv ? num_kv_chunks * compact_o_stride_n : o_stride_n,
                               /*o_stride_h=*/o_stride_h, group_size, tid);
 
     // write lse
@@ -2818,19 +3434,29 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
   int max_smem_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
-  // we expect each sm execute two threadblocks
+  constexpr bool prefer_native_fp4_pv =
+      prefer_native_fp4_pv_tile<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>();
+  // The native FP4 PV path needs a K64 V tile resident in shared memory. Prefer one CTA/SM
+  // for this shape; the generic path keeps the existing two-CTA occupancy heuristic.
   const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                              (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-          ? 2
-          : 1;
+      prefer_native_fp4_pv
+          ? 1
+          : (max_smem_per_sm >=
+                     2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+                          (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+                 ? 2
+                 : 1);
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
   const uint32_t max_num_mma_kv_reg =
-      (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
-       !USE_FP16_QK_REDUCTION)
-          ? 2
-          : (8 / NUM_MMA_Q);
+      prefer_native_fp4_pv
+          ? 4
+          : ((is_fp4_type_v<DTypeKV> && HEAD_DIM_QK == 512 && HEAD_DIM_VO == 512)
+                 ? 2
+                 : ((HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 &&
+                     POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && !USE_FP16_QK_REDUCTION)
+                        ? 2
+                        : (8 / NUM_MMA_Q)));
   const uint32_t max_num_mma_kv_smem =
       (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
       ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
@@ -2896,11 +3522,13 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
               tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream,
+              params.o_stride_n, params.o_stride_h));
         } else {
           FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
               tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
-              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream, params.o_stride_n,
+              params.o_stride_h));
         }
       }
     }
@@ -2944,19 +3572,27 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
   int max_smem_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
-  // we expect each sm execute two threadblocks
+  constexpr bool prefer_native_fp4_pv =
+      prefer_native_fp4_pv_tile<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>();
   const int num_ctas_per_sm =
-      max_smem_per_sm >= 2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
-                              (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
-          ? 2
-          : 1;
+      prefer_native_fp4_pv
+          ? 1
+          : (max_smem_per_sm >=
+                     2 * (CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ) +
+                          (HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV))
+                 ? 2
+                 : 1);
   const int max_smem_per_threadblock = max_smem_per_sm / num_ctas_per_sm;
 
   const uint32_t max_num_mma_kv_reg =
-      (HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 && POS_ENCODING_MODE == PosEncodingMode::kRoPELlama &&
-       !USE_FP16_QK_REDUCTION)
-          ? 2
-          : (8 / NUM_MMA_Q);
+      prefer_native_fp4_pv
+          ? 4
+          : ((is_fp4_type_v<DTypeKV> && HEAD_DIM_QK == 512 && HEAD_DIM_VO == 512)
+                 ? 2
+                 : ((HEAD_DIM_VO >= 128 && NUM_MMA_Q == 2 &&
+                     POS_ENCODING_MODE == PosEncodingMode::kRoPELlama && !USE_FP16_QK_REDUCTION)
+                        ? 2
+                        : (8 / NUM_MMA_Q)));
   const uint32_t max_num_mma_kv_smem =
       (max_smem_per_threadblock - CTA_TILE_Q * HEAD_DIM_QK * sizeof(DTypeQ)) /
       ((HEAD_DIM_QK + HEAD_DIM_VO) * 16 * NUM_WARPS_KV * sizeof(DTypeKV));
@@ -3021,11 +3657,13 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
         if constexpr (AttentionVariant::use_softmax) {
           FLASHINFER_CUDA_CALL(VariableLengthMergeStates(
               tmp_v, tmp_s, params.merge_indptr, o, lse, params.max_total_num_rows,
-              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+              params.total_num_rows, num_qo_heads, HEAD_DIM_VO, enable_pdl, stream,
+              params.o_stride_n, params.o_stride_h));
         } else {
           FLASHINFER_CUDA_CALL(VariableLengthAttentionSum(
               tmp_v, params.merge_indptr, o, params.max_total_num_rows, params.total_num_rows,
-              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream));
+              num_qo_heads, HEAD_DIM_VO, enable_pdl, stream, params.o_stride_n,
+              params.o_stride_h));
         }
       }
     }

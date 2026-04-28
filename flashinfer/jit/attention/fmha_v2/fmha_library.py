@@ -3,7 +3,7 @@ import pathlib
 from typing import Any, Optional, Tuple
 from ... import env as jit_env
 from ....compilation_context import CompilationContext
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from .utils import (
     get_effective_sm_and_name,
     get_hopper_instruction_traits,
@@ -26,6 +26,33 @@ from .utils import (
 from ...utils import write_if_different
 
 import jinja2
+
+
+NVFP4_GQA_HEAD_SIZES = (128, 256, 512)
+NVFP4_D512_SPLIT_O_MAX_GROUPED_ROWS = 16384
+SM12X_SMS = (120, 121)
+
+
+def is_sm12x_sm(sm: int) -> bool:
+    return sm in SM12X_SMS
+
+
+def sm_dispatch_check(kspec: "FMHAv2KernelSpec") -> str:
+    if kspec.sm == SM12X_SMS[0]:
+        return "(sm == 120 || sm == 121)"
+    return f"sm == {kspec.sm}"
+
+
+def is_sm120_nvfp4_gqa_kernel(kspec: "FMHAv2KernelSpec") -> bool:
+    return (
+        is_sm12x_sm(kspec.sm)
+        and kspec.dtype == "bf16"
+        and kspec.kv_dtype == "e2m1"
+        and kspec.head_size in NVFP4_GQA_HEAD_SIZES
+        and kspec.head_size_v == 0
+        and kspec.input_layout == InputLayout.Q_PAGED_KV
+        and kspec.group_q_heads_in_m
+    )
 
 
 def select_kv_loop_step(head_size: int) -> int:
@@ -87,17 +114,22 @@ class FMHAv2KernelSpec:
     sage_block_sizes: Optional[Tuple[int, int, int]] = None
     output_dtype: Optional[str] = None
     is_mtp: bool = False
+    kv_dtype: Optional[str] = None
+    group_q_heads_in_m: bool = False
+    split_o_tile_n: bool = False
 
 
 # BF16-QKV+BF16-out and BF16-Q + FP8-KV + BF16-out (or FP8-QKV+BF16-out)
 
 
 def select_ldgsts(
-    sm: int, warp_specialization: bool, head_size: int, dtype: str
+    sm: int, warp_specialization: bool, head_size: int, dtype: str, kv_dtype: str
 ) -> Tuple[bool, bool, bool]:
+    if is_sm12x_sm(sm) and dtype == "bf16" and kv_dtype == "e2m1":
+        return (False, True, True)
     if warp_specialization:
         return (False, False, False)
-    elif sm == 120:
+    elif is_sm12x_sm(sm):
         if dtype in ["fp16", "bf16"]:
             # Need ldgsts (cp.async) for head_size > 64 to enable the tiled noloop
             # kernel which handles RELOAD_Q (D > CTA_P_TILE_K=64).
@@ -109,8 +141,6 @@ def select_ldgsts(
             if head_size >= 256:
                 ldgsts_k = False
                 ldgsts_v = False
-            if head_size > 256:
-                ldgsts_q = False
             return (ldgsts_q, ldgsts_k, ldgsts_v)
         elif dtype == "e4m3":
             return (False, False, False)
@@ -129,6 +159,7 @@ def generate_kernel_spec(
     head_size_v: Optional[int] = 0,
     input_layout: Optional[InputLayout] = InputLayout.Q_PAGED_KV,
     output_dtype: Optional[str] = None,
+    kv_dtype: Optional[str] = None,
 ) -> FMHAv2KernelSpec:
     """
     Generate a kernel spec for FMHAv2.
@@ -148,6 +179,8 @@ def generate_kernel_spec(
     """
     # Initialize spec with required fields (no class defaults)
     # and user-provided optional fields
+    kv_dtype = kv_dtype or dtype
+
     spec: dict[str, Any] = {
         # Required fields
         "sm": sm,
@@ -173,12 +206,15 @@ def generate_kernel_spec(
         "head_size_v": head_size_v,
         "output_dtype": output_dtype,
         "is_mtp": is_mla,
+        "kv_dtype": kv_dtype,
+        "group_q_heads_in_m": False,
+        "split_o_tile_n": False,
     }
 
     # Compute ldgsts flags
     warp_specialization = sm == 90 and head_size >= 32
     ldgsts_q, ldgsts_k, ldgsts_v = select_ldgsts(
-        sm, warp_specialization, head_size, dtype
+        sm, warp_specialization, head_size, dtype, kv_dtype
     )
     spec["ldgsts_q"] = ldgsts_q
     spec["ldgsts_k"] = ldgsts_k
@@ -272,7 +308,7 @@ def generate_kernel_spec(
         else:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
-    elif sm == 120:
+    elif is_sm12x_sm(sm):
         spec["sm_mma"] = 80
         spec["has_noloop"] = 1
         spec["noloop_step"] = 64
@@ -307,6 +343,15 @@ def generate_kernel_spec(
                     q_loop_step = 64
                 spec["loop_step"] = q_loop_step
                 spec["noloop_step"] = q_loop_step
+        if (
+            dtype == "bf16"
+            and kv_dtype == "e2m1"
+            and head_size in NVFP4_GQA_HEAD_SIZES
+        ):
+            spec["group_q_heads_in_m"] = True
+            if head_size == 512:
+                spec["warps_m"] = 2
+                spec["warps_n"] = 2
 
     elif sm == 90:
         raise ValueError("(jimmyzho): Only Warp Specialization is supported for SM 90")
@@ -320,8 +365,9 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
 
     # Standard flash attention support
     flash_valid: bool = (
-        kspec.sm in [80, 86, 89, 90, 120]
+        kspec.sm in [80, 86, 89, 90, 120, 121]
         and kspec.dtype in ["fp16", "bf16", "fp16_fp32", "e4m3", "e4m3_fp32"]
+        and kspec.kv_dtype == kspec.dtype
         and kspec.head_size <= 256
         and kspec.head_size_v == 0
         and kspec.sage_block_sizes is None
@@ -330,10 +376,45 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
         and kspec.flash_attention
         and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
     )
+    sm120_paged_d512_valid: bool = (
+        is_sm12x_sm(kspec.sm)
+        and kspec.dtype in ["fp16", "bf16"]
+        and kspec.kv_dtype == kspec.dtype
+        and kspec.head_size == 512
+        and kspec.head_size_v == 0
+        and kspec.input_layout == InputLayout.Q_PAGED_KV
+        and kspec.sage_block_sizes is None
+        and kspec.version == 2
+        and not kspec.cross_mha
+        and kspec.flash_attention
+        and not kspec.warp_specialization
+        and bool(kspec.tiled)
+        and not kspec.alibi
+        and not kspec.enable_attn_logit_softcapping
+        and not kspec.return_softmax_stats
+    )
+    sm120_paged_nvfp4_valid: bool = (
+        is_sm12x_sm(kspec.sm)
+        and kspec.dtype == "bf16"
+        and kspec.kv_dtype == "e2m1"
+        and kspec.head_size in NVFP4_GQA_HEAD_SIZES
+        and kspec.head_size_v == 0
+        and kspec.input_layout == InputLayout.Q_PAGED_KV
+        and kspec.sage_block_sizes is None
+        and kspec.version == 2
+        and not kspec.cross_mha
+        and kspec.flash_attention
+        and not kspec.warp_specialization
+        and bool(kspec.tiled)
+        and not kspec.alibi
+        and not kspec.enable_attn_logit_softcapping
+        and not kspec.return_softmax_stats
+    )
     # SM90 non-flash ldgsts support (fixed seq len)
     non_flash_valid: bool = (
         kspec.sm == 90
         and kspec.dtype in ["fp16", "bf16", "fp16_fp32"]
+        and kspec.kv_dtype == kspec.dtype
         and kspec.head_size <= 256
         and bool(kspec.ldgsts_q)
         and kspec.version == 2
@@ -344,6 +425,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
     clip_valid: bool = (
         kspec.sm == 100
         and kspec.dtype in ["fp16", "bf16", "fp16_fp32", "e4m3", "e4m3_fp32"]
+        and kspec.kv_dtype == kspec.dtype
         and kspec.head_size == 80
         and kspec.head_size_v == 0
         and kspec.sage_block_sizes is None
@@ -354,8 +436,9 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
     )
     # Deepseek MLA (generation 576/512 paged)
     mla_valid_576_512: bool = (
-        kspec.sm in [90, 100, 120]
+        kspec.sm in [90, 100, 120, 121]
         and kspec.dtype in ["bf16", "e4m3_fp32"]
+        and kspec.kv_dtype == kspec.dtype
         and kspec.head_size == 576
         and kspec.head_size_v == 512
         and kspec.input_layout == InputLayout.Q_PAGED_KV
@@ -368,8 +451,9 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
     )
     # Deepseek MLA (context 192/128 separate-q-k-v)
     mla_valid_192_128: bool = (
-        kspec.sm in [90, 100, 120]
+        kspec.sm in [90, 100, 120, 121]
         and kspec.dtype in ["bf16", "e4m3", "e4m3_fp32"]
+        and kspec.kv_dtype == kspec.dtype
         and kspec.head_size == 192
         and kspec.head_size_v == 128
         and kspec.input_layout == InputLayout.SEPARATE_Q_K_V
@@ -387,6 +471,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
     sage_valid_sm90: bool = (
         kspec.sm == 90
         and kspec.head_size in [80, 128]
+        and kspec.kv_dtype == kspec.dtype
         and kspec.version == 2
         and kspec.sage_block_sizes in [(64, 64, 256)]
         and not kspec.cross_mha
@@ -400,6 +485,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
     sage_valid_sm89: bool = (
         kspec.sm == 89
         and kspec.head_size in [80, 128]
+        and kspec.kv_dtype == kspec.dtype
         and kspec.sage_block_sizes in [(64, 32, 32)]
         and kspec.output_dtype in ["fp16", "bf16"]
         and kspec.version == 2
@@ -413,6 +499,7 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
     flash_separate_qkv_valid: bool = (
         kspec.sm == 90
         and kspec.dtype in ["fp16", "bf16"]
+        and kspec.kv_dtype == kspec.dtype
         and kspec.head_size <= 256
         and kspec.head_size_v == 0
         and kspec.sage_block_sizes is None
@@ -426,6 +513,8 @@ def is_kernel_spec_valid(kspec: FMHAv2KernelSpec) -> bool:
 
     return (
         flash_valid
+        or sm120_paged_d512_valid
+        or sm120_paged_nvfp4_valid
         or non_flash_valid
         or clip_valid
         or mla_valid_576_512
@@ -460,7 +549,10 @@ def get_kernel_code(kspec: FMHAv2KernelSpec, kname: str, lname: str) -> Optional
         params_type = "bert::Fused_multihead_attention_params_mhca"
 
     if effective_sm < 90:
-        instruction_traits = sm_name.capitalize() + "_" + dtype2traits[kspec.dtype]
+        if kspec.dtype == "bf16" and kspec.kv_dtype == "e2m1":
+            instruction_traits = "Blackwell_mma_nvf4_fp32_traits"
+        else:
+            instruction_traits = sm_name.capitalize() + "_" + dtype2traits[kspec.dtype]
     elif effective_sm == 90:
         instruction_traits = (
             sm_name.capitalize() + "_" + hopper_dtype2traits[kspec.dtype]
@@ -497,7 +589,10 @@ def get_kernel_code(kspec: FMHAv2KernelSpec, kname: str, lname: str) -> Optional
     # decide whether to paged_kv kernel traits for ampere-style kernels.
     if effective_sm < 90:
         if kspec.input_layout == InputLayout.Q_PAGED_KV:
-            kernel_traits += "_paged_kv_cache"
+            if kspec.dtype == "bf16" and kspec.kv_dtype == "e2m1":
+                kernel_traits += "_bf16_q_nvf4_paged_kv_cache"
+            else:
+                kernel_traits += "_paged_kv_cache"
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
             kernel_traits += "_contiguous_kv_cache"
         elif kspec.input_layout == InputLayout.SEPARATE_Q_K_V:
@@ -530,6 +625,10 @@ def get_kernel_code(kspec: FMHAv2KernelSpec, kname: str, lname: str) -> Optional
         flags |= 4096
     if kspec.is_mtp:
         flags |= 8192
+    if kspec.group_q_heads_in_m:
+        flags |= 16384
+    if kspec.split_o_tile_n:
+        flags |= 32768
 
     # only generate certain needed combinations of input_layout and mask types for trt-llm.
     padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask = (
@@ -734,7 +833,9 @@ def get_api_code(specs_names: list[Tuple[FMHAv2KernelSpec, str, str, str]]) -> s
     def gen_call(kspec: FMHAv2KernelSpec, lname: str) -> str:
         effective_sm, _ = get_effective_sm_and_name(kspec)
         data_type = dtype2typename[kspec.dtype]
+        kv_data_type = dtype2typename[kspec.kv_dtype or kspec.dtype]
         output_data_type = data_type
+        sm_check = sm_dispatch_check(kspec)
         if kspec.output_dtype:
             output_data_type = dtype2typename[kspec.output_dtype]
         il_check = ""
@@ -801,6 +902,44 @@ def get_api_code(specs_names: list[Tuple[FMHAv2KernelSpec, str, str, str]]) -> s
                 else "&& !enable_skip_softmax "
             )
 
+        grouped_m_rows = (
+            "(params.num_grouped_heads > 1 ? "
+            "params.s * params.num_grouped_heads : params.s)"
+        )
+        is_sm120_nvfp4_gqa = is_sm120_nvfp4_gqa_kernel(kspec)
+        if is_sm120_nvfp4_gqa and kspec.head_size == 512:
+            if kspec.split_o_tile_n:
+                layout_check = (
+                    "&& params.nvfp4_v_cache_uses_pv_layout "
+                    if kspec.warps_m == 2 and kspec.warps_n == 2
+                    else "&& !params.nvfp4_v_cache_uses_pv_layout "
+                )
+                tile_variant_check = (
+                    f"&& {grouped_m_rows} <= {NVFP4_D512_SPLIT_O_MAX_GROUPED_ROWS} "
+                    f"{layout_check}"
+                )
+            elif kspec.kv_loop_step == 256:
+                tile_variant_check = f"&& false "
+            elif kspec.kv_loop_step == 128:
+                tile_variant_check = f"&& false "
+            else:
+                tile_variant_check = (
+                    f"&& {grouped_m_rows} > {NVFP4_D512_SPLIT_O_MAX_GROUPED_ROWS} "
+                )
+        elif (
+            is_sm120_nvfp4_gqa
+            and kspec.head_size in (128, 256)
+            and kspec.warps_n > 1
+        ):
+            tile_variant_check = (
+                "&& launch_params.attention_mask_type == "
+                "fmha::Attention_mask_type::CAUSAL "
+            )
+        elif kspec.split_o_tile_n:
+            tile_variant_check = f"&& {grouped_m_rows} <= 2048 "
+        else:
+            tile_variant_check = ""
+
         il_check += (
             "&& params.use_int8_scale_max "
             if kspec.has_scale_max
@@ -812,7 +951,7 @@ def get_api_code(specs_names: list[Tuple[FMHAv2KernelSpec, str, str, str]]) -> s
         ## NOTE: need to tune here
         if kspec.has_noloop and not kspec.flash_attention:
             call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && sm == {sm}
+if( data_type == {data_type} && kv_data_type == {kv_data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && {sm_check}
     {il_check}) {{
 
     {unroll_check} {{
@@ -826,10 +965,12 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
 }} """.format(
                 **asdict(kspec),
                 data_type=data_type,
+                kv_data_type=kv_data_type,
                 output_data_type=output_data_type,
                 slen=slen,
                 lname=lname,
                 il_check=il_check,
+                sm_check=sm_check,
                 unroll_check=gen_unroll_check(kspec),
             )
 
@@ -838,24 +979,27 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
             dv = kspec.head_size_v or kspec.head_size
             if kspec.tiled:  # higher precedence; does not require bh_upper_thres
                 call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
-    {il_check} && use_tiled) {{
+if( data_type == {data_type} && kv_data_type == {kv_data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && {sm_check}
+    {il_check} && use_tiled {tile_variant_check}) {{
 
     if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}_nl_tiled\\n");
     {lname}_nl_tiled(params, launch_params, stream);
 }} """.format(  # type: ignore[str-format]
                     **asdict(kspec),
                     data_type=data_type,
+                    kv_data_type=kv_data_type,
                     output_data_type=output_data_type,
                     slen=slen,
                     lname=lname,
                     il_check=il_check,
+                    tile_variant_check=tile_variant_check,
                     dv=dv,
+                    sm_check=sm_check,
                 )
             # warp specialization kernels need launch_params
             elif kspec.warp_specialization:
                 call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
+if( data_type == {data_type} && kv_data_type == {kv_data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && {sm_check}
     {il_check}) {{
 
     if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}\\n");
@@ -863,15 +1007,17 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 }} """.format(  # type: ignore[str-format]
                     **asdict(kspec),
                     data_type=data_type,
+                    kv_data_type=kv_data_type,
                     output_data_type=output_data_type,
                     slen=slen,
                     lname=lname,
                     il_check=il_check,
                     dv=dv,
+                    sm_check=sm_check,
                 )
             else:
                 call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
+if( data_type == {data_type} && kv_data_type == {kv_data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && {sm_check}
     && !use_tiled {il_check}) {{
 
     if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}_nl\\n");
@@ -879,15 +1025,17 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
 }} """.format(  # type: ignore[str-format]
                     **asdict(kspec),
                     data_type=data_type,
+                    kv_data_type=kv_data_type,
                     output_data_type=output_data_type,
                     slen=slen,
                     lname=lname,
                     il_check=il_check,
                     dv=dv,
+                    sm_check=sm_check,
                 )
         else:
             call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && sm == {sm}
+if( data_type == {data_type} && kv_data_type == {kv_data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && {sm_check}
     {il_check}) {{
 
     if (fmha_v2_verbose) printf("[FMHAv2] kernel: {lname}\\n");
@@ -895,16 +1043,19 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
 }} """.format(
                 **asdict(kspec),
                 data_type=data_type,
+                kv_data_type=kv_data_type,
                 output_data_type=output_data_type,
                 slen=slen,
                 lname=lname,
                 il_check=il_check,
+                sm_check=sm_check,
             )
         return call_stmt
 
     def gen_call_fmhca(kspec: FMHAv2KernelSpec, lname: str) -> str:
         effective_sm, _ = get_effective_sm_and_name(kspec)
         data_type = dtype2typename[kspec.dtype]
+        sm_check = sm_dispatch_check(kspec)
         il_check = ""
         if kspec.version == 2:
             il_check = "&& interleaved " if kspec.interleaved else "&& !interleaved "
@@ -919,7 +1070,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
         s_kv_len = kspec.seq_len
         if kspec.has_noloop:
             call_stmt = """\
-if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == {sm} {il_check}) {{
+if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && {sm_check} {il_check}) {{
 
     {unroll_check} {{
         {lname}(params, stream);
@@ -933,12 +1084,13 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
                 s_kv_len=s_kv_len,
                 lname=lname,
                 il_check=il_check,
+                sm_check=sm_check,
                 unroll_check=gen_unroll_check(kspec),
             )
 
         else:
             call_stmt = """\
-if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == {sm} {il_check}) {{
+if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && {sm_check} {il_check}) {{
         {lname}(params, stream);
     }} """.format(
                 **asdict(kspec),
@@ -946,6 +1098,7 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
                 s_kv_len=s_kv_len,
                 lname=lname,
                 il_check=il_check,
+                sm_check=sm_check,
             )
         return call_stmt
 
@@ -977,6 +1130,7 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
 
     def gen_warp_spec(kspec: FMHAv2KernelSpec) -> str:
         data_type = dtype2typename[kspec.dtype]
+        sm_check = sm_dispatch_check(kspec)
         if kspec.sage_block_sizes is not None:
             assert kspec.output_dtype is not None
             # override the data_type to output type, otherwise it is always E4M3
@@ -1007,7 +1161,7 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
 
         if kspec.flash_attention:  # NOTE support any sequence
             return """\
-if( data_type == {data_type} && d == {head_size} && sm == {sm} {warp_spec_check}
+if( data_type == {data_type} && d == {head_size} && {sm_check} {warp_spec_check}
     && version == {version} ) {{
     warps_m = {warps_m};
     warps_n = {warps_n};
@@ -1015,7 +1169,7 @@ if( data_type == {data_type} && d == {head_size} && sm == {sm} {warp_spec_check}
                 **locals(), **asdict(kspec), unroll_check=gen_unroll_check(kspec)
             )
         return """\
-if( data_type == {data_type} && s == {slen} && d == {head_size} && sm == {sm} {warp_spec_check}
+if( data_type == {data_type} && s == {slen} && d == {head_size} && {sm_check} {warp_spec_check}
     && version == {version} ) {{
     {unroll_check} {{
       warps_m = {warps_m};
@@ -1091,6 +1245,7 @@ else {{
 inline void run_fmha_v2(Params_v2 &params,
                         const Launch_params &launch_params,
                         Data_type data_type,
+                        Data_type kv_data_type,
                         Data_type output_data_type,
                         int sm,
                         cudaStream_t stream=0) {{
@@ -1230,6 +1385,12 @@ def generate_jit_sources(
     input_layout_values = [map_input_layout[input_layout.lower()]]
     dtype_values = [input_dtype]
     output_dtype_values = [output_dtype] if output_dtype is not None else [None]
+    kv_dtype_values = [input_dtype]
+    if input_dtype == "bf16" and input_layout.lower() in (
+        "q_paged_kv_nhd",
+        "q_paged_kv_hnd",
+    ):
+        kv_dtype_values.append("e2m1")
 
     is_mla_values = [False]
 
@@ -1244,6 +1405,7 @@ def generate_jit_sources(
     warp_spec_configs: itertools.product = itertools.product(
         [90] if include_sm90_kernels else [],
         dtype_values,
+        [input_dtype],
         head_size_qk_warpspec_values,
         head_size_v_values,
         enable_attn_logit_softcapping_values,
@@ -1255,10 +1417,11 @@ def generate_jit_sources(
         output_dtype_values,
     )
 
-    head_size_qk_sm120_values = [64, 128, 256]
+    head_size_qk_sm120_values = [64, 128, 256, 512]
     sm120_configs: itertools.product = itertools.product(
         [120] if include_sm120_kernels else [],
         dtype_values,  # fallback to avoid empty product
+        kv_dtype_values,
         head_size_qk_sm120_values,
         head_size_v_values,
         enable_attn_logit_softcapping_values,
@@ -1273,6 +1436,7 @@ def generate_jit_sources(
     other_configs: itertools.product = itertools.product(
         [],
         dtype_values,
+        [input_dtype],
         head_size_qk_values,
         head_size_v_values,
         enable_attn_logit_softcapping_values,
@@ -1294,6 +1458,7 @@ def generate_jit_sources(
         for (
             sm_iter,
             dtype_iter,
+            kv_dtype_iter,
             head_size_qk_iter,
             head_size_v_iter,
             enable_attn_logit_softcapping_iter,
@@ -1308,6 +1473,7 @@ def generate_jit_sources(
                 sm=sm_iter,
                 head_size=head_size_qk_iter,
                 dtype=dtype_iter,
+                kv_dtype=kv_dtype_iter,
                 enable_skip_softmax=enable_skip_softmax,
                 return_softmax=return_softmax_iter,
                 enable_attn_logit_softcapping=enable_attn_logit_softcapping_iter,
@@ -1320,16 +1486,66 @@ def generate_jit_sources(
             if not is_kernel_spec_valid(kspec):
                 continue
 
-            fname, lname, kname = encode_name(kspec)
-            kernel_code = get_kernel_code(kspec, kname, lname)
-            if kernel_code is None:
-                continue
+            kernel_specs = [kspec]
+            if is_sm120_nvfp4_gqa_kernel(kspec):
+                if kspec.head_size in (128, 256):
+                    if kspec.head_size == 256:
+                        kernel_specs = [
+                            replace(
+                                kspec,
+                                warps_m=1,
+                                warps_n=4,
+                                loop_step=16,
+                                noloop_step=16,
+                                kv_loop_step=512,
+                            ),
+                            replace(
+                                kspec,
+                                warps_m=2,
+                                warps_n=2,
+                                loop_step=32,
+                                noloop_step=32,
+                                kv_loop_step=256,
+                            ),
+                            kspec,
+                        ]
+                    else:
+                        kernel_specs = [
+                            replace(
+                                kspec,
+                                warps_m=2,
+                                warps_n=2,
+                                loop_step=32,
+                                noloop_step=32,
+                                kv_loop_step=256,
+                            ),
+                            kspec,
+                        ]
+                elif kspec.head_size == 512:
+                    compat_kspec = replace(kspec, warps_m=4, warps_n=1)
+                    kernel_specs = [
+                        replace(kspec, kv_loop_step=128, split_o_tile_n=True),
+                        replace(
+                            compat_kspec,
+                            kv_loop_step=128,
+                            split_o_tile_n=True,
+                        ),
+                        compat_kspec,
+                        replace(kspec, kv_loop_step=128),
+                        replace(kspec, kv_loop_step=256),
+                    ]
 
-            # Write kernel source file
-            kernel_path = gen_directory / fname
-            write_if_different(kernel_path, kernel_code)
-            source_paths.append(kernel_path)
-            specs_names.append((kspec, fname, lname, kname))
+            for kernel_spec in kernel_specs:
+                fname, lname, kname = encode_name(kernel_spec)
+                kernel_code = get_kernel_code(kernel_spec, kname, lname)
+                if kernel_code is None:
+                    continue
+
+                # Write kernel source file
+                kernel_path = gen_directory / fname
+                write_if_different(kernel_path, kernel_code)
+                source_paths.append(kernel_path)
+                specs_names.append((kernel_spec, fname, lname, kname))
 
     api_code = get_api_code(specs_names)
     api_path = gen_directory / "fmha_v2_api.h"

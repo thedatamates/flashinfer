@@ -65,9 +65,11 @@ def gen_xqa_module(
         )
     flag_tokens_per_page = [f"-DTOKENS_PER_PAGE={page_size}"]
 
-    if head_dim % 16 != 0 or head_dim > 256 or head_dim < 16:
+    max_head_dim = 512 if kv_cache_dtype == torch.uint8 else 256
+    if head_dim % 16 != 0 or head_dim > max_head_dim or head_dim < 16:
         raise ValueError(
-            f"Invalid head_dim: {head_dim}, must be divisible by 16 and in range [16, 256]"
+            f"Invalid head_dim: {head_dim}, must be divisible by 16 "
+            f"and in range [16, {max_head_dim}]"
         )
     flag_head_dim = [f"-DHEAD_ELEMS={head_dim}"]
 

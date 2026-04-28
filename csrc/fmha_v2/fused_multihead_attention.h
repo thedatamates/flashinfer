@@ -199,6 +199,12 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
   void* softmax_stats_ptr;
   // The stride between rows of softmax_stats_ptr, default: h * sizeof(float2)
   int64_t softmax_stats_stride_in_bytes;
+  // Optional split-KV output layout. When num_kv_splits > 1, the kernel writes
+  // one partial output/stat block per KV split before a separate merge step.
+  int num_kv_splits = 1;
+  int kv_split_size = 0;
+  int64_t split_o_stride_in_bytes = 0;
+  int64_t split_softmax_stats_stride_in_bytes = 0;
 
   // The attention sinks (per head).
   float* attention_sinks;
@@ -244,6 +250,23 @@ struct Fused_multihead_attention_params_v2 : Fused_multihead_attention_params_ba
   // x_stride_in_bytes_2 means the stride of tensor_size[2]
   int64_t k_stride_in_bytes_2;
   int64_t v_stride_in_bytes_2;
+
+  // Optional NVFP4 scale-factor tensors for paged K/V cache. The K/V cache data
+  // is packed E2M1 in uint8 storage; these point to UE4M3 scale bytes with one
+  // scale per 16 logical K/V values.
+  void* k_scale_ptr;
+  void* v_scale_ptr;
+  int64_t k_scale_page_stride_in_bytes;
+  int64_t k_scale_head_stride_in_bytes;
+  int64_t k_scale_token_stride_in_bytes;
+  int64_t k_scale_vec_stride_in_bytes;
+  int64_t v_scale_page_stride_in_bytes;
+  int64_t v_scale_head_stride_in_bytes;
+  int64_t v_scale_token_stride_in_bytes;
+  int64_t v_scale_vec_stride_in_bytes;
+  // When true, the NVFP4 V cache is already quantized for the BMM2/PV
+  // operand: scales are grouped over 16 KV tokens for each V column.
+  bool nvfp4_v_cache_uses_pv_layout = false;
 
   // Paged KV load.
   int blocks_per_tma_load;

@@ -1628,6 +1628,14 @@ inline __device__ void lds(uint16_t& dst, uint32_t ptr) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+inline __device__ void lds(uint8_t& dst, uint32_t ptr) {
+  uint32_t tmp;
+  asm volatile("ld.shared.u8 %0, [%1];\n" : "=r"(tmp) : "r"(ptr));
+  dst = static_cast<uint8_t>(tmp);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 inline __device__ void lds(uint32_t& dst, uint32_t ptr) {
   asm volatile("ld.shared.b32 %0, [%1];\n" : "=r"(dst) : "r"(ptr));
 }
@@ -1801,6 +1809,12 @@ inline __device__ void stg(void* ptr, uint4 val) { *reinterpret_cast<uint4*>(ptr
 
 inline __device__ void sts(uint32_t ptr, uint16_t val) {
   asm volatile("st.shared.b16 [%0], %1;\n" : : "r"(ptr), "h"(val));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ void sts(uint32_t ptr, uint8_t val) {
+  asm volatile("st.shared.u8 [%0], %1;\n" : : "r"(ptr), "r"(static_cast<uint32_t>(val)));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2145,6 +2159,136 @@ inline __device__ uint32_t float4_to_e4m3x4(float x, float y, float z, float w) 
   assert(false);
   return 0;
 #endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint8_t float2_to_e2m1x2(float x, float y) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint16_t res;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+      "mov.b16 %0, {byte0, 0};\n"
+      "}"
+      : "=h"(res)
+      : "f"(x), "f"(y));
+  return static_cast<uint8_t>(res & 0xffu);
+#else
+  assert(false);
+  return 0;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint32_t float8_to_e2m1x8(float x0, float x1, float x2, float x3, float x4,
+                                            float x5, float x6, float x7) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t res;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(res)
+      : "f"(x0), "f"(x1), "f"(x2), "f"(x3), "f"(x4), "f"(x5), "f"(x6), "f"(x7));
+  return res;
+#else
+  assert(false);
+  return 0;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float e2m1_to_float(uint8_t x) {
+  switch (x & 0x0fu) {
+    case 0x0u:
+      return 0.0f;
+    case 0x1u:
+      return 0.5f;
+    case 0x2u:
+      return 1.0f;
+    case 0x3u:
+      return 1.5f;
+    case 0x4u:
+      return 2.0f;
+    case 0x5u:
+      return 3.0f;
+    case 0x6u:
+      return 4.0f;
+    case 0x7u:
+      return 6.0f;
+    case 0x8u:
+      return -0.0f;
+    case 0x9u:
+      return -0.5f;
+    case 0xau:
+      return -1.0f;
+    case 0xbu:
+      return -1.5f;
+    case 0xcu:
+      return -2.0f;
+    case 0xdu:
+      return -3.0f;
+    case 0xeu:
+      return -4.0f;
+    default:
+      return -6.0f;
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint32_t float4_to_e2m1x4(float x0, float x1, float x2, float x3) {
+  uint32_t lo = static_cast<uint32_t>(float2_to_e2m1x2(x0, x1));
+  uint32_t hi = static_cast<uint32_t>(float2_to_e2m1x2(x2, x3));
+  return lo | (hi << 8);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint32_t make_ue4m3_scale_reg(float s0, float s1, float s2, float s3) {
+  return float4_to_e4m3x4(s0, s1, s2, s3);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint8_t float_to_e4m3_byte(float x) {
+  return static_cast<uint8_t>(float2_to_e4m3x2(x, 0.0f) & 0xffu);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ float e4m3_byte_to_float(uint8_t x) {
+  return static_cast<float>(*reinterpret_cast<__nv_fp8_e4m3 const*>(&x));
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint32_t pack_e4m3_scale_reg(uint8_t s0, uint8_t s1, uint8_t s2, uint8_t s3) {
+  return static_cast<uint32_t>(s0) | (static_cast<uint32_t>(s1) << 8) |
+         (static_cast<uint32_t>(s2) << 16) | (static_cast<uint32_t>(s3) << 24);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline __device__ uint32_t load_e4m3_scale_reg4(char const* ptr, int64_t stride_in_bytes) {
+  uint8_t s0, s1, s2, s3;
+  fmha::ldg(s0, ptr + 0 * stride_in_bytes);
+  fmha::ldg(s1, ptr + 1 * stride_in_bytes);
+  fmha::ldg(s2, ptr + 2 * stride_in_bytes);
+  fmha::ldg(s3, ptr + 3 * stride_in_bytes);
+  return pack_e4m3_scale_reg(s0, s1, s2, s3);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -239,6 +239,27 @@ struct BlockBatchPagedAttentionPersistent {
     const uint32_t v_stride_page = params.v_stride_page;
     const uint32_t v_stride_h = params.v_stride_h;
     const uint32_t v_stride_n = params.v_stride_n;
+    constexpr uint32_t SF_CONTAINERS = NVFP4_SF_VEC_SIZE / 2;
+    uint32_t k_cache_sf_stride_page = k_stride_page / SF_CONTAINERS;
+    uint32_t k_cache_sf_stride_h = k_stride_h / SF_CONTAINERS;
+    uint32_t k_cache_sf_stride_n = k_stride_n / SF_CONTAINERS;
+    uint32_t v_cache_sf_stride_page = v_stride_page / SF_CONTAINERS;
+    uint32_t v_cache_sf_stride_h = v_stride_h / SF_CONTAINERS;
+    uint32_t v_cache_sf_stride_n = v_stride_n / SF_CONTAINERS;
+    if constexpr (has_k_cache_sf_stride_page_v<Params>) {
+      if (params.k_cache_sf_stride_page != 0) {
+        k_cache_sf_stride_page = params.k_cache_sf_stride_page;
+        k_cache_sf_stride_h = params.k_cache_sf_stride_h;
+        k_cache_sf_stride_n = params.k_cache_sf_stride_n;
+      }
+    }
+    if constexpr (has_v_cache_sf_stride_page_v<Params>) {
+      if (params.v_cache_sf_stride_page != 0) {
+        v_cache_sf_stride_page = params.v_cache_sf_stride_page;
+        v_cache_sf_stride_h = params.v_cache_sf_stride_h;
+        v_cache_sf_stride_n = params.v_cache_sf_stride_n;
+      }
+    }
     const uint32_t cluster_tile_q = gridDim.x * CTA_TILE_Q;
     smem_t<SWIZZLE_MODE_Q> q_smem(smem_storage->q_smem);
 
@@ -328,7 +349,8 @@ struct BlockBatchPagedAttentionPersistent {
                                       kv_end, warp_idx, lane_idx);
       page_produce_kv_sf<false, KTraits>(
           smem_storage, maybe_k_cache_sf, block_iter_base + kv_tile_idx * CTA_TILE_KV,
-          packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
+          packed_kv_bound, kv_head_idx, k_cache_sf_stride_page, k_cache_sf_stride_h,
+          k_cache_sf_stride_n, block_size,
           kv_indices, kv_start + kv_tile_idx * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
       cp_async::commit_group();
       page_produce_kv<true, KTraits>(smem_storage, &v_smem_offset_w, v,
@@ -336,7 +358,8 @@ struct BlockBatchPagedAttentionPersistent {
                                      kv_end, warp_idx, lane_idx);
       page_produce_kv_sf<true, KTraits>(
           smem_storage, maybe_v_cache_sf, block_iter_base + kv_tile_idx * CTA_TILE_KV,
-          packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h, v_stride_n, block_size,
+          packed_kv_bound, kv_head_idx, v_cache_sf_stride_page, v_cache_sf_stride_h,
+          v_cache_sf_stride_n, block_size,
           kv_indices, kv_start + kv_tile_idx * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
       cp_async::commit_group();
 
@@ -377,7 +400,8 @@ struct BlockBatchPagedAttentionPersistent {
                                             thr_local_kv_offset, kv_end, warp_idx, lane_idx);
             page_produce_kv_sf<false, KTraits>(
                 smem_storage, maybe_k_cache_sf, block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
-                packed_kv_bound, kv_head_idx, k_stride_page, k_stride_h, k_stride_n, block_size,
+                packed_kv_bound, kv_head_idx, k_cache_sf_stride_page, k_cache_sf_stride_h,
+                k_cache_sf_stride_n, block_size,
                 kv_indices, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
             cp_async::commit_group();
             cp_async::wait_group<1>();
@@ -395,7 +419,8 @@ struct BlockBatchPagedAttentionPersistent {
                                            thr_local_kv_offset, kv_end, warp_idx, lane_idx);
             page_produce_kv_sf<true, KTraits>(
                 smem_storage, maybe_v_cache_sf, block_iter_base + (kv_tile_idx - 1) * CTA_TILE_KV,
-                packed_kv_bound, kv_head_idx, v_stride_page, v_stride_h, v_stride_n, block_size,
+                packed_kv_bound, kv_head_idx, v_cache_sf_stride_page, v_cache_sf_stride_h,
+                v_cache_sf_stride_n, block_size,
                 kv_indices, kv_start + (kv_tile_idx - 1) * CTA_TILE_KV, kv_end, warp_idx, lane_idx);
             cp_async::commit_group();
           });

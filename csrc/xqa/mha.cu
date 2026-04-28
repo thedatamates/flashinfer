@@ -86,7 +86,9 @@ static_assert(nbValidRows <= 32u);
 #else
 constexpr uint32_t nbValidRows = headGrpSize * beamWidth;
 #endif
-constexpr uint2 warpTile = {64, roundUp(nbValidRows, 16U)};
+constexpr bool isWideHead = headElems > 256;
+constexpr uint32_t warpTileX = isWideHead ? 128 : 64;
+constexpr uint2 warpTile = {warpTileX, roundUp(nbValidRows, 16U)};
 static_assert(nbValidRows <= warpTile.y);
 
 constexpr uint32_t gemm1WarpsPerGrp = exactDiv(headElems, warpTile.x);
@@ -101,15 +103,15 @@ constexpr uint32_t cvtExpansion = exactDiv(inputElemSize, cacheElemSize);
 
 #ifndef __CUDA_ARCH__
 constexpr uint32_t preferedKHeadPartBytes = 64;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+__constant__ constexpr uint32_t cacheVTileSeqLen = isWideHead ? 16 : 32;
 #else
 #if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
 constexpr uint32_t preferedKHeadPartBytes = 64;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+__constant__ constexpr uint32_t cacheVTileSeqLen = isWideHead ? 16 : 32;
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || \
     __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1100
-constexpr uint32_t preferedKHeadPartBytes = 128;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 64;
+constexpr uint32_t preferedKHeadPartBytes = isWideHead ? 64 : 128;
+__constant__ constexpr uint32_t cacheVTileSeqLen = isWideHead ? 16 : 64;
 #else
 #error "perferedKHeadPartBytes not defined"
 #endif
@@ -134,7 +136,8 @@ constexpr bool grpLoadV = GRP_LOAD_V;
 
 // number of shared memory buffers for latency hiding
 constexpr uint32_t nbQBuffers = mha::min(nbPartsPerInputQHead, 2u);  // for latency hiding
-constexpr uint32_t nbKBuffers = 2;                                   // for latency hiding
+// 512-wide NVFP4 K tiles exceed SM120/SM121 shared-memory budget if double-buffered.
+constexpr uint32_t nbKBuffers = isWideHead ? 1 : 2;
 constexpr uint32_t nbVBuffers =
     2;  // @fixme: H100 SXM need more in-flight requests. may need to increase this.
 constexpr uint32_t nbXBuffers = 1;
@@ -1558,6 +1561,8 @@ CUBIN_EXPORT __global__
         uint32_t const batchSize, float kvCacheScale,
         float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
         uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
+        uint32_t k_sf_stride_page, uint32_t k_sf_stride_token, uint32_t k_sf_stride_head,
+        uint32_t v_sf_stride_page, uint32_t v_sf_stride_token, uint32_t v_sf_stride_head,
         uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 
   float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
@@ -1685,14 +1690,26 @@ CUBIN_EXPORT __global__
 
     bool const isFullTile = (nbValidHeadTokens == warpTile.y);
     static_assert(nbQBuffers == 1);
-    if (isFullTile) {
-      copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
-                     qkSwizzle, true, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
-                                                  nbValidHeadTokens, localQHeadTokenIdxMap);
+    if constexpr (paddedInputHeadBytes > warp_size * grainBytes) {
+      if (isFullTile) {
+        copyHeadsCtaAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+                          qkSwizzle, true, warpTile.y>(threadIdx.x, smem.q[warpIdx.y][0], src,
+                                                       nbValidHeadTokens, localQHeadTokenIdxMap);
+      } else {
+        copyHeadsCtaAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+                          qkSwizzle, false, warpTile.y>(threadIdx.x, smem.q[warpIdx.y][0], src,
+                                                        nbValidHeadTokens, localQHeadTokenIdxMap);
+      }
     } else {
-      copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
-                     qkSwizzle, false, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
-                                                   nbValidHeadTokens, localQHeadTokenIdxMap);
+      if (isFullTile) {
+        copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+                       qkSwizzle, true, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
+                                                    nbValidHeadTokens, localQHeadTokenIdxMap);
+      } else {
+        copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+                       qkSwizzle, false, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
+                                                     nbValidHeadTokens, localQHeadTokenIdxMap);
+      }
     }
 
     ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
@@ -1723,9 +1740,15 @@ CUBIN_EXPORT __global__
 
     constexpr bool isFullTile = (nbValidRows == warpTile.y);
     static_assert(nbQBuffers == 1);
-    copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
-                   qkSwizzle, isFullTile, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
-                                                      nbValidRows, localQHeadIdxMap);
+    if constexpr (paddedInputHeadBytes > warp_size * grainBytes) {
+      copyHeadsCtaAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+                        qkSwizzle, isFullTile, warpTile.y>(threadIdx.x, smem.q[warpIdx.y][0], src,
+                                                           nbValidRows, localQHeadIdxMap);
+    } else {
+      copyHeadsAsync<PaddedInputHead, warpTile.y, ctaShapeInWarps.x, grainBytes, grainBytes,
+                     qkSwizzle, isFullTile, warpTile.y>(warpIdx.x, smem.q[warpIdx.y][0], src,
+                                                        nbValidRows, localQHeadIdxMap);
+    }
     ldgsts::barArrive(smem.qBarrier[warpIdx.y], true);
   }
 #endif
@@ -1818,7 +1841,7 @@ CUBIN_EXPORT __global__
 #if ENABLE_4BIT_KV_CACHE
       HeadPtr<GMemCacheHeadSf const, tokensPerPage, nbPagesPerWarpTile> const srcSf{
           cacheList.kSfCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
-          kv_stride_page,         kv_stride_token, kv_stride_head};
+          k_sf_stride_page,       k_sf_stride_token, k_sf_stride_head};
 #endif
 
 #else
@@ -1945,12 +1968,16 @@ CUBIN_EXPORT __global__
               isConvergedTile(seqIter) ? carryLE<nbPartsPerKHead, 1U>(p + 1, idxBeam, 0U)
                                        : carryLE<nbPartsPerKHead, beamWidth>(p + 1, idxBeam, 0U);
 
-          loadKTilePart(seqIter + seqStrideIters * nNextBias, idxBeamNext, idxPartNext);
-          ldgsts::commitGroup();
-          // @fixme: do L2 cache prefetch for next iter tile if last part
+          if constexpr (nbKBuffers > 1) {
+            loadKTilePart(seqIter + seqStrideIters * nNextBias, idxBeamNext, idxPartNext);
+            ldgsts::commitGroup();
+            // @fixme: do L2 cache prefetch for next iter tile if last part
+          }
 
           // q is already synchronized
-          if constexpr (!syncKTileEarly) {
+          if constexpr (nbKBuffers == 1) {
+            ldgsts::waitGroup<0>();
+          } else if constexpr (!syncKTileEarly) {
             // synchronize k
             ldgsts::waitGroup<1>();
           }
@@ -1980,6 +2007,11 @@ CUBIN_EXPORT __global__
 #endif
           );
           idxCurrSMemKBuf++;
+          if constexpr (nbKBuffers == 1) {
+            loadKTilePart(seqIter + seqStrideIters * nNextBias, idxBeamNext, idxPartNext);
+            ldgsts::commitGroup();
+            // @fixme: do L2 cache prefetch for next iter tile if last part
+          }
         }
         return acc;
       };
@@ -2152,6 +2184,10 @@ CUBIN_EXPORT __global__
       uint32_t const seqOffset = ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter +
                                  cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx;
       uint32_t const tokenOffset = seqOffset % tokensPerPage;
+#if BEAM_WIDTH == 1 && ENABLE_4BIT_KV_CACHE
+      pageIdx = getPage<VCachePageIndices::size>(cacheList, false, idxReq, 0,
+                                                 seqOffset / tokensPerPage, nbPages);
+#endif
 
 #if BEAM_WIDTH == 1
       HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
@@ -2160,7 +2196,7 @@ CUBIN_EXPORT __global__
 #if ENABLE_4BIT_KV_CACHE
       HeadPtr<GMemCacheHeadSf const, tokensPerPage, nbPagesPerVTile> const srcSf{
           cacheList.vSfCacheVLLM, pageIdx,         tokenOffset,   idxHeadGrp,
-          kv_stride_page,         kv_stride_token, kv_stride_head};
+          v_sf_stride_page,       v_sf_stride_token, v_sf_stride_head};
 #endif
 #else
       IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
@@ -2198,8 +2234,57 @@ CUBIN_EXPORT __global__
       copyHeadsAsync<PaddedCacheHead, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytes,
                      grainBytesGmemCache, vSwizzle, false>(warpIdxInGrp, dst, src, nbHeadsAvail);
 #if ENABLE_4BIT_KV_CACHE
+#if BEAM_WIDTH == 1
+      // V scale factors use TRT-LLM's 4-token interleaved physical layout in
+      // global memory. Stage them into linear [token, scale-group] shared
+      // memory because smemXVPartGemm consumes a logical V tile.
+      constexpr uint32_t sfElemsPerHead =
+          validElemsPerHead / CacheElemConverter::QuantVectorSize;
+      constexpr uint32_t sfWordsPerHead = exactDiv(sfElemsPerHead, grainBytesSf);
+      constexpr uint32_t sfGroup = sfElemsPerHead / 4;
+      static_assert(sfElemsPerHead % 4 == 0);
+      uint8_t const* srcSfBase = reinterpret_cast<uint8_t const*>(cacheList.vSfCacheVLLM);
+      uint32_t const rawSfPageStride = v_sf_stride_page * sfElemsPerHead;
+      uint32_t const rawSfTokenStride = v_sf_stride_token * sfElemsPerHead;
+      uint32_t const rawSfHeadStride = v_sf_stride_head * sfElemsPerHead;
+      uint32_t const warpGrpThrdId = warpIdxInGrp * warp_size + laneId();
+      constexpr uint32_t warpGrpSize = gemm1WarpsPerGrp * warp_size;
+      constexpr uint32_t totalSfWords = cacheVTileSeqLen * sfWordsPerHead;
+      for (uint32_t flat = warpGrpThrdId; flat < totalSfWords; flat += warpGrpSize) {
+        uint32_t const row = flat / sfWordsPerHead;
+        uint32_t const wordIdx = flat % sfWordsPerHead;
+        uint32_t packed = 0;
+        uint8_t* packedBytes = reinterpret_cast<uint8_t*>(&packed);
+#pragma unroll
+        for (uint32_t byteIdx = 0; byteIdx < grainBytesSf; ++byteIdx) {
+          uint32_t const scaleIdx = wordIdx * grainBytesSf + byteIdx;
+          uint8_t value = 0;
+          if (row < nbHeadsAvail) {
+            uint32_t const absoluteTokenIdx = tokenOffset + row;
+            uint32_t const pageSlot =
+                nbPagesPerVTile == 1 ? 0U : absoluteTokenIdx / tokensPerPage;
+            KVCachePageIndex const physicalPage = pageIdx[pageSlot];
+            if ((physicalPage & (1U << 31)) == 0) {
+              uint32_t const logicalToken = absoluteTokenIdx % tokensPerPage;
+              uint32_t const swizzledToken =
+                  (logicalToken / 4) * 4 + scaleIdx / sfGroup;
+              uint32_t const swizzledScale =
+                  (scaleIdx % sfGroup) * 4 + (logicalToken % 4);
+              uint64_t const srcOffset =
+                  static_cast<uint64_t>(physicalPage) * rawSfPageStride +
+                  static_cast<uint64_t>(swizzledToken) * rawSfTokenStride +
+                  static_cast<uint64_t>(idxHeadGrp) * rawSfHeadStride + swizzledScale;
+              value = srcSfBase[srcOffset];
+            }
+          }
+          packedBytes[byteIdx] = value;
+        }
+        dstSf(row, wordIdx) = packed;
+      }
+#else
       copyHeadsAsync<PaddedCacheHeadSf, cacheVTileSeqLen, gemm1WarpsPerGrp, grainBytesSf,
                      grainBytesSf, false, false>(warpIdxInGrp, dstSf, srcSf, nbHeadsAvail);
+#endif
 #endif
 
 #else
@@ -2745,7 +2830,7 @@ CUBIN_EXPORT __device__ constexpr XQAKernelType kernelType =
     XQAKernelType::kAMPERE_WARP_SPECIALIZED;
 
 #ifdef NDEBUG
-CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
+CUBIN_EXPORT __global__ __launch_bounds__(ctaSize, nbCtaPerSM) void kernel_mha(
 #if SPEC_DEC
     uint32_t const qSeqLen, uint32_t const nbKHeads, uint32_t const headGrpSize,
     SeqLenDataType const* qCuSeqLens,
@@ -2773,6 +2858,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     uint32_t const batchSize, float kvCacheScale,
     float const* kvScalePtr,  // Same scale for K and V cache. Used only for int8/fp8 KV cache.
     uint32_t kv_stride_page, uint32_t kv_stride_token, uint32_t kv_stride_head,
+    uint32_t k_sf_stride_page, uint32_t k_sf_stride_token, uint32_t k_sf_stride_head,
+    uint32_t v_sf_stride_page, uint32_t v_sf_stride_token, uint32_t v_sf_stride_head,
     uint32_t* __restrict__ semaphores = nullptr, void* __restrict__ scratch = nullptr) {
 #if SPEC_DEC
   kernel_mha_impl(qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,
@@ -2795,7 +2882,8 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
                   beamSearchParams,
 #endif
                   batchSize, kvCacheScale, kvScalePtr, kv_stride_page, kv_stride_token,
-                  kv_stride_head, semaphores, scratch);
+                  kv_stride_head, k_sf_stride_page, k_sf_stride_token, k_sf_stride_head,
+                  v_sf_stride_page, v_sf_stride_token, v_sf_stride_head, semaphores, scratch);
 }
 #else
 static constexpr auto kernel_mha = kernel_mha_impl;
@@ -2837,7 +2925,9 @@ void launchMHA(
     SpecDecParams const& specDecParams,
 #endif
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
+    uint64_t kv_stride_token, uint64_t kv_stride_head, uint64_t k_sf_stride_page,
+    uint64_t k_sf_stride_token, uint64_t k_sf_stride_head, uint64_t v_sf_stride_page,
+    uint64_t v_sf_stride_token, uint64_t v_sf_stride_head, cudaStream_t stream) {
 #if SPEC_DEC
   auto const qSeqLen = specDecParams.qSeqLen;
   auto const qCuSeqLens = specDecParams.qCuSeqLens;
@@ -2890,6 +2980,22 @@ void launchMHA(
   uint32_t const stride_page_in_heads = static_cast<uint32_t>(kv_stride_page / validElemsPerHead);
   uint32_t const stride_token_in_heads = static_cast<uint32_t>(kv_stride_token / validElemsPerHead);
   uint32_t const stride_head_in_heads = static_cast<uint32_t>(kv_stride_head / validElemsPerHead);
+#if ENABLE_4BIT_KV_CACHE
+  constexpr uint32_t sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
+  uint32_t const k_sf_stride_page_in_heads = static_cast<uint32_t>(k_sf_stride_page / sf_elems_per_head);
+  uint32_t const k_sf_stride_token_in_heads = static_cast<uint32_t>(k_sf_stride_token / sf_elems_per_head);
+  uint32_t const k_sf_stride_head_in_heads = static_cast<uint32_t>(k_sf_stride_head / sf_elems_per_head);
+  uint32_t const v_sf_stride_page_in_heads = static_cast<uint32_t>(v_sf_stride_page / sf_elems_per_head);
+  uint32_t const v_sf_stride_token_in_heads = static_cast<uint32_t>(v_sf_stride_token / sf_elems_per_head);
+  uint32_t const v_sf_stride_head_in_heads = static_cast<uint32_t>(v_sf_stride_head / sf_elems_per_head);
+#else
+  uint32_t const k_sf_stride_page_in_heads = 0;
+  uint32_t const k_sf_stride_token_in_heads = 0;
+  uint32_t const k_sf_stride_head_in_heads = 0;
+  uint32_t const v_sf_stride_page_in_heads = 0;
+  uint32_t const v_sf_stride_token_in_heads = 0;
+  uint32_t const v_sf_stride_head_in_heads = 0;
+#endif
 
   cudaLaunchKernelEx(&launchCfg, kernel_mha,
 #if SPEC_DEC
@@ -2913,7 +3019,10 @@ void launchMHA(
                      beamSearchParams,
 #endif
                      batchSize, kvCacheScale, kvScalePtr, stride_page_in_heads,
-                     stride_token_in_heads, stride_head_in_heads, semaphores, scratch);
+                     stride_token_in_heads, stride_head_in_heads, k_sf_stride_page_in_heads,
+                     k_sf_stride_token_in_heads, k_sf_stride_head_in_heads,
+                     v_sf_stride_page_in_heads, v_sf_stride_token_in_heads,
+                     v_sf_stride_head_in_heads, semaphores, scratch);
   checkCuda(cudaPeekAtLastError());
 #endif  // USE_INPUT_KV
 }
@@ -2946,6 +3055,9 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #endif
                          uint32_t* semaphores, void* scratch, bool enable_pdl,
                          uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
+                         uint64_t k_sf_stride_page, uint64_t k_sf_stride_token,
+                         uint64_t k_sf_stride_head, uint64_t v_sf_stride_page,
+                         uint64_t v_sf_stride_token, uint64_t v_sf_stride_head,
                          cudaStream_t stream) {
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     if (!allowMultiBlockMode) {
@@ -2977,6 +3089,28 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
       static_cast<uint32_t>(kv_stride_token / container_elems_per_head);
   uint32_t const stride_head_in_heads =
       static_cast<uint32_t>(kv_stride_head / container_elems_per_head);
+#if ENABLE_4BIT_KV_CACHE
+  constexpr uint32_t sf_elems_per_head = validElemsPerHead / CacheElemConverter::QuantVectorSize;
+  uint32_t const k_sf_stride_page_in_heads =
+      static_cast<uint32_t>(k_sf_stride_page / sf_elems_per_head);
+  uint32_t const k_sf_stride_token_in_heads =
+      static_cast<uint32_t>(k_sf_stride_token / sf_elems_per_head);
+  uint32_t const k_sf_stride_head_in_heads =
+      static_cast<uint32_t>(k_sf_stride_head / sf_elems_per_head);
+  uint32_t const v_sf_stride_page_in_heads =
+      static_cast<uint32_t>(v_sf_stride_page / sf_elems_per_head);
+  uint32_t const v_sf_stride_token_in_heads =
+      static_cast<uint32_t>(v_sf_stride_token / sf_elems_per_head);
+  uint32_t const v_sf_stride_head_in_heads =
+      static_cast<uint32_t>(v_sf_stride_head / sf_elems_per_head);
+#else
+  uint32_t const k_sf_stride_page_in_heads = 0;
+  uint32_t const k_sf_stride_token_in_heads = 0;
+  uint32_t const k_sf_stride_head_in_heads = 0;
+  uint32_t const v_sf_stride_page_in_heads = 0;
+  uint32_t const v_sf_stride_token_in_heads = 0;
+  uint32_t const v_sf_stride_head_in_heads = 0;
+#endif
 
   cudaLaunchKernelEx(&launchCfg, kernel_mha,
 #if SPEC_DEC
@@ -2996,8 +3130,10 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
                      mask,
 #endif
                      attentionSinks, cacheList, batchSize, kvCacheScale, kvScalePtr,
-                     stride_page_in_heads, stride_token_in_heads, stride_head_in_heads, semaphores,
-                     scratch);
+                     stride_page_in_heads, stride_token_in_heads, stride_head_in_heads,
+                     k_sf_stride_page_in_heads, k_sf_stride_token_in_heads,
+                     k_sf_stride_head_in_heads, v_sf_stride_page_in_heads,
+                     v_sf_stride_token_in_heads, v_sf_stride_head_in_heads, semaphores, scratch);
   checkCuda(cudaPeekAtLastError());
 }
 #endif

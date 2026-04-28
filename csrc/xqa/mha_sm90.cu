@@ -3054,7 +3054,9 @@ void launchHopperF8MHAFlashInfer(
     uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream) {
+    uint64_t kv_stride_token, uint64_t kv_stride_head, uint64_t k_sf_stride_page,
+    uint64_t k_sf_stride_token, uint64_t k_sf_stride_head, uint64_t v_sf_stride_page,
+    uint64_t v_sf_stride_token, uint64_t v_sf_stride_head, cudaStream_t stream) {
   uint32_t const nbSubSeqPerSeq = [&]() -> uint32_t {
     float const factor = 0.25f;
     return mha::min<uint32_t>(

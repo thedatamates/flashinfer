@@ -353,6 +353,70 @@ struct MtpMask : public Mask<Traits, Cta_tile, 2> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Causal mask for GQA grouped in the M dimension. Rows are laid out as
+// consecutive Q heads for the same query token, so row / group_size maps back
+// to the causal token index.
+template <typename Traits, typename Cta_tile>
+struct GqaGroupedMask : public Mask<Traits, Cta_tile, 2> {
+  using Base = Mask<Traits, Cta_tile, 2>;
+  using Mma_tile = typename Base::Mma_tile;
+
+  template <typename Params, typename Block_info>
+  inline __device__ GqaGroupedMask(Params const& params, Block_info const& block_info, int tidx)
+      : Base(params, block_info, tidx),
+        num_grouped_heads_(params.num_grouped_heads),
+        row_loop_step_(0) {
+    this->seqlen_ = block_info.actual_kv_seqlen - block_info.actual_q_seqlen + 1;
+
+    int warp = tidx / Cta_tile::THREADS_PER_WARP;
+    int lane = tidx % Cta_tile::THREADS_PER_WARP;
+    int warp_m = warp % Cta_tile::WARPS_M;
+    row_ = warp_m * 16 + lane / 4;
+  }
+
+  inline __device__ int get_row(int mi, int ii) const {
+    int row = row_ + row_loop_step_ + mi * Mma_tile::M_PER_MMA_PER_CTA;
+    row += ii * 8;
+    return row;
+  }
+
+  inline __device__ int get_col(int ni, int jj) const {
+    int col = this->col_ + this->col_loop_step_ * Cta_tile::N + ni * Mma_tile::N_PER_MMA_PER_CTA;
+    col += (jj & 0x02) * 4 + (jj & 0x1);
+    return col;
+  }
+
+  inline __device__ void get_row_col(int& row, int& col, int mi, int ni, int ii, int jj) const {
+    row = get_row(mi, ii);
+    col = get_col(ni, jj);
+  }
+
+  inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    int col = get_col(ni, jj);
+    return col < (this->seqlen_ + grouped_token_idx_[mi][ii]);
+  }
+
+  inline __device__ bool is_valid(int row, int col) const { return row >= col; }
+
+  inline __device__ void load(int row_loop_step) {
+    row_loop_step_ = row_loop_step;
+#pragma unroll
+    for (int mi = 0; mi < Mma_tile::MMAS_M; ++mi) {
+#pragma unroll
+      for (int ii = 0; ii < 2; ++ii) {
+        grouped_token_idx_[mi][ii] = get_row(mi, ii) / num_grouped_heads_;
+      }
+    }
+  }
+
+  int num_grouped_heads_;
+  int grouped_token_idx_[Mma_tile::MMAS_M][2];
+  int row_;
+  int row_loop_step_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // The lower triangle attention matrix.
 // Assume we only pay attention to past sliding-window-size long sequence.
 // v x x x x x x x x
@@ -631,13 +695,14 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 3>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Traits, typename Cta_tile, int FMHA_VERSION, bool IS_MTP>
+template <typename Traits, typename Cta_tile, int FMHA_VERSION, bool IS_MTP,
+          bool GROUP_Q_HEADS_IN_M = false>
 struct Mask_dispatcher {};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Traits, typename Cta_tile, int FMHA_VERSION>
-struct Mask_dispatcher<Traits, Cta_tile, FMHA_VERSION, false>
+struct Mask_dispatcher<Traits, Cta_tile, FMHA_VERSION, false, false>
     : public Mask<Traits, Cta_tile, FMHA_VERSION> {
   using Base = Mask<Traits, Cta_tile, FMHA_VERSION>;
 
@@ -649,8 +714,33 @@ struct Mask_dispatcher<Traits, Cta_tile, FMHA_VERSION, false>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Traits, typename Cta_tile, int FMHA_VERSION>
-struct Mask_dispatcher<Traits, Cta_tile, FMHA_VERSION, true> : public MtpMask<Traits, Cta_tile> {
+struct Mask_dispatcher<Traits, Cta_tile, FMHA_VERSION, true, false>
+    : public MtpMask<Traits, Cta_tile> {
   using Base = MtpMask<Traits, Cta_tile>;
+
+  template <typename Params, typename Block_info>
+  inline __device__ Mask_dispatcher(Params const& params, Block_info const& block_info, int tidx)
+      : Base(params, block_info, tidx) {}
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Traits, typename Cta_tile>
+struct Mask_dispatcher<Traits, Cta_tile, 2, false, true>
+    : public Mask<Traits, Cta_tile, 2> {
+  using Base = Mask<Traits, Cta_tile, 2>;
+
+  template <typename Params, typename Block_info>
+  inline __device__ Mask_dispatcher(Params const& params, Block_info const& block_info, int tidx)
+      : Base(params, block_info, tidx) {}
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Traits, typename Cta_tile, int FMHA_VERSION>
+struct Mask_dispatcher<Traits, Cta_tile, FMHA_VERSION, false, true>
+    : public GqaGroupedMask<Traits, Cta_tile> {
+  using Base = GqaGroupedMask<Traits, Cta_tile>;
 
   template <typename Params, typename Block_info>
   inline __device__ Mask_dispatcher(Params const& params, Block_info const& block_info, int tidx)

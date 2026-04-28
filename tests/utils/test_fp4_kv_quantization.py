@@ -184,5 +184,29 @@ def test_nvfp4_kv_roundtrip(shape, dtype):
     assert cos_sim > 0.8, f"Cosine similarity too low: {cos_sim:.4f}"
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_nvfp4_kv_roundtrip_non_unit_global_scale(dtype):
+    """Exercise the KV cache scale convention with a non-unit global scale."""
+    cc = get_compute_capability()
+    if cc < 100:
+        pytest.skip(f"SM{cc} does not support NVFP4 quantization (requires SM100+)")
+
+    torch.manual_seed(42)
+    input_data = torch.randn((64, 512), dtype=dtype, device="cuda") * 3.0
+    amax = input_data.float().abs().max().clamp(min=1e-12)
+    global_scale = (amax / 448.0).reshape(1).float()
+
+    fp4_output, block_scales = flashinfer.nvfp4_kv_quantize(input_data, global_scale)
+    reconstructed = flashinfer.nvfp4_kv_dequantize(
+        fp4_output, block_scales, global_scale, output_dtype=dtype
+    )
+
+    cos_sim = torch.nn.functional.cosine_similarity(
+        input_data.float().flatten().unsqueeze(0),
+        reconstructed.float().flatten().unsqueeze(0),
+    )
+    assert cos_sim > 0.98, f"Cosine similarity too low: {cos_sim:.4f}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

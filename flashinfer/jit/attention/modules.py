@@ -1021,13 +1021,37 @@ def gen_batch_prefill_module(
             "uint8_t",
         ]  # NOTE(Zihao): int32_t should follow dtype_idx
         additional_scalar_names = [
+            "k_cache_sf_stride_page",
+            "k_cache_sf_stride_h",
+            "k_cache_sf_stride_n",
+            "v_cache_sf_stride_page",
+            "v_cache_sf_stride_h",
+            "v_cache_sf_stride_n",
+            "v_cache_sf_layout",
+            "v_cache_sf_logical_cols",
+            "v_cache_sf_col_offset",
             "logits_soft_cap",
             "sm_scale",
             "rope_rcp_scale",
             "rope_rcp_theta",
             "token_pos_in_items_len",
         ]
-        additional_scalar_dtypes = ["double", "double", "double", "double", "int64_t"]
+        additional_scalar_dtypes = [
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "uint32_t",
+            "double",
+            "double",
+            "double",
+            "double",
+            "int64_t",
+        ]
         variant_name = f"DefaultAttention<use_custom_mask, {str(use_sliding_window).lower()}, {str(use_logits_soft_cap).lower()}, {str(pos_encoding_mode == 2).lower()}>"
         variant_decl = "#include<flashinfer/attention/variants.cuh>"
     else:

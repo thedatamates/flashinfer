@@ -478,6 +478,68 @@ struct Ada_qmma_e4m3_fp32_traits : public Traits<Ada, e4m3_t, e4m3_t, e4m3_t, fl
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+struct Blackwell : public Gpu_arch_base {
+  enum { HAS_LDGSTS = 1 };
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Cta_tile>
+struct Blackwell_mma_nvf4_tile {
+  // One FMHA tile is two native SM120 16x8x64 atoms in N, matching the existing
+  // 16x16 softmax/register layout used by Ampere/Ada paths.
+  enum { M_PER_MMA = 16, N_PER_MMA = 16, K_PER_MMA = 64 };
+
+  enum {
+    M_PER_MMA_PER_CTA = M_PER_MMA * Cta_tile::WARPS_M,
+    N_PER_MMA_PER_CTA = N_PER_MMA * Cta_tile::WARPS_N,
+    K_PER_MMA_PER_CTA = K_PER_MMA * Cta_tile::WARPS_K
+  };
+
+  enum {
+    MMAS_M = Div_up<Cta_tile::M, M_PER_MMA_PER_CTA>::VALUE,
+    MMAS_N = Div_up<Cta_tile::N, N_PER_MMA_PER_CTA>::VALUE,
+    MMAS_K = Div_up<Cta_tile::K, K_PER_MMA_PER_CTA>::VALUE,
+  };
+
+  enum {
+    VALID_MMAS_N = Div_up<Cta_tile::VALID_N, N_PER_MMA_PER_CTA>::VALUE,
+    VALID_MMAS_K = Div_up<Cta_tile::VALID_K, K_PER_MMA_PER_CTA>::VALUE,
+  };
+
+  enum {
+    M_PER_WARP = MMAS_M * M_PER_MMA,
+    N_PER_WARP = MMAS_N * N_PER_MMA,
+    K_PER_WARP = MMAS_K * K_PER_MMA,
+  };
+
+  enum { THREADS_PER_MMA_M = 8, THREADS_PER_MMA_N = 4 };
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct Blackwell_mma_nvf4_fp32_traits
+    : public Traits<Blackwell, uint8_t, uint8_t, bf16_t, float, bf16_t> {
+  enum { K_PER_MMA = 64 };
+  enum { BITS_PER_ELEMENT_A = 4 };
+  enum { BITS_PER_ELEMENT_B = 4 };
+  enum { BITS_PER_ELEMENT_C = 16 };
+  enum { NVFP4_SCALE_VEC_SIZE = 16 };
+
+  static inline __host__ __device__ int64_t offset_in_bytes_a(int64_t offset) {
+    return offset / 2;
+  }
+
+  static inline __host__ __device__ int64_t offset_in_bytes_b(int64_t offset) {
+    return offset / 2;
+  }
+
+  template <typename Cta_tile>
+  using Mma_tile = Blackwell_mma_nvf4_tile<Cta_tile>;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 struct Hopper : public Gpu_arch_base {
   // It has LDGSTS.
   enum { HAS_LDGSTS = 1 };

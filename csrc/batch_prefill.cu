@@ -50,7 +50,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView kv_len_arr, int64_t total_num_rows, int64_t batch_size, int64_t num_qo_heads,
     int64_t num_kv_heads, int64_t page_size, bool enable_cuda_graph, int64_t head_dim_qk,
     int64_t head_dim_vo, bool causal, int64_t window_left, int64_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas = 0) {
+    bool disable_split_kv, int64_t num_colocated_ctas = 0, int64_t cta_tile_q_override = 0) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -67,7 +67,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
       static_cast<IdType*>(kv_indptr.data_ptr()), total_num_rows, batch_size, num_qo_heads,
       num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
       /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
-      stream);
+      static_cast<uint32_t>(cta_tile_q_override), stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan prefill with error: " << cudaGetErrorString(status);
@@ -91,6 +91,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
   int64_t num_kv_heads = (kv_layout == QKVLayout::kNHD) ? k.size(1) : k.size(0);
   uint32_t q_stride_n = q.stride(0), q_stride_h = q.stride(1), k_stride_n, k_stride_h, v_stride_n,
            v_stride_h;
+  uint32_t o_stride_n = o.stride(0), o_stride_h = o.stride(1);
   if (kv_layout == QKVLayout::kNHD) {
     k_stride_n = k.stride(0);
     k_stride_h = k.stride(1);
@@ -136,6 +137,8 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         params.group_size = uint_fastdiv(num_qo_heads / num_kv_heads);
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
+        params.o_stride_n = o_stride_n;
+        params.o_stride_h = o_stride_h;
         params.k_stride_n = k_stride_n;
         params.k_stride_h = k_stride_h;
         params.v_stride_n = v_stride_n;
@@ -238,6 +241,8 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
   // get q_stride_n and q_stride_h
   const auto q_stride_n = q.stride(0);
   const auto q_stride_h = q.stride(1);
+  const auto o_stride_n = o.stride(0);
+  const auto o_stride_h = o.stride(1);
 
   // get kv_cache_strides
   const int64_t* kv_cache_strides = paged_k_cache.strides().data();
@@ -273,6 +278,8 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.group_size = uint_fastdiv(num_qo_heads / paged_kv.num_heads);
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
+        params.o_stride_n = o_stride_n;
+        params.o_stride_h = o_stride_h;
         params.window_left = window_left;
 
         params.request_indices = nullptr;

@@ -28,11 +28,18 @@ using CacheElemConverter = ElemTypeConverter<CACHE_ELEM_ENUM>;
 using CacheElem = CacheElemConverter::Type;
 constexpr uint32_t validElemsPerHead = HEAD_ELEMS;
 constexpr bool isMLA = IS_MLA;
-static_assert((isMLA || validElemsPerHead <= 256) &&
+static_assert((isMLA || validElemsPerHead <= 256 ||
+               (ENABLE_4BIT_KV_CACHE && validElemsPerHead == 512)) &&
               (sizeof(CacheElem) * validElemsPerHead) % 16 == 0);
 constexpr uint32_t headElems =
-    validElemsPerHead <= 64 ? 64 : (validElemsPerHead <= 128 ? 128 : (isMLA ? 576 : 256));
-static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 576,
+    validElemsPerHead <= 64     ? 64
+    : validElemsPerHead <= 128  ? 128
+    : validElemsPerHead <= 256  ? 256
+    : isMLA                    ? 576
+    : validElemsPerHead == 512 ? 512
+                                : 256;
+static_assert(headElems == 64 || headElems == 128 || headElems == 256 || headElems == 512 ||
+                  headElems == 576,
               "not implemented");
 constexpr uint32_t beamWidth = BEAM_WIDTH;
 constexpr uint32_t headGrpSize = HEAD_GRP_SIZE;
@@ -141,7 +148,9 @@ void launchMHA(
     SpecDecParams const& specDecParams,
 #endif
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream);
+    uint64_t kv_stride_token, uint64_t kv_stride_head, uint64_t k_sf_stride_page,
+    uint64_t k_sf_stride_token, uint64_t k_sf_stride_head, uint64_t v_sf_stride_page,
+    uint64_t v_sf_stride_token, uint64_t v_sf_stride_head, cudaStream_t stream);
 
 void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32_t slidingWinSize,
                          float qScale, float const* qScalePtr, OutputHead* output,
@@ -161,6 +170,9 @@ void launchMHAFlashInfer(uint32_t multiProcessorCount, uint32_t nbKHeads, uint32
 #endif
                          uint32_t* semaphores, void* scratch, bool enable_pdl,
                          uint64_t kv_stride_page, uint64_t kv_stride_token, uint64_t kv_stride_head,
+                         uint64_t k_sf_stride_page, uint64_t k_sf_stride_token,
+                         uint64_t k_sf_stride_head, uint64_t v_sf_stride_page,
+                         uint64_t v_sf_stride_token, uint64_t v_sf_stride_head,
                          cudaStream_t stream);
 
 void launchHopperF8MHA(
@@ -209,7 +221,9 @@ void launchHopperF8MHAFlashInfer(
     uint32_t qSeqLen, uint32_t const* qCuSeqLens, MaskType const* mask,
 #endif
     uint32_t* semaphores, void* scratch, bool enable_pdl, uint64_t kv_stride_page,
-    uint64_t kv_stride_token, uint64_t kv_stride_head, cudaStream_t stream);
+    uint64_t kv_stride_token, uint64_t kv_stride_head, uint64_t k_sf_stride_page,
+    uint64_t k_sf_stride_token, uint64_t k_sf_stride_head, uint64_t v_sf_stride_page,
+    uint64_t v_sf_stride_token, uint64_t v_sf_stride_head, cudaStream_t stream);
 
 void launchMLA(
     cudaDeviceProp const& prop,

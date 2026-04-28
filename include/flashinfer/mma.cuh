@@ -21,7 +21,15 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <cassert>
+#include <cstdint>
 #include <type_traits>
+
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#include <cutlass/float8.h>
+#include <cutlass/float_subbyte.h>
+#include <cute/arch/mma_sm120.hpp>
+#endif
 
 namespace flashinfer {
 
@@ -54,10 +62,76 @@ namespace mma {
 #define FLASHINFER_RUNTIME_ASSERT(x) assert(0 && x)
 #endif
 
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+#if (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210))
+#define FLASHINFER_MMA_F4F4F32_M16N8K64_ENABLED
+#endif
+#endif
+
 enum class MMAMode {
   kInit = 0U,
   kInplaceUpdate = 1U,
 };
+
+#if (__CUDACC_VER_MAJOR__ * 10000 + __CUDACC_VER_MINOR__ * 100 >= 120800)
+__device__ __forceinline__ uint32_t float4_to_e4m3x4(float x0, float x1, float x2,
+                                                     float x3) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  uint32_t res;
+  asm volatile(
+      "{\n"
+      ".reg .b16 lo;\n"
+      ".reg .b16 hi;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+      "mov.b32 %0, {lo, hi};\n"
+      "}"
+      : "=r"(res)
+      : "f"(x0), "f"(x1), "f"(x2), "f"(x3));
+  return res;
+#else
+  FLASHINFER_RUNTIME_ASSERT("e4m3 conversion requires sm90+.");
+  return 0;
+#endif
+}
+
+__device__ __forceinline__ uint32_t make_ue4m3_scale_reg(float s0, float s1, float s2,
+                                                         float s3) {
+  return float4_to_e4m3x4(s0, s1, s2, s3);
+}
+
+__device__ __forceinline__ uint32_t pack_e4m3_scale_reg(uint8_t s0, uint8_t s1,
+                                                        uint8_t s2, uint8_t s3) {
+  return static_cast<uint32_t>(s0) | (static_cast<uint32_t>(s1) << 8) |
+         (static_cast<uint32_t>(s2) << 16) | (static_cast<uint32_t>(s3) << 24);
+}
+
+__device__ __forceinline__ uint32_t float8_to_e2m1x8(float x0, float x1, float x2,
+                                                     float x3, float x4, float x5,
+                                                     float x6, float x7) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint32_t res;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      ".reg .b8 byte1;\n"
+      ".reg .b8 byte2;\n"
+      ".reg .b8 byte3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte1, %4, %3;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte2, %6, %5;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte3, %8, %7;\n"
+      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
+      "}"
+      : "=r"(res)
+      : "f"(x0), "f"(x1), "f"(x2), "f"(x3), "f"(x4), "f"(x5), "f"(x6), "f"(x7));
+  return res;
+#else
+  FLASHINFER_RUNTIME_ASSERT("e2m1 conversion requires sm100+.");
+  return 0;
+#endif
+}
+#endif
 
 /*!
  * \brief Wrapper of PTX ldmatrix m8n8.x4 instruction, loads data from shared memory
@@ -303,6 +377,48 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
   FLASHINFER_RUNTIME_ASSERT(
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
 #endif
+}
+
+/*!
+ * \brief Wrapper of two SM120 block-scaled FP4 MMA atoms for row-major A and column-major B.
+ *
+ * A is a m16k64 E2M1 fragment with four packed registers and one UE4M3 scale register.
+ * B is a k64n16 E2M1 fragment represented as two k64n8 atoms, each with two packed
+ * registers and its own UE4M3 scale register. Scale registers are per-block operand
+ * metadata; any row-level online-softmax correction must be applied to the accumulator,
+ * not folded into these scale registers.
+ */
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n16k64_row_col_f4f4f32(
+    float* C, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1,
+    uint32_t b2, uint32_t b3, uint32_t scale_a, uint32_t scale_b0, uint32_t scale_b1) {
+#if defined(FLASHINFER_MMA_F4F4F32_M16N8K64_ENABLED)
+  using MmaAtom =
+      cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<cutlass::float_e2m1_t,
+                                                    cutlass::float_e2m1_t, float,
+                                                    cutlass::float_ue4m3_t, 16>;
+  if constexpr (mma_mode == MMAMode::kInit) {
+    MmaAtom::fma(C[0], C[1], C[2], C[3], a0, a1, a2, a3, b0, b1, 0.f, 0.f,
+                 0.f, 0.f, scale_a, scale_b0);
+    MmaAtom::fma(C[4], C[5], C[6], C[7], a0, a1, a2, a3, b2, b3, 0.f, 0.f,
+                 0.f, 0.f, scale_a, scale_b1);
+  } else {
+    MmaAtom::fma(C[0], C[1], C[2], C[3], a0, a1, a2, a3, b0, b1, C[0],
+                 C[1], C[2], C[3], scale_a, scale_b0);
+    MmaAtom::fma(C[4], C[5], C[6], C[7], a0, a1, a2, a3, b2, b3, C[4],
+                 C[5], C[6], C[7], scale_a, scale_b1);
+  }
+#else
+  FLASHINFER_RUNTIME_ASSERT("SM120 FP4 MMA requires CUDA 12.8+ and sm120/sm121.");
+#endif
+}
+
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n16k64_row_col_f4f4f32(
+    float* C, const uint32_t (&A)[4], const uint32_t (&B)[4], uint32_t scale_a,
+    uint32_t scale_b0, uint32_t scale_b1) {
+  mma_sync_m16n16k64_row_col_f4f4f32<mma_mode>(C, A[0], A[1], A[2], A[3], B[0], B[1],
+                                               B[2], B[3], scale_a, scale_b0, scale_b1);
 }
 
 /*!

@@ -173,6 +173,45 @@ __device__ inline void copyHeadsAsync(
                                     [&](uint32_t x) { return localHeadIdxMap(dstHeadOffset + x); });
 }
 
+template <typename Head, uint32_t maxNbCopiedHeads, uint32_t nbWarps, uint32_t grainBytesSmem,
+          uint32_t grainBytesGmem, bool swizzle, bool isFull, uint32_t dstNbHeads,
+          typename SrcHeadPtr, typename _LdGrain, typename LocalHeadIdxMap = uint32_t (*)(uint32_t)>
+__device__ inline void copyHeadsCtaAsync(
+    uint32_t tid, Array2D<_LdGrain, dstNbHeads, exactDiv(sizeof(Head), grainBytesSmem)>& dst,
+    SrcHeadPtr const& src, uint32_t nbAvailHeads = maxNbCopiedHeads,
+    LocalHeadIdxMap&& localHeadIdxMap = [](uint32_t x) { return x; }) {
+  static_assert(maxNbCopiedHeads <= dstNbHeads);
+  static_assert(grainBytesSmem == grainBytesGmem);
+  assert(tid < warp_size * nbWarps);
+  assert(!isFull || nbAvailHeads >= maxNbCopiedHeads);
+
+  constexpr uint32_t grainsPerHead = exactDiv(sizeof(Head), grainBytesSmem);
+  constexpr uint32_t maxTotalNbGrains = maxNbCopiedHeads * grainsPerHead;
+  constexpr uint32_t nbThrds = warp_size * nbWarps;
+  using SrcHead = mha::decay_t<decltype(src[0])>;
+  constexpr uint32_t nbValidGrains = exactDiv(sizeof(SrcHead), grainBytesGmem);
+
+#pragma unroll
+  for (uint32_t i = 0; i < divUp(maxTotalNbGrains, nbThrds); i++) {
+    uint32_t const idx = nbThrds * i + tid;
+    if (idx >= maxTotalNbGrains) {
+      break;
+    }
+    uint32_t const idxHeadLocal = idx / grainsPerHead;
+    uint32_t const idxGrainInsideHead = idx % grainsPerHead;
+    bool const isHeadInBound = isFull || (idxHeadLocal < nbAvailHeads);
+    bool const isGrainInBound = (!isHeadPadded || idxGrainInsideHead < nbValidGrains);
+    SrcHead const* const pSrcHead = src + localHeadIdxMap(idxHeadLocal);
+    bool const isValidPage = (pSrcHead != nullptr);
+    Vec<uint8_t, grainBytesGmem> const* const pSrc =
+        reinterpret_cast<Vec<uint8_t, grainBytesGmem> const*>(pSrcHead) + idxGrainInsideHead;
+    Vec<uint8_t, grainBytesSmem>* const pDst = reinterpret_cast<Vec<uint8_t, grainBytesSmem>*>(
+        &dst.template at<swizzle>(idxHeadLocal, idxGrainInsideHead));
+    ldgsts::copyAsync<grainBytesGmem>(
+        pDst, pSrc, isValidPage && isHeadInBound && isGrainInBound ? grainBytesGmem : 0u);
+  }
+}
+
 template <bool isAsync, uint32_t maxTotalNbGrains, uint32_t nbWarps, bool isFull = true>
 __device__ inline void copyGrains(uint32_t idxWarp, LdGrain* dst, LdGrain const* src,
                                   uint32_t totalNbGrains = maxTotalNbGrains) {

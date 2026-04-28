@@ -48,7 +48,7 @@ using AlignedAllocator = flashinfer::AlignedAllocator;
 static inline void set_params(
     bert::Fused_multihead_attention_params_v2& params, const Launch_params launch_params,
     // types
-    Data_type data_type, Data_type acc_type, Data_type output_dtype,
+    Data_type q_data_type, Data_type kv_data_type, Data_type acc_type, Data_type output_dtype,
     // attention input layout
     Attention_input_layout input_layout, const bool is_paged_hnd,
     // sizes
@@ -71,6 +71,12 @@ static inline void set_params(
     void* paged_kv_pool_ptr,
     // offsets for different blocks in terms of the start address.
     int32_t* paged_block_offsets,
+    // optional NVFP4 paged K/V scale-factor tensors.
+    void* k_scale_d, void* v_scale_d, int64_t k_scale_page_stride_in_bytes,
+    int64_t k_scale_head_stride_in_bytes, int64_t k_scale_token_stride_in_bytes,
+    int64_t k_scale_vec_stride_in_bytes, int64_t v_scale_page_stride_in_bytes,
+    int64_t v_scale_head_stride_in_bytes, int64_t v_scale_token_stride_in_bytes,
+    int64_t v_scale_vec_stride_in_bytes, bool nvfp4_v_cache_uses_pv_layout,
     // mask input.
     void* packed_mask_d, void* cu_mask_rows_d,
     // attention sinks.
@@ -101,22 +107,23 @@ static inline void set_params(
     //   qkv_stride = 3hd * bytes_per_elt
     params.qkv_ptr = qkv_packed_d;
     params.q_stride_in_bytes = params.k_stride_in_bytes = params.v_stride_in_bytes =
-        get_size_in_bytes(h * d + h_kv * d + h_kv * dv, data_type);
+        get_size_in_bytes(h * d + h_kv * d + h_kv * dv, q_data_type);
   } else {
     // Layout [B, S, H, D].
     params.q_ptr = q_d;
-    params.q_stride_in_bytes = get_size_in_bytes(h * d, data_type);
+    params.q_stride_in_bytes = get_size_in_bytes(h * d, q_data_type);
 
     if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV) {
       // Layout [B, S, 2, H, D].
       params.kv_ptr = kv_d;
       params.k_stride_in_bytes = params.v_stride_in_bytes =
-          get_size_in_bytes(h_kv * (d + dv), data_type);
+          get_size_in_bytes(h_kv * (d + dv), kv_data_type);
     } else if (input_layout == Attention_input_layout::Q_PAGED_KV) {
       int max_blocks_per_sequence = (s_kv + tokens_per_block - 1) / tokens_per_block;
       params.paged_kv_cache =
           Kv_block_array(b, max_blocks_per_sequence, tokens_per_block,
-                         get_size_in_bytes(tokens_per_block * h_kv * std::gcd(d, dv), data_type),
+                         get_size_in_bytes(tokens_per_block * h_kv * std::gcd(d, dv),
+                                           kv_data_type),
                          paged_kv_pool_ptr);
       params.paged_kv_cache.mBlockOffsets = paged_block_offsets;
       // FMHA kernels always access the K/V tensor in 4D coordinate [num_pages, H_kv, page_size, D].
@@ -124,25 +131,37 @@ static inline void set_params(
       // address. 4D tensor strides of HND: [block_size, page_size * D, D ,1] 4D tensor strides of
       // NHD: [block_size, D, H_kv * D, 1]
       if (is_paged_hnd) {
-        params.k_stride_in_bytes = get_size_in_bytes(d, data_type);
-        params.v_stride_in_bytes = get_size_in_bytes(dv, data_type);
-        params.k_stride_in_bytes_2 = get_size_in_bytes(tokens_per_block * d, data_type);
-        params.v_stride_in_bytes_2 = get_size_in_bytes(tokens_per_block * dv, data_type);
+        params.k_stride_in_bytes = get_size_in_bytes(d, kv_data_type);
+        params.v_stride_in_bytes = get_size_in_bytes(dv, kv_data_type);
+        params.k_stride_in_bytes_2 = get_size_in_bytes(tokens_per_block * d, kv_data_type);
+        params.v_stride_in_bytes_2 = get_size_in_bytes(tokens_per_block * dv, kv_data_type);
       } else {
-        params.k_stride_in_bytes = get_size_in_bytes(h_kv * d, data_type);
-        params.v_stride_in_bytes = get_size_in_bytes(h_kv * dv, data_type);
-        params.k_stride_in_bytes_2 = get_size_in_bytes(d, data_type);
-        params.v_stride_in_bytes_2 = get_size_in_bytes(dv, data_type);
+        params.k_stride_in_bytes = get_size_in_bytes(h_kv * d, kv_data_type);
+        params.v_stride_in_bytes = get_size_in_bytes(h_kv * dv, kv_data_type);
+        params.k_stride_in_bytes_2 = get_size_in_bytes(d, kv_data_type);
+        params.v_stride_in_bytes_2 = get_size_in_bytes(dv, kv_data_type);
       }
     } else if (input_layout == Attention_input_layout::SEPARATE_Q_K_V) {
       // Layout [B, S, H_kv, D].
       params.k_ptr = k_d;
       // Layout [B, S, H_kv, Dv].
       params.v_ptr = v_d;
-      params.k_stride_in_bytes = get_size_in_bytes(h_kv * d, data_type);
-      params.v_stride_in_bytes = get_size_in_bytes(h_kv * dv, data_type);
+      params.k_stride_in_bytes = get_size_in_bytes(h_kv * d, kv_data_type);
+      params.v_stride_in_bytes = get_size_in_bytes(h_kv * dv, kv_data_type);
     }
   }
+
+  params.k_scale_ptr = k_scale_d;
+  params.v_scale_ptr = v_scale_d;
+  params.k_scale_page_stride_in_bytes = k_scale_page_stride_in_bytes;
+  params.k_scale_head_stride_in_bytes = k_scale_head_stride_in_bytes;
+  params.k_scale_token_stride_in_bytes = k_scale_token_stride_in_bytes;
+  params.k_scale_vec_stride_in_bytes = k_scale_vec_stride_in_bytes;
+  params.v_scale_page_stride_in_bytes = v_scale_page_stride_in_bytes;
+  params.v_scale_head_stride_in_bytes = v_scale_head_stride_in_bytes;
+  params.v_scale_token_stride_in_bytes = v_scale_token_stride_in_bytes;
+  params.v_scale_vec_stride_in_bytes = v_scale_vec_stride_in_bytes;
+  params.nvfp4_v_cache_uses_pv_layout = nvfp4_v_cache_uses_pv_layout;
 
   // Packed mask.
   params.packed_mask_ptr = packed_mask_d;
@@ -160,7 +179,7 @@ static inline void set_params(
 
 #if defined(STORE_S)
   params.s_ptr = s_d;
-  params.s_stride_in_bytes = get_size_in_bytes(b * h * s_kv, data_type);
+  params.s_stride_in_bytes = get_size_in_bytes(b * h * s_kv, q_data_type);
 #endif  // defined(STORE_S)
 
   params.softmax_stats_ptr = softmax_stats_d;
@@ -188,13 +207,18 @@ static inline void set_params(
 
   // Set the different scale values.
   Data_type scale_type1 =
-      (data_type == DATA_TYPE_FP16) || (data_type == DATA_TYPE_BF16) ? acc_type : DATA_TYPE_FP32;
+      (q_data_type == DATA_TYPE_FP16) || (q_data_type == DATA_TYPE_BF16) ? acc_type
+                                                                          : DATA_TYPE_FP32;
   Data_type scale_softmax_type = scale_type1;
   Data_type scale_type2 =
-      (data_type == DATA_TYPE_FP16) || (data_type == DATA_TYPE_BF16) ? data_type : DATA_TYPE_FP32;
-  if (data_type == DATA_TYPE_E4M3) {
+      (q_data_type == DATA_TYPE_FP16) || (q_data_type == DATA_TYPE_BF16) ? q_data_type
+                                                                          : DATA_TYPE_FP32;
+  if (q_data_type == DATA_TYPE_E4M3) {
     scale_type1 = acc_type;
     scale_type2 = acc_type;
+  }
+  if (kv_data_type == DATA_TYPE_E2M1) {
+    scale_type2 = DATA_TYPE_FP32;
   }
 
   // Fuse 1.0f / softcapping_scale into scale_bmm1.
@@ -210,7 +234,10 @@ static inline void set_params(
     set_alpha(params.scale_bmm1, fused_scale_bmm1, scale_type1);
   }
   set_alpha(params.scale_softmax, scale_softmax, scale_softmax_type);
-  set_alpha(params.scale_bmm2, scale_bmm2, scale_type2);
+  constexpr float kNvfp4ProbabilityGlobalScale = 6.f * 448.f;
+  float const fused_scale_bmm2 =
+      kv_data_type == DATA_TYPE_E2M1 ? scale_bmm2 / kNvfp4ProbabilityGlobalScale : scale_bmm2;
+  set_alpha(params.scale_bmm2, fused_scale_bmm2, scale_type2);
   // NOTE: scale_bmm2_d is now pre-populated from Python to avoid cudaMemcpy synchronization.
   // The Python side calls create_scale_bmm2_d_tensor() which replicates set_alpha logic.
   params.scale_bmm2_d = reinterpret_cast<uint32_t*>(scale_bmm2_d);
@@ -228,7 +255,7 @@ static inline void set_params(
   params.use_int8_scale_max = use_int8_scale_max;
 
   // Do we enable the trick to replace I2F with FP math in the 2nd GEMM?
-  if (data_type == DATA_TYPE_INT8) {
+  if (q_data_type == DATA_TYPE_INT8) {
     params.enable_i2f_trick = -double(1 << 22) * double(scale_bmm2) <= -128.f &&
                               double(1 << 22) * double(scale_bmm2) >= 127.f;
   }
@@ -316,6 +343,13 @@ static inline Data_type dltype_to_data_type(DLDataType dtype) {
   return DATA_TYPE_FP16;
 }
 
+static inline Data_type dltype_to_kv_data_type(DLDataType dtype, bool has_nvfp4_scale) {
+  if (has_nvfp4_scale && dtype.code == kDLUInt && dtype.bits == 8) {
+    return DATA_TYPE_E2M1;
+  }
+  return dltype_to_data_type(dtype);
+}
+
 static inline Attention_mask_type string_to_mask_type(const std::string& s) {
   if (s == "padding") return Attention_mask_type::PADDING;
   if (s == "causal") return Attention_mask_type::CAUSAL;
@@ -357,6 +391,11 @@ void fmha_v2_run(
     int window_left, int chunked_attention_size, bool has_alibi, float softcapping_scale,
     float skip_softmax_threshold_scale_factor,
     ffi::TensorView scale_bmm2_d,             // Pre-populated scale_bmm2 on device [1] int32
+    Optional<ffi::TensorView> k_scale,         // Optional NVFP4 K scales
+    Optional<ffi::TensorView> v_scale,         // Optional NVFP4 V scales
+    bool nvfp4_v_cache_uses_pv_layout,         // Optional pre-reblocked V cache layout
+    int kv_split_size,                         // Optional split-KV partition size in tokens
+    int num_kv_splits,                         // Optional number of split-KV partitions
     Optional<ffi::TensorView> softmax_stats,  // Optional [batch, s_q, num_heads, 2] for (max, sum)
     Optional<ffi::TensorView> sinks) {
   bool is_paged_hnd;
@@ -375,6 +414,11 @@ void fmha_v2_run(
   cudaDeviceProp props = device.props;
 
   cudaStream_t stream = static_cast<cudaStream_t>(get_stream(q.device()));
+
+  bool const has_nvfp4_kv = k_scale.has_value() && v_scale.has_value();
+  Data_type q_data_type = dltype_to_data_type(q.dtype());
+  Data_type kv_data_type = dltype_to_kv_data_type(k.dtype(), has_nvfp4_kv);
+  Data_type data_type = q_data_type;
 
   // Extract dimensions based on input_layout:
   // - PACKED_QKV: q is 4D [total_tokens, 3, num_heads, head_dim], k/v are same as q
@@ -397,28 +441,26 @@ void fmha_v2_run(
     //   NHD: [num_pages, page_size, H_kv, D]
     h_kv = k.shape()[is_paged_hnd ? 1 : 2];
     d = q.shape()[2];
-    dv = v.shape()[3];
+    dv = is_sub_byte(kv_data_type) ? v.shape()[3] * 2 : v.shape()[3];
   } else if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV) {
     // q is 3D: [total_tokens, H, D], k is 4D: [total_tokens, 2, H_kv, D]
     // k holds the combined KV tensor where dim 1 = 2 (K and V interleaved)
     h = q.shape()[1];
     h_kv = k.shape()[2];  // KV shape is [tokens, 2, H_kv, D]
     d = q.shape()[2];
-    dv = k.shape()[3];  // D from KV tensor
+    dv = is_sub_byte(kv_data_type) ? k.shape()[3] * 2 : k.shape()[3];  // D from KV tensor
   } else {
     // SEPARATE_Q_K_V: all 3D ragged [total_tokens, H, D]
     h = q.shape()[1];
     h_kv = k.shape()[1];
     d = q.shape()[2];
-    dv = v.shape()[2];
+    dv = is_sub_byte(kv_data_type) ? v.shape()[2] * 2 : v.shape()[2];
   }
 
   const size_t s_q = max_q_len;
   const size_t s_kv = max_kv_len;
   const size_t s = s_kv;  // For compatibility with existing code
 
-  // Determine data types from input tensors
-  Data_type data_type = dltype_to_data_type(q.dtype());
   Data_type acc_type =
       (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3) ? DATA_TYPE_FP32 : data_type;
 
@@ -463,12 +505,33 @@ void fmha_v2_run(
   // Validation for softmax save with MLA
   if (softmax_stats.has_value()) {
     bool is_MLA = (d == 192 && dv == 128);
-    if (((!is_MLA) && input_layout != Attention_input_layout::CONTIGUOUS_Q_KV) ||
+    bool normal_attention_layout =
+        input_layout == Attention_input_layout::CONTIGUOUS_Q_KV ||
+        input_layout == Attention_input_layout::Q_PAGED_KV;
+    if (((!is_MLA) && !normal_attention_layout) ||
         (is_MLA && input_layout != Attention_input_layout::SEPARATE_Q_K_V)) {
       fprintf(stderr,
-              "For normal attention, only CONTIGUOUS_Q_KV layout supports saving softmax stats. "
+              "For normal attention, only CONTIGUOUS_Q_KV and Q_PAGED_KV layouts support saving "
+              "softmax stats. "
               "For MLA only SEPARATE_Q_K_V layout supports saving softmax stats.\n");
       exit(1);
+    }
+  }
+  if (num_kv_splits < 1) {
+    throw std::invalid_argument("num_kv_splits must be >= 1");
+  }
+  if (num_kv_splits > 1) {
+    if (input_layout != Attention_input_layout::Q_PAGED_KV) {
+      throw std::invalid_argument("split-KV FMHA v2 currently requires Q_PAGED_KV layout");
+    }
+    if (!softmax_stats.has_value()) {
+      throw std::invalid_argument("split-KV FMHA v2 requires softmax_stats output for merge");
+    }
+    if (kv_split_size <= 0 || kv_split_size % 128 != 0) {
+      throw std::invalid_argument("kv_split_size must be a positive multiple of 128");
+    }
+    if (static_cast<size_t>(kv_split_size) < s_q) {
+      throw std::invalid_argument("kv_split_size must be >= max_q_len for causal split-KV");
     }
   }
 
@@ -553,15 +616,10 @@ void fmha_v2_run(
   // NOTE: scale_bmm2_d is now passed as a pre-populated tensor from Python
   // to avoid cudaMemcpy synchronization in set_params().
 
-  // Softmax stats: stores (max, sum) per token, 2 floats per (b, s_q, h)
-  // Write directly to user-provided tensor when available, otherwise use workspace.
-  void* softmax_stats_ptr;
-  if (softmax_stats.has_value()) {
-    softmax_stats_ptr = softmax_stats.value().data_ptr();
-  } else {
-    const size_t softmax_stats_size = 2 * sizeof(float) * b * s_q * h;
-    softmax_stats_ptr = allocator.aligned_alloc<void>(softmax_stats_size, 128, "softmax_stats_d");
-  }
+  // Softmax stats: stores (max, sum) per token, 2 floats per (b, s_q, h).
+  // Keep this null unless explicitly requested; the kernel uses null to skip the store.
+  void* softmax_stats_ptr =
+      softmax_stats.has_value() ? softmax_stats.value().data_ptr() : nullptr;
   void* attention_sinks_d = sinks.has_value() ? sinks.value().data_ptr() : nullptr;
 
   // Initialize pointers for different input layouts
@@ -577,7 +635,7 @@ void fmha_v2_run(
   // where [:, 0, :] contains K offsets and [:, 1, :] contains V offsets.
   int block_table_max_blocks = 0;
 
-  switch (input_layout) {
+	  switch (input_layout) {
     case Attention_input_layout::PACKED_QKV:
       qkv_packed_d = q.data_ptr();
       break;
@@ -607,17 +665,77 @@ void fmha_v2_run(
       break;
   }
 
+  void* k_scale_d = nullptr;
+  void* v_scale_d = nullptr;
+  int64_t k_scale_page_stride_in_bytes = 0;
+  int64_t k_scale_head_stride_in_bytes = 0;
+  int64_t k_scale_token_stride_in_bytes = 0;
+  int64_t k_scale_vec_stride_in_bytes = 0;
+  int64_t v_scale_page_stride_in_bytes = 0;
+  int64_t v_scale_head_stride_in_bytes = 0;
+  int64_t v_scale_token_stride_in_bytes = 0;
+  int64_t v_scale_vec_stride_in_bytes = 0;
+
+  if (has_nvfp4_kv) {
+    ffi::TensorView k_scale_t = k_scale.value();
+    ffi::TensorView v_scale_t = v_scale.value();
+    k_scale_d = k_scale_t.data_ptr();
+    v_scale_d = v_scale_t.data_ptr();
+    if (input_layout == Attention_input_layout::Q_PAGED_KV) {
+      if (is_paged_hnd) {
+        k_scale_page_stride_in_bytes = get_size_in_bytes(k_scale_t.stride(0), DATA_TYPE_E4M3);
+        k_scale_head_stride_in_bytes = get_size_in_bytes(k_scale_t.stride(1), DATA_TYPE_E4M3);
+        k_scale_token_stride_in_bytes = get_size_in_bytes(k_scale_t.stride(2), DATA_TYPE_E4M3);
+        k_scale_vec_stride_in_bytes = get_size_in_bytes(k_scale_t.stride(3), DATA_TYPE_E4M3);
+        v_scale_page_stride_in_bytes = get_size_in_bytes(v_scale_t.stride(0), DATA_TYPE_E4M3);
+        v_scale_head_stride_in_bytes = get_size_in_bytes(v_scale_t.stride(1), DATA_TYPE_E4M3);
+        v_scale_token_stride_in_bytes = get_size_in_bytes(v_scale_t.stride(2), DATA_TYPE_E4M3);
+        v_scale_vec_stride_in_bytes = get_size_in_bytes(v_scale_t.stride(3), DATA_TYPE_E4M3);
+      } else {
+        k_scale_page_stride_in_bytes = get_size_in_bytes(k_scale_t.stride(0), DATA_TYPE_E4M3);
+        k_scale_token_stride_in_bytes = get_size_in_bytes(k_scale_t.stride(1), DATA_TYPE_E4M3);
+        k_scale_head_stride_in_bytes = get_size_in_bytes(k_scale_t.stride(2), DATA_TYPE_E4M3);
+        k_scale_vec_stride_in_bytes = get_size_in_bytes(k_scale_t.stride(3), DATA_TYPE_E4M3);
+        v_scale_page_stride_in_bytes = get_size_in_bytes(v_scale_t.stride(0), DATA_TYPE_E4M3);
+        v_scale_token_stride_in_bytes = get_size_in_bytes(v_scale_t.stride(1), DATA_TYPE_E4M3);
+        v_scale_head_stride_in_bytes = get_size_in_bytes(v_scale_t.stride(2), DATA_TYPE_E4M3);
+        v_scale_vec_stride_in_bytes = get_size_in_bytes(v_scale_t.stride(3), DATA_TYPE_E4M3);
+      }
+    }
+  }
+
   bert::Fused_multihead_attention_params_v2 params_v2;
+  size_t const grouped_q_heads_in_m =
+      input_layout == Attention_input_layout::Q_PAGED_KV && q_data_type == DATA_TYPE_BF16 &&
+              kv_data_type == DATA_TYPE_E2M1 && (d == 128 || d == 256 || d == 512)
+          ? h / h_kv
+          : 1;
   set_params(
-      params_v2, launch_params, data_type, acc_type, output_dtype, input_layout, is_paged_hnd, b,
-      s_q, s, h, h_kv, d, dv, total, 1, sliding_window_size, chunked_attention_size,
+      params_v2, launch_params, q_data_type, kv_data_type, acc_type, output_dtype, input_layout,
+      is_paged_hnd, b, s_q, s, h, h_kv, d, dv, total, grouped_q_heads_in_m, sliding_window_size,
+      chunked_attention_size,
       // Paged kv cache.
       tokens_per_block, qkv_packed_d, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr,
-      kv_cache_block_offsets_d, packed_mask_d, nullptr, attention_sinks_d,
+      kv_cache_block_offsets_d, k_scale_d, v_scale_d, k_scale_page_stride_in_bytes,
+      k_scale_head_stride_in_bytes, k_scale_token_stride_in_bytes, k_scale_vec_stride_in_bytes,
+      v_scale_page_stride_in_bytes, v_scale_head_stride_in_bytes, v_scale_token_stride_in_bytes,
+      v_scale_vec_stride_in_bytes, nvfp4_v_cache_uses_pv_layout, packed_mask_d, nullptr, attention_sinks_d,
       static_cast<void*>(cum_seq_lens_kv.data_ptr()), static_cast<void*>(cum_seq_lens_q.data_ptr()),
       o.data_ptr(), nullptr, nullptr, softmax_stats_ptr, scale_bmm2_d.data_ptr(), scale_bmm1,
       scale_softmax, scale_bmm2, softcapping_scale_bmm1, false, false, false, has_alibi,
       skip_softmax_threshold_scale_factor);
+  params_v2.num_kv_splits = num_kv_splits;
+  params_v2.kv_split_size = kv_split_size;
+  int64_t const row_o_stride_in_bytes = get_size_in_bytes(h * dv, output_dtype);
+  int64_t const row_softmax_stats_stride_in_bytes = params_v2.softmax_stats_stride_in_bytes;
+  if (num_kv_splits > 1) {
+    params_v2.o_stride_in_bytes =
+        static_cast<int64_t>(num_kv_splits) * row_o_stride_in_bytes;
+    params_v2.softmax_stats_stride_in_bytes =
+        static_cast<int64_t>(num_kv_splits) * row_softmax_stats_stride_in_bytes;
+  }
+  params_v2.split_o_stride_in_bytes = row_o_stride_in_bytes;
+  params_v2.split_softmax_stats_stride_in_bytes = row_softmax_stats_stride_in_bytes;
 
   // For Q_PAGED_KV layout, override mMaxBlocksPerSeq to match the actual block_tables stride
   // that we used when expanding the block offsets from [B, M] to [B, 2, M]
@@ -681,5 +799,5 @@ void fmha_v2_run(
   // using pack_flash_attention_mask() or provide pre-packed mask
 
   // Run the V2 kernel with runtime dispatch based on dtype and head dimensions
-  run_fmha_v2(params_v2, launch_params, data_type, output_dtype, sm, stream);
+  run_fmha_v2(params_v2, launch_params, data_type, kv_data_type, output_dtype, sm, stream);
 }

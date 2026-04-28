@@ -12,6 +12,11 @@
 
 #pragma once
 
+#include <cutlass/float8.h>
+#include <cutlass/float_subbyte.h>
+#include <cute/arch/mma_sm120.hpp>
+#include <cute/atom/mma_traits_sm120.hpp>
+
 #include <fmha/traits.h>
 #include <fmha/utils.h>
 
@@ -470,6 +475,14 @@ struct Fragment_a<Ada_qmma_e4m3_fp16_traits, Layout> : public Fragment<e4m3_t, 1
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <typename Layout>
+struct Fragment_a<Blackwell_mma_nvf4_fp32_traits, Layout>
+    : public Fragment_base<uint8_t, 32, 4, 16> {
+  uint32_t scale_reg;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename Traits, typename Layout>
 struct Fragment_b {};
 
@@ -537,6 +550,14 @@ struct Fragment_b<Ada_qmma_e4m3_fp32_traits, Layout> : public Fragment<e4m3_t, 1
 
 template <typename Layout>
 struct Fragment_b<Ada_qmma_e4m3_fp16_traits, Layout> : public Fragment<e4m3_t, 16> {};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Layout>
+struct Fragment_b<Blackwell_mma_nvf4_fp32_traits, Layout>
+    : public Fragment_base<uint8_t, 32, 4, 16> {
+  uint32_t scale_reg[2];
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -986,6 +1007,33 @@ struct Fragment_accumulator<Ada_qmma_e4m3_fp16_traits> : public Fragment<uint16_
       asm volatile("trap;\n");
 #endif
     }
+  }
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <>
+struct Fragment_accumulator<Blackwell_mma_nvf4_fp32_traits> : public Fragment<float, 8> {
+  using Fragment_a = Fragment_a<Blackwell_mma_nvf4_fp32_traits, Row>;
+  using Fragment_b = Fragment_b<Blackwell_mma_nvf4_fp32_traits, Col>;
+  using Mma_atom =
+      cute::SM120::BLOCKSCALED::SM120_16x8x64_TN_VS<cutlass::float_e2m1_t,
+                                                    cutlass::float_e2m1_t, float,
+                                                    cutlass::float_ue4m3_t,
+                                                    Blackwell_mma_nvf4_fp32_traits::
+                                                        NVFP4_SCALE_VEC_SIZE>;
+
+  inline __device__ void mma(Fragment_a const& a, Fragment_b const& b) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+    Mma_atom::fma(this->elt(0), this->elt(1), this->elt(2), this->elt(3), a.reg(0), a.reg(1),
+                  a.reg(2), a.reg(3), b.reg(0), b.reg(1), this->elt(0), this->elt(1),
+                  this->elt(2), this->elt(3), a.scale_reg, b.scale_reg[0]);
+    Mma_atom::fma(this->elt(4), this->elt(5), this->elt(6), this->elt(7), a.reg(0), a.reg(1),
+                  a.reg(2), a.reg(3), b.reg(2), b.reg(3), this->elt(4), this->elt(5),
+                  this->elt(6), this->elt(7), a.scale_reg, b.scale_reg[1]);
+#else
+    asm volatile("trap;\n");
+#endif
   }
 };
 
@@ -1483,6 +1531,19 @@ struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile>
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename Cta_tile>
+struct Tile_o_normalizer<Blackwell_mma_nvf4_fp32_traits, Cta_tile>
+    : public Tile_o_normalizer_fp32<Blackwell_mma_nvf4_fp32_traits, Cta_tile> {
+  using Traits = fmha::Blackwell_mma_nvf4_fp32_traits;
+  using Base = Tile_o_normalizer_fp32<Traits, Cta_tile>;
+
+  template <typename Params, typename Block_info>
+  inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+      : Base(params, binfo) {}
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Cta_tile>
 struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile, true>
     : public Tile_o_normalizer_fp32<Ada_qmma_e4m3_fp32_traits, Cta_tile> {
   // The traits.
@@ -1586,9 +1647,15 @@ struct Softmax_saver {
   template <typename Params, typename Block_info>
   inline __device__ Softmax_saver(Params const& params, Block_info const& binfo)
       : actual_q_len_(binfo.actual_q_seqlen),
-        softmax_sum_ptr_(reinterpret_cast<char*>(params.softmax_stats_ptr)),
+        num_grouped_heads_(params.num_grouped_heads),
+        kv_head_(binfo.bidh),
+        q_base_(binfo.sum_s),
+        softmax_stats_ptr_(
+            reinterpret_cast<char*>(params.softmax_stats_ptr) +
+            static_cast<int64_t>(
+                params.num_kv_splits > 1 ? blockIdx.z % params.num_kv_splits : 0) *
+                params.split_softmax_stats_stride_in_bytes),
         softmax_stats_stride_in_bytes_(params.softmax_stats_stride_in_bytes) {
-    softmax_max_ptr_ = reinterpret_cast<char*>(params.softmax_stats_ptr);
 
     int warp = threadIdx.x / Cta_tile::THREADS_PER_WARP;
     int lane = threadIdx.x % Cta_tile::THREADS_PER_WARP;
@@ -1598,11 +1665,6 @@ struct Softmax_saver {
     row0_ = (warp % WARPS_M) * m_per_mma + (lane / 4);
     // Decide whether to store the lse values
     store_softmax_ = (lane % 4 == 0 && int(warp / WARPS_M) == 0);
-
-    // assume fixed seq length for the batch
-    size_t const bh_offset = (binfo.sum_s * params.h + binfo.bidh) * sizeof(float) * 2;
-    softmax_max_ptr_ += bh_offset + row0_ * params.softmax_stats_stride_in_bytes;
-    softmax_sum_ptr_ += bh_offset + row0_ * params.softmax_stats_stride_in_bytes + sizeof(float);
   };
 
   inline __device__ void store(int q_loop, float* p_sum, float* p_max) {
@@ -1615,26 +1677,37 @@ struct Softmax_saver {
         float max1 = p_max[mi * 2 + 1];
 
         int row_offset = q_loop * Cta_tile::M + mi * Mma_tile::M_PER_MMA_PER_CTA;
-        if (row0_ + row_offset < actual_q_len_) {
-          fmha::stg(softmax_max_ptr_ + row_offset * softmax_stats_stride_in_bytes_, max0);
-          fmha::stg(softmax_sum_ptr_ + row_offset * softmax_stats_stride_in_bytes_, sum0);
-        }
-        if (row0_ + row_offset + 8 < actual_q_len_) {
-          fmha::stg(softmax_max_ptr_ + (row_offset + 8) * softmax_stats_stride_in_bytes_, max1);
-          fmha::stg(softmax_sum_ptr_ + (row_offset + 8) * softmax_stats_stride_in_bytes_, sum1);
-        }
+        store_row(row0_ + row_offset, max0, sum0);
+        store_row(row0_ + row_offset + 8, max1, sum1);
       }
     }
   }
 
+  inline __device__ void store_row(int grouped_row, float max_val, float sum_val) {
+    int const q_rows = actual_q_len_ * num_grouped_heads_;
+    if (grouped_row >= q_rows) {
+      return;
+    }
+    int const token_row = grouped_row / num_grouped_heads_;
+    int const grouped_head = grouped_row - token_row * num_grouped_heads_;
+    int const head = kv_head_ * num_grouped_heads_ + grouped_head;
+    char* ptr = softmax_stats_ptr_ +
+                static_cast<int64_t>(q_base_ + token_row) * softmax_stats_stride_in_bytes_ +
+                static_cast<int64_t>(head) * sizeof(float) * 2;
+    fmha::stg(ptr, max_val);
+    fmha::stg(ptr + sizeof(float), sum_val);
+  }
+
   // ptr (total_token_q, h, 2) float
-  char* softmax_sum_ptr_ = nullptr;
-  char* softmax_max_ptr_ = nullptr;
+  char* softmax_stats_ptr_ = nullptr;
 
   // the first row's idx
   int row0_;
   // actual seq length
   int const actual_q_len_ = 0;
+  int const num_grouped_heads_ = 1;
+  int const kv_head_ = 0;
+  int const q_base_ = 0;
   int const softmax_stats_stride_in_bytes_ = 0;
 
   // store lse or not
@@ -2089,6 +2162,21 @@ struct Fragment_updater<Ada_qmma_e4m3_fp32_traits, Cta_tile>
       : Base(params, binfo) {}
 
   // Default ctor
+  Fragment_updater() = default;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Cta_tile>
+struct Fragment_updater<Blackwell_mma_nvf4_fp32_traits, Cta_tile>
+    : public Fragment_updater_ampere_fp32<Blackwell_mma_nvf4_fp32_traits, Cta_tile> {
+  using Traits = fmha::Blackwell_mma_nvf4_fp32_traits;
+  using Base = Fragment_updater_ampere_fp32<Traits, Cta_tile>;
+
+  template <typename Params, typename Block_info>
+  inline __device__ Fragment_updater(Params const& params, Block_info const& binfo)
+      : Base(params, binfo) {}
+
   Fragment_updater() = default;
 };
 

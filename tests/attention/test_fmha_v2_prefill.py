@@ -849,6 +849,108 @@ def test_trtllm_fmha_v2_prefill(
     )
 
 
+def test_trtllm_fmha_v2_sm120_paged_d512_covers_all_q_tiles() -> None:
+    if not is_sm120a_supported(torch.device("cuda")):
+        pytest.skip("SM120/SM121-only FMHAv2 D512 coverage test")
+
+    run_trtllm_fmha_v2_prefill_case(
+        input_layout="Q_PAGED_KV_HND",
+        batch_size=1,
+        max_seq_len=128,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim=512,
+        page_size=16,
+        dtype=torch.bfloat16,
+        o_dtype=torch.bfloat16,
+        causal=True,
+        mask_mode="CAUSAL",
+        window_left=-1,
+        logits_soft_cap=0.0,
+        pos_encoding_mode=None,
+        save_softmax_stats=False,
+        skip_softmax_threshold_scale_factor=0.0,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(2, 2), (4, 2)])
+def test_batch_prefill_paged_auto_uses_fmha_v2_d512(
+    kv_layout: str, num_qo_heads: int, num_kv_heads: int
+) -> None:
+    if not is_sm120a_supported(torch.device("cuda")):
+        pytest.skip("SM120/SM121-only FMHAv2 D512 wrapper test")
+
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    batch_size = 2
+    head_dim = 512
+    page_size = 16
+
+    q_lens = torch.tensor([128, 96], dtype=torch.int32, device=device)
+    kv_lens = torch.tensor([384, 320], dtype=torch.int32, device=device)
+    qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    qo_indptr[1:] = torch.cumsum(q_lens, dim=0)
+
+    blocks_per_seq = (kv_lens + page_size - 1) // page_size
+    paged_kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    paged_kv_indptr[1:] = torch.cumsum(blocks_per_seq, dim=0)
+    paged_kv_indices = torch.arange(
+        int(paged_kv_indptr[-1].item()), dtype=torch.int32, device=device
+    )
+    paged_kv_last_page_len = ((kv_lens - 1) % page_size + 1).to(torch.int32)
+
+    num_pages = int(paged_kv_indices.numel())
+    paged_shape = (
+        (num_pages, 2, page_size, num_kv_heads, head_dim)
+        if kv_layout == "NHD"
+        else (num_pages, 2, num_kv_heads, page_size, head_dim)
+    )
+    paged_kv = torch.randn(*paged_shape, dtype=torch.bfloat16, device=device)
+    q = torch.randn(
+        int(qo_indptr[-1].item()),
+        num_qo_heads,
+        head_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    workspace = _get_workspace_buffer()
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, kv_layout=kv_layout, backend="auto"
+    )
+    wrapper.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    assert wrapper._backend == "fmha_v2"
+
+    out = wrapper.run(q, paged_kv)
+    ref_paged_kv = (
+        paged_kv if kv_layout == "NHD" else paged_kv.transpose(-3, -2).contiguous()
+    )
+    out_ref = attention_ref_torch(
+        (q, ref_paged_kv),
+        seq_lens=kv_lens,
+        cum_seq_lens_q=qo_indptr,
+        sm_scale=1.0 / math.sqrt(head_dim),
+        causal=True,
+        block_tables=wrapper._block_tables,
+    )
+    torch.testing.assert_close(out.float(), out_ref.float(), rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("max_seq_len", [16384])
 @pytest.mark.parametrize("num_qo_heads", [4, 32])

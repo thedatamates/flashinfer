@@ -122,6 +122,11 @@
       __VA_ARGS__                                          \
       break;                                               \
     }                                                      \
+    case 32: {                                             \
+      constexpr uint32_t CTA_TILE_Q = 32;                  \
+      __VA_ARGS__                                          \
+      break;                                               \
+    }                                                      \
     case 16: {                                             \
       constexpr uint32_t CTA_TILE_Q = 16;                  \
       __VA_ARGS__                                          \
@@ -388,6 +393,15 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
     auto compute_capacity = GetCudaComputeCapability();
     if (compute_capacity.first >= 8) {
       // Ampere or newer
+      if (head_dim >= 512) {
+        if (avg_packed_qo_len <= 16) {
+          return 32;
+        }
+        // Avoid the 1 Q-warp / 4 KV-warp layout selected by CTA_TILE_Q=16.
+        // For 512-wide heads that layout can exceed the per-CTA shared memory
+        // limit; CTA_TILE_Q=64 uses one KV warp and keeps the same shapes valid.
+        return 64;
+      }
       if (avg_packed_qo_len > 16) {
         // avg_packed_qo_len <= 64
         return 64;

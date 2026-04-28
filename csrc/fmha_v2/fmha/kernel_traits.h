@@ -27,7 +27,54 @@
 #include <fmha/traits.h>
 #include <fmha/utils.h>
 
+#include <type_traits>
+
 namespace fmha {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <bool UseSmemO, typename GmemTileO, typename SmemTileO>
+struct Smem_o_thread_match {
+  static constexpr bool VALUE = true;
+};
+
+template <typename GmemTileO, typename SmemTileO>
+struct Smem_o_thread_match<true, GmemTileO, SmemTileO> {
+  static constexpr bool VALUE =
+      static_cast<int>(GmemTileO::THREADS_PER_ROW) == static_cast<int>(SmemTileO::THREADS_PER_ROW);
+};
+
+template <bool UseSmemO, typename SmemTileO>
+struct Smem_o_bytes {
+  enum { VALUE = 0 };
+};
+
+template <typename SmemTileO>
+struct Smem_o_bytes<true, SmemTileO> {
+  enum { VALUE = SmemTileO::BYTES_PER_TILE };
+};
+
+struct Unused_gmem_tile_o {
+  enum { THREADS_PER_ROW = 0 };
+  enum { BYTES_PER_ELEMENT = 2 };
+  enum { LOOPS = 0 };
+  enum { STGS_PER_LOOP = 0 };
+};
+
+struct Unused_smem_tile_o {
+  enum { THREADS_PER_ROW = 0 };
+  enum { BYTES_PER_TILE = 0 };
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifndef FLASHINFER_FMHA_V2_NVFP4_CTA_P_TILE_K
+#define FLASHINFER_FMHA_V2_NVFP4_CTA_P_TILE_K 64
+#endif
+
+#ifndef FLASHINFER_FMHA_V2_NVFP4_SPLIT_O_TILE_N
+#define FLASHINFER_FMHA_V2_NVFP4_SPLIT_O_TILE_N 128
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -168,13 +215,39 @@ struct Kernel_traits_ {
 
   enum { CTA_P_TILE_N = Traits_tile_size::CTA_P_TILE_N };
 
-  enum { CTA_P_TILE_K = Traits_tile_size::CTA_P_TILE_K };
+  static constexpr bool USE_NVFP4_TRAITS =
+      std::is_same<Traits_p, fmha::Blackwell_mma_nvf4_fp32_traits>::value;
+
+  enum {
+    CTA_P_TILE_K =
+        USE_NVFP4_TRAITS && USE_GRANULAR_TILING && D > 64
+            ? (FLASHINFER_FMHA_V2_NVFP4_CTA_P_TILE_K > D
+                   ? D
+                   : FLASHINFER_FMHA_V2_NVFP4_CTA_P_TILE_K)
+            : Traits_tile_size::CTA_P_TILE_K
+  };
 
   enum { CTA_O_TILE_M = Traits_tile_size::CTA_O_TILE_M };
 
-  enum { CTA_O_TILE_N = Traits_tile_size::CTA_O_TILE_N };
+  enum { SPLIT_O_TILE_N = (FLAGS & 0x8000u) != 0u };
 
-  enum { CTA_O_TILE_K = Traits_tile_size::CTA_O_TILE_K };
+  enum {
+    CTA_O_TILE_N =
+        SPLIT_O_TILE_N && USE_NVFP4_TRAITS &&
+                Traits_tile_size::CTA_O_TILE_N > FLASHINFER_FMHA_V2_NVFP4_SPLIT_O_TILE_N
+            ? FLASHINFER_FMHA_V2_NVFP4_SPLIT_O_TILE_N
+        : SPLIT_O_TILE_N && Traits_tile_size::CTA_O_TILE_N > 128 ? 128
+                                                                 : Traits_tile_size::CTA_O_TILE_N
+  };
+
+  enum {
+    CTA_O_TILE_K =
+        USE_NVFP4_TRAITS && SPLIT_O_TILE_N && D > 256 && WARPS_N > 1
+            ? Traits_o::K_PER_MMA * WARPS_N
+            : Traits_tile_size::CTA_O_TILE_K
+  };
+
+  enum { CTA_O_VALID_N = VALID_DV < CTA_O_TILE_N ? VALID_DV : CTA_O_TILE_N };
 
   // Do we need to reload Q due to splitting the D ?
   enum { RELOAD_Q = static_cast<int>(CTA_P_TILE_K) != static_cast<int>(D) };
@@ -185,8 +258,8 @@ struct Kernel_traits_ {
                                                 VALID_D, WARPS_M, WARPS_N, 1>;
   // The CTA description for the 2nd GEMM.
   using Cta_tile_o =
-      typename Traits_o::template Cta_tile_extd<CTA_O_TILE_M, CTA_O_TILE_N, CTA_O_TILE_K, VALID_DV,
-                                                S, WARPS_M, 1, WARPS_N>;
+      typename Traits_o::template Cta_tile_extd<CTA_O_TILE_M, CTA_O_TILE_N, CTA_O_TILE_K,
+                                                CTA_O_VALID_N, S, WARPS_M, 1, WARPS_N>;
 
   // The MMA tile for the 1st GEMM.
   using Mma_tile_p = typename Traits_p::template Mma_tile<Cta_tile_p>;
@@ -259,6 +332,10 @@ struct Kernel_traits_ {
   // Use MTP (multi-token prediction for MLA kernels) or not.
   enum { IS_MTP = (FLAGS & 0x2000) != 0u };
 
+  // Fold GQA heads that share a KV head into the CTA M dimension. This lets
+  // one CTA reuse the same K/V tile for all Q heads in the group.
+  enum { GROUP_Q_HEADS_IN_M = (FLAGS & 0x4000) != 0u };
+
   // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
   enum { CTAS_PER_HEAD = CTAS_PER_HEAD_ };
 
@@ -282,6 +359,21 @@ struct Kernel_traits_ {
   using Smem_tile_q = fmha::Smem_tile_a<Traits_p, Cta_tile_p, fmha::Row, Gmem_tile_q::BYTES_PER_LDG,
                                         BUFFERS_PER_TILE_SMEM_Q>;
 
+  // The Blackwell NVFP4 tiled no-loop path splits D across multiple 64-wide
+  // Q tiles. Q is invariant across KV tiles, so keep the packed Q tiles in
+  // shared memory and avoid reloading/repacking them for every KV tile.
+  using Persistent_smem_tile_q =
+      fmha::Smem_tile_a<Traits_p, Cta_tile_p, fmha::Row, Gmem_tile_q::BYTES_PER_LDG, 1>;
+  static constexpr bool USE_PERSISTENT_Q =
+      NO_LOOP && RELOAD_Q &&
+      std::is_same<Traits_p, fmha::Blackwell_mma_nvf4_fp32_traits>::value &&
+      Mma_tile_p::MMAS_K == 1;
+  enum { PERSISTENT_Q_COL_TILES = fmha::Div_up<VALID_D, CTA_P_TILE_K>::VALUE };
+  enum {
+    BYTES_PER_PERSISTENT_SMEM_Q =
+        USE_PERSISTENT_Q ? Persistent_smem_tile_q::BYTES_PER_TILE * PERSISTENT_Q_COL_TILES : 0
+  };
+
   // The global memory tile to load K.
   using Gmem_tile_k = Gmem_tile_k_<Traits_p, Cta_tile_p, Traits_p::BITS_PER_ELEMENT_B, CTA_P_TILE_N,
                                    CTA_P_TILE_K, VALID_D, USE_LDGSTS_K, HEADS_INTERLEAVED,
@@ -301,13 +393,23 @@ struct Kernel_traits_ {
   // The shared memory tile to swizzle V.
   using Smem_tile_v = fmha::Smem_tile_v<Traits_o, Cta_tile_o, BUFFERS_PER_TILE_SMEM_V>;
 
+  // Grouped-M remaps rows across Q heads, so the generic O smem epilogue's
+  // row/head addressing is not valid for this path.
+  static constexpr bool USE_SMEM_O =
+      !(NO_LOOP && std::is_same<Traits_o, fmha::Blackwell_mma_nvf4_fp32_traits>::value &&
+        GROUP_Q_HEADS_IN_M);
+
   // The global memory tile to store O.
-  using Gmem_tile_o = Gmem_tile_o_<Traits_e, Cta_tile_o, CTAS_PER_HEAD>;
+  using Gmem_tile_o_storage = Gmem_tile_o_<Traits_e, Cta_tile_o, CTAS_PER_HEAD>;
   // The shared memory tile for O.
-  using Smem_tile_o = fmha::Smem_tile_o<Traits_e, Cta_tile_o>;
+  using Smem_tile_o_storage = fmha::Smem_tile_o<Traits_e, Cta_tile_o>;
+
+  using Gmem_tile_o =
+      std::conditional_t<USE_SMEM_O, Gmem_tile_o_storage, Unused_gmem_tile_o>;
+  using Smem_tile_o = std::conditional_t<USE_SMEM_O, Smem_tile_o_storage, Unused_smem_tile_o>;
 
   // Make sure the number of threads match.
-  static_assert((int)Gmem_tile_o::THREADS_PER_ROW == (int)Smem_tile_o::THREADS_PER_ROW, "");
+  static_assert(Smem_o_thread_match<USE_SMEM_O, Gmem_tile_o, Smem_tile_o>::VALUE, "");
 
   // The number of threads.
   enum { THREADS = Cta_tile_p::THREADS_PER_CTA };
@@ -316,7 +418,11 @@ struct Kernel_traits_ {
   static_assert((int)THREADS == (int)Cta_tile_o::THREADS_PER_CTA, "");
 
   // The amount of shared memory needed to load Q and K.
-  enum { BYTES_PER_SMEM_QK = Smem_tile_q::BYTES_PER_TILE + Smem_tile_k::BYTES_PER_TILE };
+  enum {
+    BYTES_PER_SMEM_Q =
+        USE_PERSISTENT_Q ? BYTES_PER_PERSISTENT_SMEM_Q : Smem_tile_q::BYTES_PER_TILE
+  };
+  enum { BYTES_PER_SMEM_QK = BYTES_PER_SMEM_Q + Smem_tile_k::BYTES_PER_TILE };
 
   // The extra amount of shared memory needed to load V.
   enum { BYTES_PER_SMEM_V = SHARE_SMEM_FOR_K_AND_V ? 0u : Smem_tile_v::BYTES_PER_TILE };
@@ -325,21 +431,20 @@ struct Kernel_traits_ {
   enum { BYTES_PER_SMEM_QKV = BYTES_PER_SMEM_QK + BYTES_PER_SMEM_V };
 
   // The amount of shared memory needed to load/store O.
-  enum { BYTES_PER_SMEM_O = Smem_tile_o::BYTES_PER_TILE };
+  enum { BYTES_PER_SMEM_O = Smem_o_bytes<USE_SMEM_O, Smem_tile_o>::VALUE };
 
   // The amount of shared memory needed to load Q and store O.
   enum {
     BYTES_PER_SMEM_QO =
-        NO_LOOP ? Smem_tile_o::BYTES_PER_TILE : Smem_tile_q::BYTES_PER_TILE + BYTES_PER_SMEM_O
+        NO_LOOP ? BYTES_PER_SMEM_O : Smem_tile_q::BYTES_PER_TILE + BYTES_PER_SMEM_O
   };
 
   // The amount of shared memory needed for Q, K, V and O.
   enum { BYTES_PER_SMEM = fmha::Max<BYTES_PER_SMEM_QKV, BYTES_PER_SMEM_QO>::VALUE };
 
   // Make sure we have enough shared memory.
-  static_assert((NO_LOOP
-                     ? Smem_tile_o::BYTES_PER_TILE
-                     : Smem_tile_q::BYTES_PER_TILE + Smem_tile_o::BYTES_PER_TILE) <= BYTES_PER_SMEM,
+  static_assert((NO_LOOP ? BYTES_PER_SMEM_O : Smem_tile_q::BYTES_PER_TILE + BYTES_PER_SMEM_O) <=
+                    BYTES_PER_SMEM,
                 "");
 };
 
@@ -405,6 +510,9 @@ struct Kernel_traits_fmhca_ {
 
   // Whether use the sliding window attention or not.
   enum { SLIDING_WINDOW_ATTENTION = MASK_VERSION == 4 };
+
+  enum { IS_MTP = false };
+  enum { GROUP_Q_HEADS_IN_M = false };
 
   // Do we use LDGSTS for Q, K or V.
   enum { USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u };
@@ -539,6 +647,9 @@ struct Kernel_traits_interleaved_v2_ {
 
   // Whether use the sliding window attention or not.
   enum { SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4 };
+
+  enum { IS_MTP = false };
+  enum { GROUP_Q_HEADS_IN_M = false };
 
   // The number of CTAs per head for Cta_tile_p; equivalent to BMM1 split-K
   enum { CTAS_PER_HEAD = CTAS_PER_HEAD_ };
@@ -711,6 +822,14 @@ struct Gmem_tile_o_dispatcher<fmha::Ada_qmma_e4m3_fp32_traits, nv_bfloat16> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <>
+struct Gmem_tile_o_dispatcher<fmha::Blackwell_mma_nvf4_fp32_traits, bf16_t> {
+  template <typename Traits, typename Cta_tile, int CTAS_PER_HEAD>
+  using Gmem_tile_o = fmha::v2::Gmem_tile_o_bfloat16<Traits, Cta_tile, CTAS_PER_HEAD>;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <
     // The instruction traits.
     typename Traits,
@@ -811,6 +930,29 @@ template <
     int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0>
 using Kernel_traits_v2_paged_kv_cache =
     Kernel_traits_<Traits, fmha::v2::Gmem_tile_q_k_v, fmha::v2::Gmem_tile_paged_kv,
+                   fmha::v2::Gmem_tile_paged_kv,
+                   Gmem_tile_o_dispatcher<Traits, OutputType>::Gmem_tile_o, S, D, DV, STEP, WARPS_M,
+                   WARPS_N, CTAS_PER_HEAD, FLAGS, 2, MASK_VERSION, BMM2_FP16_EPILOGUE,
+                   SAGE_BLOCK_SIZE_Q, SAGE_BLOCK_SIZE_K, SAGE_BLOCK_SIZE_V>;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <
+    typename Traits,
+    int S,
+    int D,
+    int DV,
+    int STEP,
+    int WARPS_M,
+    int WARPS_N,
+    int CTAS_PER_HEAD,
+    uint32_t FLAGS = 0x8,
+    int MASK_VERSION = 2,
+    bool BMM2_FP16_EPILOGUE = true,
+    typename OutputType = bf16_t,
+    int SAGE_BLOCK_SIZE_Q = 0, int SAGE_BLOCK_SIZE_K = 0, int SAGE_BLOCK_SIZE_V = 0>
+using Kernel_traits_v2_bf16_q_nvf4_paged_kv_cache =
+    Kernel_traits_<Traits, fmha::v2::Gmem_tile_q_bf16, fmha::v2::Gmem_tile_paged_kv,
                    fmha::v2::Gmem_tile_paged_kv,
                    Gmem_tile_o_dispatcher<Traits, OutputType>::Gmem_tile_o, S, D, DV, STEP, WARPS_M,
                    WARPS_N, CTAS_PER_HEAD, FLAGS, 2, MASK_VERSION, BMM2_FP16_EPILOGUE,

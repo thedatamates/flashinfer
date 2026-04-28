@@ -1136,6 +1136,9 @@ struct Regs_to_rows<fmha::Ampere_imma_int8_int32_traits> : public Regs_to_rows_8
 template <>
 struct Regs_to_rows<fmha::Ada_qmma_e4m3_fp32_traits> : public Regs_to_rows_8bit {};
 
+template <>
+struct Regs_to_rows<fmha::Blackwell_mma_nvf4_fp32_traits> : public Regs_to_rows_8bit {};
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <>
@@ -1266,7 +1269,8 @@ struct Smem_tile_o_base_8bit_mma {
 
   enum { WARPS_K = Cta_tile::WARPS_K };
 
-  static_assert(WARPS_K > 1 || std::is_same<Traits, Ada_qmma_e4m3_fp32_traits>::value,
+  static_assert(WARPS_K > 1 || std::is_same<Traits, Ada_qmma_e4m3_fp32_traits>::value ||
+                    std::is_same<Traits, Blackwell_mma_nvf4_fp32_traits>::value,
                 "Kernel misconfigured. No split-k needed.");
 
   // Determine the config.
@@ -1302,6 +1306,10 @@ struct Smem_tile_o_base_8bit_mma {
     } else if (WARPS_2x1x2 && Cta_tile::N == 64) {
       write_row = (tidx & 0x20) / 2 + (tidx & 0x1c) / 4;
       write_col = (tidx & 0x40) / 4 + (tidx & 0x07);
+
+    } else if (WARPS_2x1x2 && Cta_tile::N >= 128) {
+      write_row = (tidx & 0x20) / 2 + (tidx & 0x1c) / 4;
+      write_col = (tidx & 0x40) * Cta_tile::N / 256 + (tidx & 0x07);
 
       // SEQLEN == 256, 384, 512 and HIDDEN_SIZE_PER_HEAD == 16.
     } else if ((WARPS_1x1x8 || WARPS_1x1x4) && Cta_tile::N == 16) {
@@ -1491,6 +1499,17 @@ struct Smem_tile_o<fmha::Ada_qmma_e4m3_fp32_traits, Cta_tile>
   using Base = Smem_tile_o_base_8bit_mma<Traits, Cta_tile>;
 
   // Ctor.
+  inline __device__ Smem_tile_o(void* smem, int tidx) : Base(smem, tidx) {}
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Cta_tile>
+struct Smem_tile_o<fmha::Blackwell_mma_nvf4_fp32_traits, Cta_tile>
+    : public Smem_tile_o_base_8bit_mma<fmha::Blackwell_mma_nvf4_fp32_traits, Cta_tile> {
+  using Traits = fmha::Blackwell_mma_nvf4_fp32_traits;
+  using Base = Smem_tile_o_base_8bit_mma<Traits, Cta_tile>;
+
   inline __device__ Smem_tile_o(void* smem, int tidx) : Base(smem, tidx) {}
 };
 

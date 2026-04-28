@@ -1137,6 +1137,179 @@ struct Smem_tile_a<Ada_qmma_e4m3_fp16_traits, Cta_tile, Row, BYTES_PER_STS, BUFF
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <
+    typename Cta_tile,
+    int BYTES_PER_STS,
+    int BUFFERS_PER_TILE>
+struct Smem_tile_a<Blackwell_mma_nvf4_fp32_traits, Cta_tile, Row, BYTES_PER_STS, BUFFERS_PER_TILE>
+    : public Smem_tile_ampere_row_a<Blackwell_mma_nvf4_fp32_traits, Cta_tile, BYTES_PER_STS,
+                                    BUFFERS_PER_TILE> {
+  using Traits = Blackwell_mma_nvf4_fp32_traits;
+  using Base = Smem_tile_ampere_row_a<Traits, Cta_tile, BYTES_PER_STS, BUFFERS_PER_TILE>;
+  using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
+  using Fragment = Fragment_a<Traits, Row>;
+
+  enum { SCALE_GROUPS_PER_ROW = Cta_tile::K / Traits::NVFP4_SCALE_VEC_SIZE };
+  enum { BYTES_PER_SCALE_BUFFER = Cta_tile::M * SCALE_GROUPS_PER_ROW };
+  enum { BYTES_PER_SCALE_TILE = BYTES_PER_SCALE_BUFFER * BUFFERS_PER_TILE };
+  enum { BYTES_PER_TILE = Base::BYTES_PER_TILE + BYTES_PER_SCALE_TILE };
+
+  inline __device__ Smem_tile_a(void* smem, int tidx) : Base(smem, tidx) {
+    int const WARPS_M = Cta_tile::WARPS_M;
+    int const WARPS_N = Cta_tile::WARPS_N;
+    int const WARPS_K = Cta_tile::WARPS_K;
+    int const WARP_MASK_M = Warp_masks<WARPS_M, WARPS_N, WARPS_K>::M;
+    int const WARP_MASK_K = Warp_masks<WARPS_M, WARPS_N, WARPS_K>::K;
+    int const WARP_DIV_M = Cta_tile::THREADS_PER_WARP;
+    int const WARP_DIV_K = WARPS_M * WARPS_N * Cta_tile::THREADS_PER_WARP;
+    int const warp_m = (tidx & WARP_MASK_M) / WARP_DIV_M;
+    int const warp_k = (tidx & WARP_MASK_K) / WARP_DIV_K;
+
+    int const lane = tidx & 0x1f;
+    nvfp4_data_row_offset_ = warp_m * Mma_tile::M_PER_MMA;
+    nvfp4_data_col_offset_ = warp_k * Mma_tile::K_PER_MMA;
+    nvfp4_scale_read_row_ =
+        warp_m * Mma_tile::M_PER_MMA + (lane >> 2) + ((lane & 0x01) ? 8 : 0);
+    nvfp4_scale_warp_k_group_offset_ =
+        warp_k * Mma_tile::K_PER_WARP / Traits::NVFP4_SCALE_VEC_SIZE;
+  }
+
+  inline __device__ void store_q_scale(int logical_row, int scale_group,
+                                       uint32_t scale_reg) {
+    int const buffer_idx = Base::BUFFERS_PER_TILE > 1 ? this->smem_write_buffer_ / Base::BYTES_PER_BUFFER : 0;
+    uint32_t const ptr = this->smem_ + Base::BYTES_PER_TILE +
+                         buffer_idx * BYTES_PER_SCALE_BUFFER +
+                         logical_row * SCALE_GROUPS_PER_ROW + scale_group;
+    fmha::sts(ptr, scale_reg);
+  }
+
+  inline __device__ void store_q_scale(int logical_row, uint32_t scale_reg) {
+    store_q_scale(logical_row, 0, scale_reg);
+  }
+
+  inline __device__ uint32_t load_q_scale(int logical_row, int scale_group) const {
+    int const buffer_idx = Base::BUFFERS_PER_TILE > 1 ? this->smem_read_buffer_ / Base::BYTES_PER_BUFFER : 0;
+    uint32_t const ptr = this->smem_ + Base::BYTES_PER_TILE +
+                         buffer_idx * BYTES_PER_SCALE_BUFFER +
+                         logical_row * SCALE_GROUPS_PER_ROW + scale_group;
+    uint32_t scale_reg;
+    fmha::lds(scale_reg, ptr);
+    return scale_reg;
+  }
+
+  inline __device__ uint8_t load_q_data_byte(int logical_row, int logical_col) const {
+    if constexpr (Cta_tile::VALID_K != Cta_tile::K) {
+      if (logical_col < 0 || logical_col >= Cta_tile::VALID_K) {
+        return 0u;
+      }
+    }
+    int const logical_byte_offset =
+        logical_row * Base::BYTES_PER_ROW_BEFORE_PACKING + logical_col / 2;
+    int const physical_row = logical_byte_offset / Base::BYTES_PER_ROW;
+    int const byte_in_row =
+        logical_byte_offset - physical_row * Base::BYTES_PER_ROW;
+    int const logical_chunk = byte_in_row / 16;
+    int const byte_in_chunk = byte_in_row - logical_chunk * 16;
+    int const physical_chunk =
+        logical_chunk ^
+        ((physical_row % Base::ROWS_PER_XOR_PATTERN) * Base::COLS_PER_XOR_PATTERN);
+    uint8_t byte;
+    fmha::lds(byte, this->smem_ + this->smem_read_buffer_ +
+                        physical_row * Base::BYTES_PER_ROW +
+                        physical_chunk * 16 + byte_in_chunk);
+    return byte;
+  }
+
+  inline __device__ uint32_t load_q_data_word4(int logical_row,
+                                               int logical_col) const {
+    if constexpr (Cta_tile::VALID_K != Cta_tile::K) {
+      if (logical_col < 0 || logical_col + 7 >= Cta_tile::VALID_K) {
+        uint32_t packed = 0u;
+#pragma unroll
+        for (int nib = 0; nib < 8; ++nib) {
+          uint8_t const byte = load_q_data_byte(logical_row, logical_col + nib);
+          uint32_t const code =
+              ((logical_col + nib) & 1) ? ((byte >> 4) & 0x0fu) : (byte & 0x0fu);
+          packed |= code << (4 * nib);
+        }
+        return packed;
+      }
+    }
+    int const logical_byte_offset =
+        logical_row * Base::BYTES_PER_ROW_BEFORE_PACKING + logical_col / 2;
+    int const physical_row = logical_byte_offset / Base::BYTES_PER_ROW;
+    int const byte_in_row =
+        logical_byte_offset - physical_row * Base::BYTES_PER_ROW;
+    int const logical_chunk = byte_in_row / 16;
+    int const byte_in_chunk = byte_in_row - logical_chunk * 16;
+    int const physical_chunk =
+        logical_chunk ^
+        ((physical_row % Base::ROWS_PER_XOR_PATTERN) * Base::COLS_PER_XOR_PATTERN);
+    uint32_t word;
+    fmha::lds(word, this->smem_ + this->smem_read_buffer_ +
+                        physical_row * Base::BYTES_PER_ROW +
+                        physical_chunk * 16 + byte_in_chunk);
+    return word;
+  }
+
+  inline __device__ void store_q_data_byte(int logical_row, int logical_col,
+                                           uint8_t byte) {
+    if (logical_row < 0 || logical_row >= Cta_tile::M || logical_col < 0 ||
+        logical_col >= Cta_tile::K) {
+      return;
+    }
+    int const logical_byte_offset =
+        logical_row * Base::BYTES_PER_ROW_BEFORE_PACKING + logical_col / 2;
+    int const physical_row = logical_byte_offset / Base::BYTES_PER_ROW;
+    int const byte_in_row =
+        logical_byte_offset - physical_row * Base::BYTES_PER_ROW;
+    int const logical_chunk = byte_in_row / 16;
+    int const byte_in_chunk = byte_in_row - logical_chunk * 16;
+    int const physical_chunk =
+        logical_chunk ^
+        ((physical_row % Base::ROWS_PER_XOR_PATTERN) * Base::COLS_PER_XOR_PATTERN);
+    fmha::sts(this->smem_ + this->smem_write_buffer_ +
+                  physical_row * Base::BYTES_PER_ROW +
+                  physical_chunk * 16 + byte_in_chunk,
+              byte);
+  }
+
+  inline __device__ uint32_t load_q_data_reg(int mi, int ki, int reg) const {
+    int const lane = threadIdx.x & 31;
+    int const logical_row =
+        nvfp4_data_row_offset_ + mi * Mma_tile::M_PER_MMA_PER_CTA +
+        (lane >> 2) + 8 * (reg & 1);
+    int const logical_col =
+        nvfp4_data_col_offset_ + ki * Mma_tile::K_PER_MMA_PER_CTA +
+        16 * (lane & 3) + 8 * (reg >> 1);
+    return load_q_data_word4(logical_row, logical_col);
+  }
+
+  inline __device__ void load(Fragment (&a)[Mma_tile::MMAS_M], int ki) {
+    if (ki < Mma_tile::VALID_MMAS_K) {
+#pragma unroll
+      for (int mi = 0; mi < Mma_tile::MMAS_M; ++mi) {
+        a[mi].reg(0) = load_q_data_reg(mi, ki, 0);
+        a[mi].reg(1) = load_q_data_reg(mi, ki, 1);
+        a[mi].reg(2) = load_q_data_reg(mi, ki, 2);
+        a[mi].reg(3) = load_q_data_reg(mi, ki, 3);
+        int const row =
+            mi * Mma_tile::M_PER_MMA_PER_CTA + nvfp4_scale_read_row_;
+        int const scale_group = nvfp4_scale_warp_k_group_offset_ +
+                                ki * (Mma_tile::K_PER_MMA / Traits::NVFP4_SCALE_VEC_SIZE);
+        a[mi].scale_reg = load_q_scale(row, scale_group);
+      }
+    }
+  }
+
+  int nvfp4_data_row_offset_;
+  int nvfp4_data_col_offset_;
+  int nvfp4_scale_read_row_;
+  int nvfp4_scale_warp_k_group_offset_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <
     // The instruction traits.
     typename Traits,
     // The dimensions of the tile computed by the CTA.
@@ -1814,6 +1987,364 @@ struct Smem_tile_b<Ada_qmma_e4m3_fp16_traits, Cta_tile, Col, BYTES_PER_STS, BUFF
 
   // Ctor.
   inline __device__ Smem_tile_b(void* smem, int tidx) : Base(smem, tidx) {}
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <
+    typename Cta_tile,
+    int BYTES_PER_STS,
+    int BUFFERS_PER_TILE>
+struct Smem_tile_b<Blackwell_mma_nvf4_fp32_traits, Cta_tile, Col, BYTES_PER_STS, BUFFERS_PER_TILE>
+    : public Smem_tile_ampere_col_b<Blackwell_mma_nvf4_fp32_traits, Cta_tile, BYTES_PER_STS,
+                                    BUFFERS_PER_TILE, 8> {
+  using Traits = Blackwell_mma_nvf4_fp32_traits;
+  using Base = Smem_tile_ampere_col_b<Traits, Cta_tile, BYTES_PER_STS, BUFFERS_PER_TILE, 8>;
+  using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
+  using Fragment = Fragment_b<Traits, Col>;
+
+  enum { SCALE_GROUPS_PER_TILE_ROW = Cta_tile::K / Traits::NVFP4_SCALE_VEC_SIZE };
+  enum { BYTES_PER_SCALE_ROW = SCALE_GROUPS_PER_TILE_ROW < 16 ? 16 : SCALE_GROUPS_PER_TILE_ROW };
+  enum { BYTES_PER_SCALE_BUFFER = Cta_tile::N * BYTES_PER_SCALE_ROW };
+  enum { BYTES_PER_SCALE_TILE = BYTES_PER_SCALE_BUFFER * BUFFERS_PER_TILE };
+  enum { BYTES_PER_TILE = Base::BYTES_PER_TILE + BYTES_PER_SCALE_TILE };
+
+  static_assert(Cta_tile::K % Traits::NVFP4_SCALE_VEC_SIZE == 0, "");
+
+  inline __device__ Smem_tile_b(void* smem, int tidx)
+      : Base(smem, tidx) {
+    int const WARPS_M = Cta_tile::WARPS_M;
+    int const WARPS_N = Cta_tile::WARPS_N;
+    int const WARPS_K = Cta_tile::WARPS_K;
+    int const WARP_MASK_N = Warp_masks<WARPS_M, WARPS_N, WARPS_K>::N;
+    int const WARP_MASK_K = Warp_masks<WARPS_M, WARPS_N, WARPS_K>::K;
+    int const WARP_DIV_N = WARPS_M * Cta_tile::THREADS_PER_WARP;
+    int const WARP_DIV_K = WARPS_M * WARPS_N * Cta_tile::THREADS_PER_WARP;
+    int const warp_n = (tidx & WARP_MASK_N) / WARP_DIV_N;
+    int const warp_k = (tidx & WARP_MASK_K) / WARP_DIV_K;
+
+    nvfp4_data_row_offset_ = warp_n * Mma_tile::N_PER_MMA;
+    nvfp4_data_col_offset_ = warp_k * Mma_tile::K_PER_MMA;
+    nvfp4_scale_read_row_ = warp_n * Mma_tile::N_PER_MMA + (tidx & 0x07);
+    nvfp4_scale_warp_k_group_offset_ =
+        warp_k * Mma_tile::K_PER_WARP / Traits::NVFP4_SCALE_VEC_SIZE;
+
+#pragma unroll
+    for (int buffer = 0; buffer < BUFFERS_PER_TILE; ++buffer) {
+      has_nvfp4_scale_metadata_[buffer] = false;
+      nvfp4_row_offset_[buffer] = 0;
+      nvfp4_col_group_offset_[buffer] = 0;
+      nvfp4_actual_seqlen_[buffer] = 0;
+    }
+  }
+
+  inline __device__ void set_nvfp4_scale_metadata(
+      char const* scale_ptr, int64_t scale_head_offset_in_bytes,
+      int64_t scale_page_stride_in_bytes, int64_t scale_token_stride_in_bytes,
+      int64_t scale_vec_stride_in_bytes, int32_t const* paged_kv_global_block_offsets,
+      int paged_kv_log2_block_size, int row_offset, int64_t col_tile_offset_in_bytes,
+      int actual_seqlen) {
+    int const buffer_idx =
+        Base::BUFFERS_PER_TILE > 1 ? this->smem_write_buffer_ / Base::BYTES_PER_BUFFER : 0;
+    has_nvfp4_scale_metadata_[buffer_idx] = true;
+    nvfp4_scale_ptr_ = scale_ptr;
+    nvfp4_scale_head_offset_in_bytes_ = scale_head_offset_in_bytes;
+    nvfp4_scale_page_stride_in_bytes_ = scale_page_stride_in_bytes;
+    nvfp4_scale_token_stride_in_bytes_ = scale_token_stride_in_bytes;
+    nvfp4_scale_vec_stride_in_bytes_ = scale_vec_stride_in_bytes;
+    nvfp4_paged_kv_global_block_offsets_ = paged_kv_global_block_offsets;
+    nvfp4_paged_kv_log2_block_size_ = paged_kv_log2_block_size;
+    nvfp4_row_offset_[buffer_idx] = row_offset;
+    nvfp4_col_group_offset_[buffer_idx] =
+        static_cast<int>((col_tile_offset_in_bytes * 8 / Traits::BITS_PER_ELEMENT_B) /
+                         Traits::NVFP4_SCALE_VEC_SIZE);
+    nvfp4_actual_seqlen_[buffer_idx] = actual_seqlen;
+  }
+
+  inline __device__ uint8_t load_nvfp4_scale_byte(int buffer_idx, int token_row,
+                                                  int scale_group) const {
+    if (!has_nvfp4_scale_metadata_[buffer_idx] ||
+        token_row >= nvfp4_actual_seqlen_[buffer_idx]) {
+      return fmha::float_to_e4m3_byte(1.f);
+    }
+    constexpr int SCALE_GROUPS_PER_ROW = Cta_tile::VALID_K / Traits::NVFP4_SCALE_VEC_SIZE;
+    if (scale_group < 0 || scale_group >= SCALE_GROUPS_PER_ROW) {
+      return fmha::float_to_e4m3_byte(1.f);
+    }
+    int const page_idx = token_row >> nvfp4_paged_kv_log2_block_size_;
+    int const row_in_page = token_row & ((1 << nvfp4_paged_kv_log2_block_size_) - 1);
+    int32_t const physical_page = nvfp4_paged_kv_global_block_offsets_[page_idx];
+    // Paged KV data uses an expanded block table: K is 2 * page, V is
+    // 2 * page + 1. K/V scale tensors are passed separately and are indexed
+    // by the original logical page.
+    int32_t const scale_page = physical_page / 2;
+    char const* scale_ptr =
+        nvfp4_scale_ptr_ + static_cast<int64_t>(scale_page) * nvfp4_scale_page_stride_in_bytes_ +
+        nvfp4_scale_head_offset_in_bytes_ +
+        static_cast<int64_t>(row_in_page) * nvfp4_scale_token_stride_in_bytes_ +
+        static_cast<int64_t>(scale_group) * nvfp4_scale_vec_stride_in_bytes_;
+    uint8_t scale_byte;
+    fmha::ldg(scale_byte, scale_ptr);
+    return scale_byte;
+  }
+
+  inline __device__ void store_k_scale(int logical_row, int local_scale_group,
+                                       uint8_t scale_byte) {
+    if (logical_row < 0 || logical_row >= Cta_tile::N || local_scale_group < 0 ||
+        local_scale_group >= SCALE_GROUPS_PER_TILE_ROW) {
+      return;
+    }
+    int const buffer_idx =
+        Base::BUFFERS_PER_TILE > 1 ? this->smem_write_buffer_ / Base::BYTES_PER_BUFFER : 0;
+    uint32_t const ptr = this->smem_ + Base::BYTES_PER_TILE +
+                         buffer_idx * BYTES_PER_SCALE_BUFFER +
+                         logical_row * BYTES_PER_SCALE_ROW + local_scale_group;
+    fmha::sts(ptr, scale_byte);
+  }
+
+  inline __device__ void store_k_scale_word(int logical_row, uint32_t scale_word) {
+    if (logical_row < 0 || logical_row >= Cta_tile::N || SCALE_GROUPS_PER_TILE_ROW != 4) {
+      return;
+    }
+    fmha::sts(k_scale_row_smem_ptr(logical_row), scale_word);
+  }
+
+  inline __device__ uint32_t k_scale_row_smem_ptr(int logical_row) const {
+    int const buffer_idx =
+        Base::BUFFERS_PER_TILE > 1 ? this->smem_write_buffer_ / Base::BYTES_PER_BUFFER : 0;
+    return this->smem_ + Base::BYTES_PER_TILE +
+           buffer_idx * BYTES_PER_SCALE_BUFFER +
+           logical_row * BYTES_PER_SCALE_ROW;
+  }
+
+  inline __device__ uint8_t load_k_scale_byte(int token_row, int scale_group) const {
+    int const buffer_idx =
+        Base::BUFFERS_PER_TILE > 1 ? this->smem_read_buffer_ / Base::BYTES_PER_BUFFER : 0;
+    int const logical_row = token_row - nvfp4_row_offset_[buffer_idx];
+    int const local_scale_group = scale_group - nvfp4_col_group_offset_[buffer_idx];
+    if (logical_row < 0 || logical_row >= Cta_tile::N || local_scale_group < 0 ||
+        local_scale_group >= SCALE_GROUPS_PER_TILE_ROW) {
+      return fmha::float_to_e4m3_byte(1.f);
+    }
+    uint32_t const ptr = this->smem_ + Base::BYTES_PER_TILE +
+                         buffer_idx * BYTES_PER_SCALE_BUFFER +
+                         logical_row * BYTES_PER_SCALE_ROW + local_scale_group;
+    uint8_t scale_byte;
+    fmha::lds(scale_byte, ptr);
+    return scale_byte;
+  }
+
+  inline __device__ uint32_t load_k_scale_word(int token_row, int scale_group) const {
+    uint8_t const one = fmha::float_to_e4m3_byte(1.f);
+    uint32_t const one_word = fmha::pack_e4m3_scale_reg(one, one, one, one);
+    int const buffer_idx =
+        Base::BUFFERS_PER_TILE > 1 ? this->smem_read_buffer_ / Base::BYTES_PER_BUFFER : 0;
+    int const logical_row = token_row - nvfp4_row_offset_[buffer_idx];
+    int const local_scale_group = scale_group - nvfp4_col_group_offset_[buffer_idx];
+    if (logical_row < 0 || logical_row >= Cta_tile::N || local_scale_group < 0 ||
+        local_scale_group + 3 >= SCALE_GROUPS_PER_TILE_ROW) {
+      return one_word;
+    }
+    uint32_t const ptr = this->smem_ + Base::BYTES_PER_TILE +
+                         buffer_idx * BYTES_PER_SCALE_BUFFER +
+                         logical_row * BYTES_PER_SCALE_ROW + local_scale_group;
+    uint32_t scale_word;
+    fmha::lds(scale_word, ptr);
+    return scale_word;
+  }
+
+  static inline __device__ uint32_t make_scale_reg_from_scale_word(uint32_t scale_word) {
+    uint8_t const g0 = static_cast<uint8_t>(scale_word & 0xffu);
+    uint8_t const g1 = static_cast<uint8_t>((scale_word >> 8) & 0xffu);
+    uint8_t const g2 = static_cast<uint8_t>((scale_word >> 16) & 0xffu);
+    uint8_t const g3 = static_cast<uint8_t>((scale_word >> 24) & 0xffu);
+    uint8_t const s01 = g0 > g1 ? g0 : g1;
+    uint8_t const s23 = g2 > g3 ? g2 : g3;
+    return fmha::pack_e4m3_scale_reg(s01, s23, s01, s23);
+  }
+
+  inline __device__ uint32_t load_nvfp4_scale_reg(int buffer_idx, int token_row_base,
+                                                  int scale_group_base, int atom) const {
+    int const lane = threadIdx.x & 31;
+    int const token_row = token_row_base + atom * 8 + (lane >> 2);
+    uint32_t const scale_word = load_k_scale_word(token_row, scale_group_base);
+    return make_scale_reg_from_scale_word(scale_word);
+  }
+
+  inline __device__ uint8_t load_k_data_byte(int logical_row, int logical_col) const {
+    if constexpr (Cta_tile::VALID_K != Cta_tile::K) {
+      if (logical_col < 0 || logical_col >= Cta_tile::VALID_K) {
+        return 0u;
+      }
+    }
+    int const logical_byte_offset =
+        logical_row * Base::BYTES_PER_ROW_BEFORE_PACKING + logical_col / 2;
+    int const physical_row = logical_byte_offset / Base::BYTES_PER_ROW;
+    int const byte_in_row =
+        logical_byte_offset - physical_row * Base::BYTES_PER_ROW;
+    int const logical_chunk = byte_in_row / 16;
+    int const byte_in_chunk = byte_in_row - logical_chunk * 16;
+    int const physical_chunk =
+        logical_chunk ^
+        ((physical_row % Base::ROWS_PER_XOR_PATTERN) * Base::COLS_PER_XOR_PATTERN);
+    uint8_t byte;
+    fmha::lds(byte, this->smem_ + this->smem_read_buffer_ +
+                        physical_row * Base::BYTES_PER_ROW +
+                        physical_chunk * 16 + byte_in_chunk);
+    return byte;
+  }
+
+  inline __device__ uint32_t load_k_data_word4(int logical_row,
+                                               int logical_col) const {
+    if constexpr (Cta_tile::VALID_K != Cta_tile::K) {
+      if (logical_col < 0 || logical_col + 7 >= Cta_tile::VALID_K) {
+        uint32_t packed = 0u;
+#pragma unroll
+        for (int nib = 0; nib < 8; ++nib) {
+          uint8_t const byte = load_k_data_byte(logical_row, logical_col + nib);
+          uint32_t const code =
+              ((logical_col + nib) & 1) ? ((byte >> 4) & 0x0fu) : (byte & 0x0fu);
+          packed |= code << (4 * nib);
+        }
+        return packed;
+      }
+    }
+    int const logical_byte_offset =
+        logical_row * Base::BYTES_PER_ROW_BEFORE_PACKING + logical_col / 2;
+    int const physical_row = logical_byte_offset / Base::BYTES_PER_ROW;
+    int const byte_in_row =
+        logical_byte_offset - physical_row * Base::BYTES_PER_ROW;
+    int const logical_chunk = byte_in_row / 16;
+    int const byte_in_chunk = byte_in_row - logical_chunk * 16;
+    int const physical_chunk =
+        logical_chunk ^
+        ((physical_row % Base::ROWS_PER_XOR_PATTERN) * Base::COLS_PER_XOR_PATTERN);
+    uint32_t word;
+    fmha::lds(word, this->smem_ + this->smem_read_buffer_ +
+                        physical_row * Base::BYTES_PER_ROW +
+                        physical_chunk * 16 + byte_in_chunk);
+    return word;
+  }
+
+  inline __device__ uint2 load_k_data_word8(int logical_row,
+                                            int logical_col) const {
+    if constexpr (Cta_tile::VALID_K != Cta_tile::K) {
+      if (logical_col < 0 || logical_col + 15 >= Cta_tile::VALID_K) {
+        return make_uint2(load_k_data_word4(logical_row, logical_col),
+                          load_k_data_word4(logical_row, logical_col + 8));
+      }
+    }
+    int const logical_byte_offset =
+        logical_row * Base::BYTES_PER_ROW_BEFORE_PACKING + logical_col / 2;
+    int const physical_row = logical_byte_offset / Base::BYTES_PER_ROW;
+    int const byte_in_row =
+        logical_byte_offset - physical_row * Base::BYTES_PER_ROW;
+    int const logical_chunk = byte_in_row / 16;
+    int const byte_in_chunk = byte_in_row - logical_chunk * 16;
+    if (byte_in_chunk > 8) {
+      return make_uint2(load_k_data_word4(logical_row, logical_col),
+                        load_k_data_word4(logical_row, logical_col + 8));
+    }
+    int const physical_chunk =
+        logical_chunk ^
+        ((physical_row % Base::ROWS_PER_XOR_PATTERN) * Base::COLS_PER_XOR_PATTERN);
+    uint2 word_pair;
+    fmha::lds(word_pair, this->smem_ + this->smem_read_buffer_ +
+                             physical_row * Base::BYTES_PER_ROW +
+                             physical_chunk * 16 + byte_in_chunk);
+    return word_pair;
+  }
+
+  inline __device__ void store_k_data_byte(int logical_row, int logical_col,
+                                           uint8_t byte) {
+    if (logical_row < 0 || logical_row >= Cta_tile::N || logical_col < 0 ||
+        logical_col >= Cta_tile::K) {
+      return;
+    }
+    int const logical_byte_offset =
+        logical_row * Base::BYTES_PER_ROW_BEFORE_PACKING + logical_col / 2;
+    int const physical_row = logical_byte_offset / Base::BYTES_PER_ROW;
+    int const byte_in_row =
+        logical_byte_offset - physical_row * Base::BYTES_PER_ROW;
+    int const logical_chunk = byte_in_row / 16;
+    int const byte_in_chunk = byte_in_row - logical_chunk * 16;
+    int const physical_chunk =
+        logical_chunk ^
+        ((physical_row % Base::ROWS_PER_XOR_PATTERN) * Base::COLS_PER_XOR_PATTERN);
+    fmha::sts(this->smem_ + this->smem_write_buffer_ +
+                  physical_row * Base::BYTES_PER_ROW +
+                  physical_chunk * 16 + byte_in_chunk,
+              byte);
+  }
+
+  inline __device__ uint32_t load_k_data_reg(int ni, int ki, int reg) const {
+    int const lane = threadIdx.x & 31;
+    int const logical_row =
+        nvfp4_data_row_offset_ + ni * Mma_tile::N_PER_MMA_PER_CTA +
+        (lane >> 2) + 8 * (reg >> 1);
+    int const logical_col =
+        nvfp4_data_col_offset_ + ki * Mma_tile::K_PER_MMA_PER_CTA +
+        16 * (lane & 3) + 8 * (reg & 1);
+    return load_k_data_word4(logical_row, logical_col);
+  }
+
+  inline __device__ void store_v_scale(int, int, uint8_t) {}
+
+  inline __device__ void load(Fragment (&b)[Mma_tile::MMAS_N], int ki) {
+    if (ki < Mma_tile::VALID_MMAS_K) {
+      int const buffer_idx =
+          Base::BUFFERS_PER_TILE > 1 ? this->smem_read_buffer_ / Base::BYTES_PER_BUFFER : 0;
+#pragma unroll
+      for (int ni = 0; ni < Mma_tile::MMAS_N; ++ni) {
+        if (ni < Mma_tile::VALID_MMAS_N) {
+          int const lane = threadIdx.x & 31;
+          int const row_base =
+              nvfp4_data_row_offset_ + ni * Mma_tile::N_PER_MMA_PER_CTA +
+              (lane >> 2);
+          int const col_base =
+              nvfp4_data_col_offset_ + ki * Mma_tile::K_PER_MMA_PER_CTA +
+              16 * (lane & 3);
+          uint2 const row0 = load_k_data_word8(row_base, col_base);
+          uint2 const row1 = load_k_data_word8(row_base + 8, col_base);
+          b[ni].reg(0) = row0.x;
+          b[ni].reg(1) = row0.y;
+          b[ni].reg(2) = row1.x;
+          b[ni].reg(3) = row1.y;
+          int const token_row_base = nvfp4_row_offset_[buffer_idx] +
+                                     nvfp4_data_row_offset_ +
+                                     ni * Mma_tile::N_PER_MMA_PER_CTA;
+          int const scale_group_base =
+              nvfp4_col_group_offset_[buffer_idx] + nvfp4_scale_warp_k_group_offset_ +
+              ki * (Mma_tile::K_PER_MMA / Traits::NVFP4_SCALE_VEC_SIZE);
+#if defined(FLASHINFER_FMHA_V2_PROFILE_SKIP_K_SCALE_LOAD)
+          b[ni].scale_reg[0] = fmha::make_ue4m3_scale_reg(1.f, 1.f, 1.f, 1.f);
+          b[ni].scale_reg[1] = fmha::make_ue4m3_scale_reg(1.f, 1.f, 1.f, 1.f);
+#else
+          b[ni].scale_reg[0] = load_nvfp4_scale_reg(buffer_idx, token_row_base,
+                                                    scale_group_base, 0);
+          b[ni].scale_reg[1] = load_nvfp4_scale_reg(buffer_idx, token_row_base,
+                                                    scale_group_base, 1);
+#endif
+        }
+      }
+    }
+  }
+
+  int nvfp4_data_row_offset_;
+  int nvfp4_data_col_offset_;
+  bool has_nvfp4_scale_metadata_[BUFFERS_PER_TILE];
+  char const* nvfp4_scale_ptr_;
+  int64_t nvfp4_scale_head_offset_in_bytes_;
+  int64_t nvfp4_scale_page_stride_in_bytes_;
+  int64_t nvfp4_scale_token_stride_in_bytes_;
+  int64_t nvfp4_scale_vec_stride_in_bytes_;
+  int32_t const* nvfp4_paged_kv_global_block_offsets_;
+  int nvfp4_paged_kv_log2_block_size_;
+  int nvfp4_row_offset_[BUFFERS_PER_TILE];
+  int nvfp4_col_group_offset_[BUFFERS_PER_TILE];
+  int nvfp4_actual_seqlen_[BUFFERS_PER_TILE];
+  int nvfp4_scale_read_row_;
+  int nvfp4_scale_warp_k_group_offset_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

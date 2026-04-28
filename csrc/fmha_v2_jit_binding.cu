@@ -33,6 +33,9 @@ void fmha_v2_run(ffi::TensorView q, ffi::TensorView k, ffi::TensorView v, ffi::T
                  float scale_softmax, float scale_bmm1, float scale_bmm2, int window_left,
                  int chunked_attention_size, bool has_alibi, float softcapping_scale,
                  float skip_softmax_threshold_scale_factor, ffi::TensorView scale_bmm2_d,
+                 Optional<ffi::TensorView> k_scale, Optional<ffi::TensorView> v_scale,
+                 bool nvfp4_v_cache_uses_pv_layout,
+                 int kv_split_size, int num_kv_splits,
                  Optional<ffi::TensorView> softmax_stats, Optional<ffi::TensorView> sinks);
 
 // FMHAv2 attention operator

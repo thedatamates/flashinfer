@@ -1231,17 +1231,19 @@ def nvfp4_quantize_paged_kv_cache(
     kv_layout: str = "HND",
     k_global_sf: Optional[torch.Tensor] = None,
     v_global_sf: Optional[torch.Tensor] = None,
+    v_scale_layout: str = "trtllm_interleaved",
 ) -> Tuple[
     Tuple[torch.Tensor, torch.Tensor],
     Tuple[torch.Tensor, torch.Tensor],
     float,
     float,
 ]:
-    """Quantize paged KV cache to NVFP4 format for trtllm-gen MHA.
+    """Quantize paged KV cache to NVFP4 format.
 
     Quantizes BF16/FP16 K/V caches to NVFP4 with two-level scaling
-    (global FP32 + per-block FP8), and swizzles scale factors
-    for the SM100 trtllm-gen MHA kernel layout.
+    (global FP32 + per-block FP8). K scale factors are row-major. V scale
+    factors default to the TRT-LLM 4-token interleaved layout used by
+    trtllm-gen, but FA2 can use row-major V scales via ``v_scale_layout="linear"``.
 
     Args:
         k_cache: Key cache tensor.
@@ -1253,14 +1255,15 @@ def nvfp4_quantize_paged_kv_cache(
             If None, auto-computed as ``FLOAT8_E4M3_MAX / k_amax``.
         v_global_sf: Optional global scale factor for V (float32 scalar tensor).
             If None, auto-computed as ``FLOAT8_E4M3_MAX / v_amax``.
+        v_scale_layout: Physical V scale layout. ``"trtllm_interleaved"`` keeps the
+            historical default; ``"linear"`` leaves V scales in row-major layout.
 
     Returns:
         kv_cache_fp4: Tuple of (k_fp4, v_fp4) in the same layout as input,
             with head_dim replaced by head_dim//2, dtype=uint8.
         kv_cache_sf: Tuple of (k_scales, v_scales). `k_scales` keeps the linear
-            input layout, while `v_scales` uses TRT-LLM's 4-token interleaved
-            layout. Both tensors replace `head_dim` with `head_dim//16` and use
-            dtype=float8_e4m3fn.
+            input layout. `v_scales` uses the selected ``v_scale_layout``. Both
+            tensors replace `head_dim` with `head_dim//16` and use dtype=float8_e4m3fn.
         k_global_scale: Global scale for K (float), equal to ``1 / k_global_sf``.
         v_global_scale: Global scale for V (float), equal to ``1 / v_global_sf``.
     """
@@ -1323,44 +1326,47 @@ def nvfp4_quantize_paged_kv_cache(
     k_sf_fp8 = k_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
     v_sf_fp8 = v_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
 
-    # Apply V scale factor swizzling for SM100 trtllm-gen MHA kernel.
-    # The swizzle interleaves the token dimension by groups of 4 within each
-    # [page_size, head_dim//16] tile per page/head:
-    #   output[..., (t//4)*4*S + s*4 + t%4] = input[..., t*S + s]
-    # This matches TRT-LLM's quantizeAndWriteFP4KVCache() V swizzle pattern.
-    # K scale factors do NOT need swizzling — the kernel reads them with real strides.
-    if page_size % 4 != 0 or head_dim % 64 != 0:
-        raise ValueError(
-            "V-scale swizzling requires page_size % 4 == 0 and head_dim % 64 == 0, "
-            f"got page_size={page_size}, head_dim={head_dim}."
-        )
-    if kv_layout == "NHD":
-        swizzle_shape = (
-            num_pages,
-            page_size // 4,
-            4,
-            num_kv_heads,
-            4,
-            scale_dim // 4,
-        )
-        swizzle_perm = (0, 1, 4, 3, 5, 2)
-    else:
-        swizzle_shape = (
-            num_pages,
-            num_kv_heads,
-            page_size // 4,
-            4,
-            4,
-            scale_dim // 4,
-        )
-        swizzle_perm = (0, 1, 2, 4, 5, 3)
+    if v_scale_layout not in ("trtllm_interleaved", "linear"):
+        raise ValueError("v_scale_layout must be 'trtllm_interleaved' or 'linear'.")
+    if v_scale_layout == "trtllm_interleaved":
+        # Apply V scale factor swizzling for SM100 trtllm-gen MHA kernel.
+        # The swizzle interleaves the token dimension by groups of 4 within each
+        # [page_size, head_dim//16] tile per page/head:
+        #   output[..., (t//4)*4*S + s*4 + t%4] = input[..., t*S + s]
+        # This matches TRT-LLM's quantizeAndWriteFP4KVCache() V swizzle pattern.
+        # K scale factors do NOT need swizzling — the kernel reads them with real strides.
+        if page_size % 4 != 0 or head_dim % 64 != 0:
+            raise ValueError(
+                "V-scale swizzling requires page_size % 4 == 0 and head_dim % 64 == 0, "
+                f"got page_size={page_size}, head_dim={head_dim}."
+            )
+        if kv_layout == "NHD":
+            swizzle_shape = (
+                num_pages,
+                page_size // 4,
+                4,
+                num_kv_heads,
+                4,
+                scale_dim // 4,
+            )
+            swizzle_perm = (0, 1, 4, 3, 5, 2)
+        else:
+            swizzle_shape = (
+                num_pages,
+                num_kv_heads,
+                page_size // 4,
+                4,
+                4,
+                scale_dim // 4,
+            )
+            swizzle_perm = (0, 1, 2, 4, 5, 3)
 
-    v_sf_fp8 = (
-        v_sf_fp8.reshape(swizzle_shape)
-        .permute(swizzle_perm)
-        .reshape(out_shape_sf)
-        .contiguous()
-    )
+        v_sf_fp8 = (
+            v_sf_fp8.reshape(swizzle_shape)
+            .permute(swizzle_perm)
+            .reshape(out_shape_sf)
+            .contiguous()
+        )
 
     kv_cache_sf = (k_sf_fp8, v_sf_fp8)
 
@@ -1465,7 +1471,59 @@ def get_fp4_kv_quantization_module():
     return SimpleNamespace(nvfp4_kv_quant=nvfp4_kv_quant)
 
 
+@functools.cache
+def get_fp4_softmax_quantization_module():
+    from ..jit.fp4_softmax_quantization import gen_fp4_softmax_quantization_module
+
+    module = gen_fp4_softmax_quantization_module().build_and_load()
+
+    @register_custom_op(
+        "flashinfer::nvfp4_softmax_quant",
+        mutates_args=("fp4_output", "block_scales"),
+    )
+    def nvfp4_softmax_quant(
+        logits: torch.Tensor,
+        global_scale: torch.Tensor,
+        fp4_output: torch.Tensor,
+        block_scales: torch.Tensor,
+        num_threads: int,
+    ) -> None:
+        module.nvfp4_softmax_quant(
+            logits, global_scale, fp4_output, block_scales, num_threads
+        )
+
+    @register_fake_op("flashinfer::nvfp4_softmax_quant")
+    def _fake_nvfp4_softmax_quant(
+        logits: torch.Tensor,
+        global_scale: torch.Tensor,
+        fp4_output: torch.Tensor,
+        block_scales: torch.Tensor,
+        num_threads: int,
+    ) -> None:
+        pass
+
+    return SimpleNamespace(nvfp4_softmax_quant=nvfp4_softmax_quant)
+
+
 _NVFP4_BLOCK_SIZE = 16
+
+
+def _select_nvfp4_softmax_quant_threads(m: int, n: int) -> int:
+    """Select a row-block size for fused softmax + NVFP4 quantization.
+
+    The Blackwell kernel is sensitive to both row count and row width. A single
+    launch shape regresses either small-M or long-row cases, so the default is
+    an empirical dispatch table from SM120 measurements.
+    """
+    if n >= 32768:
+        if m <= 128:
+            return 512
+        if m <= 1024:
+            return 128
+        return 256
+    if n >= 16384 and 256 <= m <= 512:
+        return 128
+    return 256
 
 
 @supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
@@ -1542,5 +1600,60 @@ def nvfp4_kv_quantize(
     )
     get_fp4_kv_quantization_module().nvfp4_kv_quant(
         input, global_scale, fp4_output, block_scales
+    )
+    return fp4_output, block_scales
+
+
+@supported_compute_capability([100, 103, 110, 120, 121])
+def _nvfp4_softmax_quant_check(logits, global_scale, num_threads=0):
+    return True
+
+
+@backend_requirement({}, common_check=_nvfp4_softmax_quant_check)
+@flashinfer_api
+def nvfp4_softmax_quantize(
+    logits: torch.Tensor,
+    global_scale: torch.Tensor,
+    num_threads: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused row-wise softmax and NVFP4 quantization.
+
+    The returned scale tensor uses the 128x4 swizzled E4M3 scale layout used by
+    :func:`fp4_quantize` for CUTLASS FP4 GEMM. This is intended for native FP4
+    attention prototypes where the softmax probability matrix is immediately
+    consumed by a block-scaled FP4 GEMM.
+
+    Args:
+        logits (torch.Tensor): Input logits of shape ``[M, N]`` with dtype bf16 or fp16.
+            N must be divisible by 16.
+        global_scale (torch.Tensor): Global NVFP4 scale of shape ``[1]`` with dtype float32.
+        num_threads (int): CUDA threads per row block. Use 0 for shape-dependent
+            dispatch, or explicitly pass 128, 256, or 512.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - fp4_output: Packed FP4 probabilities of shape ``[M, N / 2]``.
+            - block_scales: 128x4 swizzled E4M3 scales of shape
+              ``[round_up(M, 128), round_up(N / 16, 4)]``.
+    """
+    if logits.ndim != 2:
+        raise ValueError("logits must be 2D")
+    M, N = logits.shape
+    if N % _NVFP4_BLOCK_SIZE != 0:
+        raise ValueError(f"N dimension ({N}) must be divisible by {_NVFP4_BLOCK_SIZE}")
+    if global_scale.shape != (1,):
+        raise ValueError("global_scale must have shape [1]")
+    if num_threads == 0:
+        num_threads = _select_nvfp4_softmax_quant_threads(M, N)
+    elif num_threads not in (128, 256, 512):
+        raise ValueError("num_threads must be 0, 128, 256, or 512")
+    fp4_output = torch.empty((M, N // 2), dtype=torch.uint8, device=logits.device)
+    block_scales = torch.empty(
+        (round_up(M, 128), round_up(N // _NVFP4_BLOCK_SIZE, 4)),
+        dtype=torch.uint8,
+        device=logits.device,
+    )
+    get_fp4_softmax_quantization_module().nvfp4_softmax_quant(
+        logits, global_scale, fp4_output, block_scales, num_threads
     )
     return fp4_output, block_scales

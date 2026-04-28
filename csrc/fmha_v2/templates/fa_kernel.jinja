@@ -127,7 +127,7 @@ void {{ launcher_name }}(
 
 {% endif %} // has_noloop && !cross_mha
 
-{% if not use_multi_cta and has_noloop and not cross_mha %} // !use_multi_cta && has_noloop && !cross_mha
+{% if not use_multi_cta and has_noloop and not cross_mha and not reload_q %} // !use_multi_cta && has_noloop && !cross_mha && !reload_q
 
 using Kernel_traits_nl = fmha::{{ kernel_traits }}<
     fmha::{{ instruction_traits }},
@@ -204,7 +204,7 @@ void {{ launcher_name }}_nl(
   }
 }
 
-{% endif %} // !use_multi_cta && has_noloop && !cross_mha
+{% endif %} // !use_multi_cta && has_noloop && !cross_mha && !reload_q
 
 {% if not use_multi_cta and tiled and not cross_mha %} // !use_multi_cta && tiled && !cross_mha
 {% if reload_q %} // reload_q
@@ -282,9 +282,17 @@ void {{ launcher_name }}_nl_tiled(
     cudaStream_t stream){
 
   // Runtime loop_iters: flash attention supports variable sequence lengths.
-  int loop_iters = ( params.s + {{ noloop_step }} - 1 )  / {{ noloop_step }};
-  dim3 grid(loop_iters, params.h, params.b); // better locality
 {% if reload_q %}
+  int const q_rows = Kernel_traits_nl_tiled::GROUP_Q_HEADS_IN_M
+                         ? params.s * params.num_grouped_heads
+                         : params.s;
+  int loop_iters = ( q_rows + {{ noloop_step }} - 1 )  / {{ noloop_step }};
+  int const grid_heads = Kernel_traits_nl_tiled::GROUP_Q_HEADS_IN_M ? params.h_kv : params.h;
+  constexpr int ctas_per_o_row =
+      (Kernel_traits_nl_tiled::VALID_DV + Kernel_traits_nl_tiled::Cta_tile_o::N - 1) /
+      Kernel_traits_nl_tiled::Cta_tile_o::N;
+  int const num_kv_splits = params.num_kv_splits > 0 ? params.num_kv_splits : 1;
+  dim3 grid(loop_iters * ctas_per_o_row, grid_heads, params.b * num_kv_splits);
   if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {
     constexpr int smem_size = Kernel_traits_nl_tiled_causal::BYTES_PER_SMEM;
     if( smem_size >= 48*1024 ) {
@@ -303,6 +311,8 @@ void {{ launcher_name }}_nl_tiled(
     {{ kernel_name }}_nl_tiled<<<grid, Kernel_traits_nl_tiled::THREADS, Kernel_traits_nl_tiled::BYTES_PER_SMEM, stream>>>(params);
   }
 {% else %}
+  int loop_iters = ( params.s + {{ noloop_step }} - 1 )  / {{ noloop_step }};
+  dim3 grid(loop_iters, params.h, params.b); // better locality
   if( launch_params.attention_mask_type == Attention_mask_type::CAUSAL ) {
     constexpr int smem_size = Kernel_traits_nl_causal::BYTES_PER_SMEM;
     if( smem_size >= 48*1024 ) {

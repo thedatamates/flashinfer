@@ -173,8 +173,13 @@ enum Data_type {
   DATA_TYPE_INT8 = 3,
   DATA_TYPE_BF16 = 4,
   DATA_TYPE_E4M3 = 5,
-  DATA_TYPE_E5M2 = 6
+  DATA_TYPE_E5M2 = 6,
+  DATA_TYPE_E2M1 = 7
 };
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static inline bool is_sub_byte(Data_type dtype) { return dtype == DATA_TYPE_E2M1; }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -194,6 +199,8 @@ static inline size_t get_size_in_bytes(size_t n, Data_type dtype) {
       return n;
     case DATA_TYPE_E5M2:
       return n;
+    case DATA_TYPE_E2M1:
+      return (n + 1) / 2;
     default:
       assert(false);
       return 0;

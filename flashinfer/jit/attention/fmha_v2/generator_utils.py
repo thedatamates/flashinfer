@@ -27,7 +27,16 @@ sm2name = {
     89: "ada",
     90: "hopper",
     120: "blackwell",
+    121: "blackwell",
 }
+
+SM12X_SMS = (120, 121)
+
+
+def sm_dispatch_check(kspec) -> str:
+    if kspec.sm == SM12X_SMS[0]:
+        return "(sm == 120 || sm == 121)"
+    return f"sm == {kspec.sm}"
 
 dtype2traits = {
     "int8": "imma_int8_int32_traits",
@@ -155,6 +164,8 @@ kernel_spec = namedtuple(
         "sage_block_sizes",
         "output_dtype",
         "is_mtp",
+        "group_q_heads_in_m",
+        "split_o_tile_n",
         "enable_skip_softmax",
     ],
     defaults=(
@@ -181,6 +192,8 @@ kernel_spec = namedtuple(
         None,  # sage_block_sizes
         None,  # output_dtype, same as dtype by default.
         False,  # is_mtp
+        False,  # group GQA query heads in the CTA M dimension
+        False,  # use a narrower output-N tile
         False,  # enable_skip_softmax
     ),
 )
@@ -1885,6 +1898,16 @@ def encode_name(kernel_spec: kernel_spec) -> tuple[str, str, str]:
         feature_tags += f"_sage_{'_'.join(map(str, kernel_spec.sage_block_sizes))}"
     if kernel_spec.output_dtype:
         feature_tags += f"_output_{kernel_spec.output_dtype}"
+    if kernel_spec.group_q_heads_in_m:
+        feature_tags += "_gqa_m"
+    if (
+        getattr(kernel_spec, "group_q_heads_in_m", False)
+        and getattr(kernel_spec, "kv_dtype", kernel_spec.dtype) == "e2m1"
+        and kernel_spec.head_size == 512
+    ):
+        feature_tags += f"_w{kernel_spec.warps_m}x{kernel_spec.warps_n}"
+    if getattr(kernel_spec, "split_o_tile_n", False):
+        feature_tags += "_o128"
     if kernel_spec.ctas_per_head > 1:
         fmt = (
             "fmha_v{version}{il_tag}_{dtype}_"
@@ -2165,6 +2188,10 @@ def get_kernel_code(kspec: kernel_spec, kname: str, lname: str) -> str | None:
         flags |= 4096
     if kspec.is_mtp:
         flags |= 8192
+    if kspec.group_q_heads_in_m:
+        flags |= 16384
+    if kspec.split_o_tile_n:
+        flags |= 32768
 
     # only generate certain needed combinations of input_layout and mask types for trt-llm.
     padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask = (
@@ -2411,6 +2438,7 @@ def get_api_code(specs_names: list[tuple[kernel_spec, str, str, str]]) -> str:
         effective_sm, _ = get_effective_sm_and_name(kspec)
         data_type = dtype2typename[kspec.dtype]
         output_data_type = data_type
+        sm_check = sm_dispatch_check(kspec)
         if kspec.output_dtype:
             output_data_type = dtype2typename[kspec.output_dtype]
         il_check = ""
@@ -2488,7 +2516,7 @@ def get_api_code(specs_names: list[tuple[kernel_spec, str, str, str]]) -> str:
         ## NOTE: need to tune here
         if kspec.has_noloop and not kspec.flash_attention:
             call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && sm == {sm}
+if( data_type == {data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && {sm_check}
     {il_check}) {{
 
     {unroll_check} {{
@@ -2504,6 +2532,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
                 slen=slen,
                 lname=lname,
                 il_check=il_check,
+                sm_check=sm_check,
                 unroll_check=gen_unroll_check(kspec),
             )
 
@@ -2512,7 +2541,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
             dv = kspec.head_size_v or kspec.head_size
             if kspec.tiled:  # higher precedence; does not require bh_upper_thres
                 call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
+if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && {sm_check}
     {il_check} && use_tiled) {{
 
     {lname}_nl_tiled(params, launch_params, stream);
@@ -2525,11 +2554,12 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
                     lname=lname,
                     il_check=il_check,
                     dv=dv,
+                    sm_check=sm_check,
                 )
             # warp specialization kernels need launch_params
             elif kspec.warp_specialization:
                 call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
+if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && {sm_check}
     {il_check}) {{
 
     {lname}(params, launch_params, stream);
@@ -2542,10 +2572,11 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
                     lname=lname,
                     il_check=il_check,
                     dv=dv,
+                    sm_check=sm_check,
                 )
             else:
                 call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && sm == {sm}
+if( data_type == {data_type} && output_data_type == {output_data_type} && d == {head_size} && dv == {dv} && {sm_check}
     && !use_tiled {il_check}) {{
 
     {lname}_nl(params, launch_params, stream);
@@ -2558,10 +2589,11 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && d == {
                     lname=lname,
                     il_check=il_check,
                     dv=dv,
+                    sm_check=sm_check,
                 )
         else:
             call_stmt = """\
-if( data_type == {data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && sm == {sm}
+if( data_type == {data_type} && output_data_type == {output_data_type} && s == {slen} && d == {head_size} && {sm_check}
     {il_check}) {{
 
     {lname}(params, launch_params, stream);
@@ -2573,12 +2605,14 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
                 slen=slen,
                 lname=lname,
                 il_check=il_check,
+                sm_check=sm_check,
             )
         return call_stmt
 
     def gen_call_fmhca(kspec: kernel_spec, lname: str) -> str:
         effective_sm, _ = get_effective_sm_and_name(kspec)
         data_type = dtype2typename[kspec.dtype]
+        sm_check = sm_dispatch_check(kspec)
         il_check = ""
         if kspec.version == 2:
             il_check = "&& interleaved " if kspec.interleaved else "&& !interleaved "
@@ -2593,7 +2627,7 @@ if( data_type == {data_type} && output_data_type == {output_data_type} && s == {
         s_kv_len = kspec.seq_len
         if kspec.has_noloop:
             call_stmt = """\
-if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == {sm} {il_check}) {{
+if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && {sm_check} {il_check}) {{
 
     {unroll_check} {{
         {lname}(params, stream);
@@ -2607,12 +2641,13 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
                 s_kv_len=s_kv_len,
                 lname=lname,
                 il_check=il_check,
+                sm_check=sm_check,
                 unroll_check=gen_unroll_check(kspec),
             )
 
         else:
             call_stmt = """\
-if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == {sm} {il_check}) {{
+if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && {sm_check} {il_check}) {{
         {lname}(params, stream);
     }} """.format(
                 **kspec._asdict(),
@@ -2620,6 +2655,7 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
                 s_kv_len=s_kv_len,
                 lname=lname,
                 il_check=il_check,
+                sm_check=sm_check,
             )
         return call_stmt
 
@@ -2649,6 +2685,7 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
 
     def gen_warp_spec(kspec: kernel_spec) -> str:
         data_type = dtype2typename[kspec.dtype]
+        sm_check = sm_dispatch_check(kspec)
         if kspec.sage_block_sizes is not None:
             assert kspec.output_dtype is not None
             # override the data_type to output type, otherwise it is always E4M3
@@ -2679,7 +2716,7 @@ if( data_type == {data_type} && s_kv == {s_kv_len} && d == {head_size} && sm == 
 
         if kspec.flash_attention:  # NOTE support any sequence
             return """\
-if( data_type == {data_type} && d == {head_size} && sm == {sm} {warp_spec_check}
+if( data_type == {data_type} && d == {head_size} && {sm_check} {warp_spec_check}
     && version == {version} ) {{
     warps_m = {warps_m};
     warps_n = {warps_n};
@@ -2687,7 +2724,7 @@ if( data_type == {data_type} && d == {head_size} && sm == {sm} {warp_spec_check}
                 **locals(), **kspec._asdict(), unroll_check=gen_unroll_check(kspec)
             )
         return """\
-if( data_type == {data_type} && s == {slen} && d == {head_size} && sm == {sm} {warp_spec_check}
+if( data_type == {data_type} && s == {slen} && d == {head_size} && {sm_check} {warp_spec_check}
     && version == {version} ) {{
     {unroll_check} {{
       warps_m = {warps_m};
@@ -2948,6 +2985,10 @@ def get_kernel_traits_code(specs_names: list[tuple[kernel_spec, str, str, str]])
             flags |= 4096
         if kspec.is_mtp:
             flags |= 8192
+        if kspec.group_q_heads_in_m:
+            flags |= 16384
+        if kspec.split_o_tile_n:
+            flags |= 32768
 
         kernel_flags = "0x{:02x}u".format(flags)
 
@@ -6950,7 +6991,7 @@ def enumerate_kernels() -> None:
     # yapf: disable
     specs_names = [(kspec, *encode_name(kspec)) for kspec in specs_expanded
                   # Volta is deprecated in TRT-LLM.
-                  if  (kspec.sm            in [80, 86, 89, 90, 120]
+                  if  (kspec.sm            in [80, 86, 89, 90, 120, 121]
                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']
                   and kspec.head_size     <= 256
                   and kspec.head_size_v   == 0
@@ -6977,7 +7018,7 @@ def enumerate_kernels() -> None:
                   and kspec.flash_attention
                   and kspec.input_layout != InputLayout.SEPARATE_Q_K_V)
                   # Deepseek MLA (generation 576/512 paged)
-                  or (kspec.sm            in [90, 100, 120]
+                  or (kspec.sm            in [90, 100, 120, 121]
                   and kspec.dtype         in ['bf16', 'e4m3_fp32']
                   and kspec.head_size     == 576
                   and kspec.head_size_v   == 512
@@ -6989,7 +7030,7 @@ def enumerate_kernels() -> None:
                   and not kspec.warp_specialization
                   and kspec.tiled)
                   # Deepseek MLA (context 192/128 separate-q-k-v)
-                  or (kspec.sm            in [90, 100, 120]
+                  or (kspec.sm            in [90, 100, 120, 121]
                   and kspec.dtype         in ['bf16', 'e4m3', 'e4m3_fp32']
                   and kspec.head_size     == 192
                   and kspec.head_size_v   == 128

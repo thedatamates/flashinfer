@@ -1105,6 +1105,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
+                args.append(0)  # cta_tile_q_override
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -2962,6 +2963,7 @@ def fast_decode_plan(
                     args.append(fixed_split_size)
                     args.append(disable_split_kv)
                     args.append(0)  # num_colocated_ctas
+                    args.append(0)  # cta_tile_q_override
                 self._plan_info = self._cached_module.plan(
                     *args,
                 )

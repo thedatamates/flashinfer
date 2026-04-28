@@ -79,6 +79,12 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
   uint64_t kv_stride_page = kCacheVLLM.stride(0);
   uint64_t kv_stride_token = kCacheVLLM.stride(-3);
   uint64_t kv_stride_head = kCacheVLLM.stride(-2);
+  uint64_t k_sf_stride_page = kv_stride_page;
+  uint64_t k_sf_stride_token = kv_stride_token;
+  uint64_t k_sf_stride_head = kv_stride_head;
+  uint64_t v_sf_stride_page = kv_stride_page;
+  uint64_t v_sf_stride_token = kv_stride_token;
+  uint64_t v_sf_stride_head = kv_stride_head;
 
 #if SPEC_DEC
   MaskType const* maskPtr =
@@ -87,6 +93,16 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
 
   void* kSfCachePtr = kSfCacheVLLM.has_value() ? kSfCacheVLLM.value().data_ptr() : nullptr;
   void* vSfCachePtr = vSfCacheVLLM.has_value() ? vSfCacheVLLM.value().data_ptr() : nullptr;
+  if (kSfCacheVLLM.has_value()) {
+    k_sf_stride_page = kSfCacheVLLM.value().stride(0);
+    k_sf_stride_token = kSfCacheVLLM.value().stride(-3);
+    k_sf_stride_head = kSfCacheVLLM.value().stride(-2);
+  }
+  if (vSfCacheVLLM.has_value()) {
+    v_sf_stride_page = vSfCacheVLLM.value().stride(0);
+    v_sf_stride_token = vSfCacheVLLM.value().stride(-3);
+    v_sf_stride_head = vSfCacheVLLM.value().stride(-2);
+  }
 
   mha_func(multiProcessorCount, nbKHeads, slidingWinSize, qScale, qScalePtr,
            reinterpret_cast<OutputHead*>(output.data_ptr()),
@@ -107,7 +123,8 @@ void xqa_wrapper(bool run_sm90_fp8_mha, int64_t multiProcessorCount, int64_t nbK
            qSeqLen, nullptr, maskPtr,
 #endif
            reinterpret_cast<uint32_t*>(semaphores.data_ptr()),
-           reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page, kv_stride_token,
-           kv_stride_head, stream);
+           reinterpret_cast<void*>(scratch.data_ptr()), enable_pdl, kv_stride_page,
+           kv_stride_token, kv_stride_head, k_sf_stride_page, k_sf_stride_token, k_sf_stride_head,
+           v_sf_stride_page, v_sf_stride_token, v_sf_stride_head, stream);
 }
 #endif

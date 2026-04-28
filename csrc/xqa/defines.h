@@ -23,7 +23,8 @@
 #define NB_K_HEADS 2
 #endif
 
-// allowed values are multiples of 16 in range [16, 256]
+// allowed values are multiples of 16 in range [16, 256].
+// NVFP4 KV cache additionally supports 512 for Gemma4 global-attention layers.
 #ifndef HEAD_ELEMS
 #define HEAD_ELEMS 128
 #endif

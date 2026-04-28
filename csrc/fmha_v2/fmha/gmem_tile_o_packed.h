@@ -979,7 +979,8 @@ struct Gmem_tile_o_16bit {
   // This stores the fp32 accumulators of Ada_qmma_e4m3_fp32_traits as 16bit values to
   // the global memory.
 
-  static_assert(std::is_same<Traits, fmha::Ada_qmma_e4m3_fp32_traits>::value);
+  static_assert(std::is_same<Traits, fmha::Ada_qmma_e4m3_fp32_traits>::value ||
+                std::is_same<Traits, fmha::Blackwell_mma_nvf4_fp32_traits>::value);
   static_assert(std::is_same<Output_type, uint16_t>::value ||
                 std::is_same<Output_type, nv_bfloat16>::value);
 
