@@ -5822,3 +5822,205 @@ QK-accumulator-to-P staging inside the MMA/softmax pipeline, or a smaller
 subtile score/P staging scheme that actually permits overlap without requiring
 an impossible second 128x128 BF16 logits buffer.
 ```
+
+### Course Correction: Port Structure, Do Not Re-Derive It
+
+2026-04-28T17:38:37-05:00
+
+The current SM120 prototype has ported the SM120 block-scaled atom mechanics and
+some local conventions from the references, but it has not ported the full
+Example 77 / SM100 FMHA mainloop structure. That distinction is now explicit and
+load-bearing.
+
+Ported so far:
+
+```text
+CUTLASS/CuTe SM120 block-scaled NVFP4 MMA atoms
+TMA partition_D / partition_S producer convention for Q/K/V
+register-resident Q after Q TMA load
+separate nominal roles for load, MMA, softmax, correction, epilogue
+```
+
+Not yet ported:
+
+```text
+SM100-style pipeline storage topology:
+  load_q, load_kv, mma_s0, mma_s1, s0_corr, s1_corr,
+  mma_corr, corr_epi, order_s01
+
+SM100 method/lifetime topology:
+  load(...) -> mma(...) -> softmax(...) -> correction(...) -> epilogue(...)
+
+SM100/Example 77 issue order:
+  Q1, K1, Q2, V1, K2, V2, ...
+
+Example 88 accumulator/logit handoff:
+  QK accumulator -> online softmax/P staging -> PV
+  without a full BF16 score-tile smem round-trip
+```
+
+Code change in this checkpoint:
+
+```text
+Added the SM120 analogue of the SM100 pipeline-storage contract:
+  Sm120Nvfp4PipelineS = cutlass::PipelineAsync<1>
+  Sm120Nvfp4PipelineC = cutlass::PipelineAsync<1>
+  Sm120Nvfp4PipelineO = cutlass::PipelineAsync<2>
+  Sm120Nvfp4PipelineE = cutlass::PipelineAsync<2>
+  Sm120Nvfp4OrderBarrierSoftmax = cutlass::OrderedSequenceBarrier<1, 2>
+
+Added Sm120Nvfp4MainloopPipelineStorage with:
+  mma_s0, mma_s1, s0_corr, s1_corr, mma_corr, corr_epi, order_s01
+
+Embedded that storage in Sm120Nvfp4QkvLoadCollectiveStorage and exposed its
+size in the metadata path.
+```
+
+This is not a performance optimization and should not be evaluated as one. It
+is the structural anchor for the next port slice: replacing the loose
+benchmark-local named-barrier handoffs with the same pipeline-state ownership
+model that Example 77 uses.
+
+### Rejected: MMA-Owned Softmax/Correction Collapse
+
+2026-04-28T17:38:37-05:00
+
+Tried collapsing softmax, correction, P staging, and PV ownership into the MMA
+role after the inline atom-body rewrite. Softmax/correction roles were idled;
+the MMA role computed row stats, online correction, P quantization, and PV
+directly.
+
+Validation passed, but full-grid performance regressed badly:
+
+```text
+inline QK/PV atom-body baseline:
+  min_ms: 12.777376
+  mean_ms: 12.878765
+
+MMA-owned softmax/correction/P/PV:
+  min_ms: 15.059456
+  mean_ms: 15.149126
+  max_ms: 15.228544
+```
+
+Decision:
+
+```text
+Rejected and reverted. Collapsing roles reduces handoff count but destroys the
+role separation that Example 77 relies on for overlap and register lifetime.
+The correct direction is not "fewer roles"; it is the SM100 role pipeline
+topology ported to SM120 mma.sync/register mechanics.
+```
+
+### Rejected: Move BF16 Logits Scratch To smem_A
+
+2026-04-28T17:38:37-05:00
+
+Considered moving `smem_logits` from aliased QK `smem_B` to `smem_A` to free the
+K destination earlier and remove the load-role wait. This is invalid in the
+current storage model:
+
+```text
+QK smem_A is also the PV A/P staging region.
+Softmax would read logits from smem_A and write P into the same storage.
+```
+
+Decision:
+
+```text
+Rejected before testing. This is a storage-lifetime conflict, not a scheduling
+tweak. The fix must come from the Example 77/88 structure: accumulator/subtile
+handoff or a correctly pipelined S/P lifetime, not by moving the full score tile
+onto another aliased operand buffer.
+```
+
+### Rejected: V Lookahead Without Matching Pipeline Ownership
+
+2026-04-28T17:38:37-05:00
+
+Tried changing only the loader issue order so the prologue staged `V0` and `V1`,
+then each loop staged next K and `V+2`. This was intended to move toward Example
+77's independent K/V issue order without first porting the full pipeline
+ownership model.
+
+Result:
+
+```text
+online register-Q correctness gate did not fail at compile time;
+the process hung in the run path with no nvcc/ptxas active.
+```
+
+Decision:
+
+```text
+Rejected and reverted. Moving V issue order alone violates the current
+consumer/release lifetime. Example 77's K/V interleave is coupled to its
+PipelineKV state machine and S/P/O ownership. The next attempt must port the
+pipeline-state ownership together with the issue order, not move V lookahead as
+an isolated schedule edit.
+```
+
+### Full SM100-Style Role Pipeline Port
+
+2026-04-28T18:26:00-05:00
+
+Ported the active online owner from a partial S/C pipeline hybrid to the full
+SM100-style role pipeline graph for the benchmark kernel:
+
+```text
+MMA -> Softmax0:      pipeline_mma_s0
+MMA -> Softmax1:      pipeline_mma_s1
+Softmax0 -> Corr:     pipeline_s0_corr
+Softmax1 -> Corr:     pipeline_s1_corr
+MMA -> Corr:          pipeline_mma_corr
+Corr -> Epilogue:     pipeline_corr_epi
+Softmax0/1 ordering:  order_s01
+```
+
+The S and C pipelines now use role-specific ownership rather than both softmax
+groups consuming every tile:
+
+```text
+even tiles:  MMA -> Softmax0 -> Correction
+odd tiles:   MMA -> Softmax1 -> Correction
+```
+
+`pipeline_s0_corr` and `pipeline_s1_corr` now use producer arrival counts that
+match the softmax warpgroups, following the SM100 reference. `pipeline_mma_corr`
+is committed by the MMA role after PV, then consumed by the correction role.
+`pipeline_corr_epi` is committed by correction on the final tile and consumed by
+the epilogue role.
+
+Important benchmark limitation:
+
+```text
+The benchmark still writes the float output from the MMA role because the
+current shared-memory budget cannot hand a full 128x128 output tile to the
+epilogue role. The E pipeline is structural ownership plumbing in this benchmark
+path, not the final production epilogue.
+```
+
+Validation:
+
+```text
+git diff --check: pass
+python3 -m py_compile benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py: pass
+online kv_tiles=2:  finite, mean_abs=0.00184237, max_abs=0.00913417, cosine=0.987295
+online kv_tiles=4:  finite, mean_abs=0.00125708, max_abs=0.00587741, cosine=0.988742
+online kv_tiles=16: finite, mean_abs=0.000650447, max_abs=0.00310903, cosine=0.988928
+full grid:          finite first tile, mean_abs=0.00015529, max_abs=0.000905559, cosine=0.992945
+full-grid min:      13.2259 ms
+```
+
+Conclusion:
+
+```text
+The full S/C/O/E/order pipeline graph removes the previous long-run hang and
+makes role ownership match SM100 more closely, but it does not improve wall
+time. The current performance is still far from the two-stage CUTLASS target.
+
+The remaining gap is not missing O/E/order plumbing. The remaining structural
+gap is that the SM120 benchmark still lacks the SM100 mainloop's true overlap
+model: S/P are aliased through one QK tensor region, output remains
+MMA-register-owned, and the epilogue is only a structural placeholder.
+```
