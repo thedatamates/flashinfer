@@ -736,7 +736,8 @@ __device__ __forceinline__ void cutlass_smem_atom_gemm_tile_body(
       out_col_base, data_debug_mode, scale_debug_mode);
 }
 
-template <class FrgTensorA, class FrgTensorSFA, class FrgTensorC>
+template <bool FinalBarrier = true, class FrgTensorA, class FrgTensorSFA,
+          class FrgTensorC>
 __device__ __forceinline__ void cutlass_qk_tma_k_mma_register_q_stage(
     typename CutlassCollectiveMainloop::MainloopPipeline pipeline,
     typename CutlassCollectiveMainloop::PipelineState& smem_pipe_read,
@@ -818,9 +819,11 @@ __device__ __forceinline__ void cutlass_qk_tma_k_mma_register_q_stage(
     gemm_kblock(k_block);
   });
 
-  cutlass::arch::NamedBarrier::sync(
-      thr_size(tiled_mma),
-      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+  if constexpr (FinalBarrier) {
+    cutlass::arch::NamedBarrier::sync(
+        thr_size(tiled_mma),
+        cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+  }
 }
 
 template <class FrgTensorA, class FrgTensorSFA>
@@ -1164,7 +1167,7 @@ __device__ __forceinline__ void cutlass_pv_stage2_tma_v_register_stage(
   ++smem_pipe_read;
 }
 
-template <class FrgTensorB, class FrgTensorSFB, class FrgTensorC,
+template <bool FinalBarrier = true, class FrgTensorB, class FrgTensorSFB, class FrgTensorC,
           class TensorA, class TensorSFA>
 __device__ __forceinline__ void cutlass_pv_stage2_mma_register_v_stage(
     FrgTensorB const& v_frag,
@@ -1229,9 +1232,11 @@ __device__ __forceinline__ void cutlass_pv_stage2_mma_register_v_stage(
     gemm_kblock(k_block);
   });
 
-  cutlass::arch::NamedBarrier::sync(
-      thr_size(tiled_mma),
-      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+  if constexpr (FinalBarrier) {
+    cutlass::arch::NamedBarrier::sync(
+        thr_size(tiled_mma),
+        cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+  }
 }
 
 template <class FrgTensorC>
@@ -2436,10 +2441,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       auto qk_accum = cute::partition_fragment_C(
           qk_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShape{}));
       cute::clear(qk_accum);
-      cutlass_qk_tma_k_mma_register_q_stage(
+      cutlass_qk_tma_k_mma_register_q_stage<false>(
           k_pipeline, k_pipe_read, q_frag0, q_scale_frag0, qk_accum,
           qk_mma_thread_idx, storage.qk_tensors);
-      cutlass_qk_tma_k_mma_register_q_stage(
+      cutlass_qk_tma_k_mma_register_q_stage<false>(
           k_pipeline, k_pipe_read, q_frag1, q_scale_frag1, qk_accum,
           qk_mma_thread_idx, storage.qk_tensors);
 
@@ -2467,7 +2472,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           pv_sB, pv_sSFB);
       cutlass_pv_stage2_scale_or_clear_accum(
           pv_accum, storage.old_scale, pv_mma_thread_idx, tile == 0 ? 1 : 0);
-      cutlass_pv_stage2_mma_register_v_stage(
+      cutlass_pv_stage2_mma_register_v_stage<false>(
           v_frag, v_scale_frag, pv_accum, pv_mma_thread_idx, p_sA, p_sSFA);
     }
 

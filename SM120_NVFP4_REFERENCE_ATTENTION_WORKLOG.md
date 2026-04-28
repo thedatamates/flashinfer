@@ -5582,3 +5582,73 @@ ceiling, so the next milestone must remove the helper-call-per-tile QK/PV
 boundaries inside the MMA loop and inline the CUTLASS atom copy/MMA sequence
 directly into that role loop.
 ```
+
+### Helper Tail-Barrier Removal In Online Role Loop
+
+2026-04-28T17:00:23-05:00
+
+The role-loop rewrite still called QK/PV helpers that ended with conservative
+`Sm120MainloopBarrier` synchronizations. Those barriers are useful for the
+older smoke gates, but they are helper-boundary barriers in the online
+role-loop path:
+
+```text
+QK helper:
+  per-stage consumer_wait/copy/gemm/release still retained
+  trailing helper-exit barrier made optional
+
+PV helper:
+  P/V copy and GEMM still retained
+  trailing helper-exit barrier made optional
+```
+
+Implementation:
+
+```text
+cutlass_qk_tma_k_mma_register_q_stage<false>(...) in online MMA role
+cutlass_pv_stage2_mma_register_v_stage<false>(...) in online MMA role
+
+default remains <true>, so older gates keep the conservative behavior.
+```
+
+Validation:
+
+```text
+git diff --check: pass
+role schedule: pass
+QKV load collective: finite, mean_abs=0.0015516469720751047,
+                     max_abs=0.015534400939941406,
+                     cosine=0.9999986290931702
+role handoff: finite, mean_abs=0.0025383096653968096,
+              max_abs=0.014019200578331947,
+              cosine=0.9895987510681152
+online register-Q, kv_tiles=2: finite,
+                                   mean_abs=0.00184237165376544,
+                                   max_abs=0.009134171530604362,
+                                   cosine=0.9872949719429016
+full-grid first tile vs exact: finite,
+                               mean_abs=0.00015529035590589046,
+                               max_abs=0.0009055592236109078,
+                               cosine=0.9929453134536743
+```
+
+Performance:
+
+```text
+role-loop baseline:
+  min_ms: 12.918880
+
+helper tail-barriers removed:
+  min_ms: 12.896800
+  mean_ms: 12.920973
+  max_ms: 12.945888
+```
+
+Conclusion:
+
+```text
+This confirms the helper-exit barriers are not the dominant problem. The next
+target is the helper body itself: the online MMA role still constructs/copies
+fragment views and runs separate QK0, QK1, V-load, and PV helper bodies per KV
+tile instead of one fused CUTLASS atom loop.
+```
