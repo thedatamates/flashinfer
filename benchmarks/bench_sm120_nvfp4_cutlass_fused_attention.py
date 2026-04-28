@@ -102,18 +102,13 @@ def main() -> None:
     parser.add_argument("--smem-atom-check-only", action="store_true")
     parser.add_argument("--smem-atom-block-check-only", action="store_true")
     parser.add_argument("--pv-smem-atom-tile-check-only", action="store_true")
-    parser.add_argument("--persistent-owner-layout-check-only", action="store_true")
-    parser.add_argument("--persistent-owner-qk-check-only", action="store_true")
-    parser.add_argument("--persistent-owner-softmax-check-only", action="store_true")
-    parser.add_argument("--persistent-owner-pv-group-check-only", action="store_true")
-    parser.add_argument("--persistent-owner-full-tile-check-only", action="store_true")
-    parser.add_argument("--persistent-owner-group-online-check-only", action="store_true")
-    parser.add_argument("--persistent-owner-group-online-register-check-only", action="store_true")
-    parser.add_argument(
-        "--persistent-owner-group-online-register-q-check-only",
-        action="store_true",
-    )
-    parser.add_argument("--persistent-owner-online-kv-tiles", type=int, default=2)
+    parser.add_argument("--sm120-qk-load-collective-check-only", action="store_true")
+    parser.add_argument("--sm120-qkv-load-collective-check-only", action="store_true")
+    parser.add_argument("--sm120-qkv-role-handoff-check-only", action="store_true")
+    parser.add_argument("--sm120-qkv-online-check-only", action="store_true")
+    parser.add_argument("--sm120-qkv-online-full-grid-bench", action="store_true")
+    parser.add_argument("--sm120-role-schedule-check-only", action="store_true")
+    parser.add_argument("--online-kv-tiles", type=int, default=2)
     parser.add_argument("--smem-atom-data-mode", type=int, default=0)
     parser.add_argument("--smem-atom-scale-mode", type=int, default=0)
     parser.add_argument("--smem-atom-ones", action="store_true")
@@ -129,22 +124,43 @@ def main() -> None:
     ext = build_extension()
     metadata = dict(ext.cutlass_sm120_blockscaled_collective_metadata())
 
-    if args.persistent_owner_layout_check_only:
-        marker = torch.empty(8, device=device, dtype=torch.float32)
-        ext.persistent_mainloop_owner_layout_smoke(marker)
+    if args.sm120_role_schedule_check_only:
+        marker = torch.empty(16, device=device, dtype=torch.int32)
+        ext.sm120_nvfp4_role_schedule_smoke(marker)
         torch.cuda.synchronize()
-        marker_values = marker.cpu().tolist()
+        values = marker.cpu().tolist()
+        role_schedule = dict(metadata["sm120_role_schedule"])
         print(
             {
-                "persistent_owner_layout_smoke": True,
-                "marker": marker_values,
-                "sm120_optin_smem_bytes": metadata["sm120_optin_smem_bytes"],
-                "phased_storage_bytes": int(marker_values[1]),
-                "independent_qk_pv_fits_sm120": metadata[
-                    "persistent_independent_qk_pv_fits_sm120"
+                "sm120_role_schedule_smoke": True,
+                "role_warp_counts": {
+                    "softmax0": values[0],
+                    "softmax1": values[1],
+                    "correction": values[2],
+                    "mma": values[3],
+                    "load": values[4],
+                    "epilogue": values[5],
+                    "empty": values[6],
+                },
+                "total_warps": values[7],
+                "mma_threads": values[8],
+                "total_threads": values[9],
+                "mma_warp_begin": values[10],
+                "load_warp": values[11],
+                "epilogue_warp": values[12],
+                "metadata_role_schedule": role_schedule,
+                "storage_bytes": metadata["sm120_qkv_load_collective_storage_bytes"],
+                "storage_margin_bytes": metadata[
+                    "sm120_qkv_load_collective_storage_margin_bytes"
                 ],
-                "independent_qk_pv_smem_margin_bytes": metadata[
-                    "persistent_independent_qk_pv_smem_margin_bytes"
+                "bf16_logits_128x128_bytes": metadata[
+                    "bf16_logits_128x128_bytes"
+                ],
+                "independent_double_buffered_logits_128x128_margin_bytes": metadata[
+                    "independent_double_buffered_logits_128x128_margin_bytes"
+                ],
+                "independent_double_buffered_logits_64x128_margin_bytes": metadata[
+                    "independent_double_buffered_logits_64x128_margin_bytes"
                 ],
             }
         )
@@ -246,7 +262,7 @@ def main() -> None:
         torch.cuda.synchronize()
         return qk_ref
 
-    if args.persistent_owner_qk_check_only:
+    if args.sm120_qk_load_collective_check_only:
         (
             q_cutlass,
             q_cutlass_scales,
@@ -258,252 +274,18 @@ def main() -> None:
             workspace,
             tactic,
         ) = cutlass_qk_inputs()
-        qk_owner = torch.empty((128, 128), device=device, dtype=torch.float32)
-        ext.persistent_mainloop_owner_qk_stage(
+        qk_load_collective = torch.empty((128, 128), device=device, dtype=torch.float32)
+        ext.sm120_nvfp4_qk_load_collective_stage(
             q_cutlass,
             q_cutlass_scales,
             k_cutlass,
             k_cutlass_scales,
-            qk_owner,
+            qk_load_collective,
             workspace,
             0,
             0,
         )
         torch.cuda.synchronize()
-        qk_ref = qk_runner_ref(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            qk_alpha,
-            workspace,
-            tactic,
-        ).float()
-        result = {"persistent_owner_qk_stage": True}
-        result.update(compare("owner_vs_runner", qk_owner * qk_alpha, qk_ref))
-        print(result)
-        return
-
-    if args.persistent_owner_softmax_check_only:
-        (
-            q_cutlass,
-            q_cutlass_scales,
-            _,
-            k_cutlass,
-            k_cutlass_scales,
-            _,
-            qk_alpha,
-            workspace,
-            tactic,
-        ) = cutlass_qk_inputs()
-        p_packed = torch.empty((128, 64), device=device, dtype=torch.uint8)
-        p_scales = torch.empty((128, 8), device=device, dtype=torch.uint8)
-        row_m = torch.empty((128,), device=device, dtype=torch.float32)
-        row_l = torch.empty((128,), device=device, dtype=torch.float32)
-        ext.persistent_mainloop_owner_softmax_stage(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            p_packed,
-            p_scales,
-            row_m,
-            row_l,
-            workspace,
-            float(qk_alpha.item()),
-            0,
-            0,
-        )
-        torch.cuda.synchronize()
-        logits = qk_runner_ref(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            qk_alpha,
-            workspace,
-            tactic,
-        ).float() / (HEAD_DIM**0.5)
-        row_m_ref = logits.amax(dim=-1)
-        p_ref = torch.exp(logits - row_m_ref[:, None])
-        row_l_ref = p_ref.sum(dim=-1)
-        p_dequant = nvfp4_rowmajor_to_fp32(p_packed, p_scales) / PROB_GLOBAL_SCALE
-        result = {"persistent_owner_softmax_stage": True}
-        result.update(compare("p_vs_ref", p_dequant, p_ref))
-        result["row_m_max_abs"] = float((row_m - row_m_ref).abs().max().item())
-        result["row_l_max_abs"] = float((row_l - row_l_ref).abs().max().item())
-        print(result)
-        return
-
-    if args.persistent_owner_pv_group_check_only:
-        (
-            q_cutlass,
-            q_cutlass_scales,
-            _,
-            k_cutlass,
-            k_cutlass_scales,
-            _,
-            qk_alpha,
-            workspace,
-            _,
-        ) = cutlass_qk_inputs()
-        v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
-        out_group = torch.empty((128, 128), device=device, dtype=torch.float32)
-        p_packed = torch.empty((128, 64), device=device, dtype=torch.uint8)
-        p_scales = torch.empty((128, 8), device=device, dtype=torch.uint8)
-        row_m = torch.empty((128,), device=device, dtype=torch.float32)
-        row_l = torch.empty((128,), device=device, dtype=torch.float32)
-        out_group_idx = 0
-        pv_alpha = 1.0 / v_pv_cutlass_global
-        ext.persistent_mainloop_owner_pv_group_stage(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            v_pv_cutlass,
-            v_pv_cutlass_scales,
-            out_group,
-            p_packed,
-            p_scales,
-            row_m,
-            row_l,
-            workspace,
-            float(qk_alpha.item()),
-            0,
-            0,
-            out_group_idx,
-        )
-        torch.cuda.synchronize()
-        p_dequant = nvfp4_rowmajor_to_fp32(p_packed, p_scales) / PROB_GLOBAL_SCALE
-        p_norm = p_dequant / torch.clamp(row_l[:, None], min=1.0e-20)
-        group_start = out_group_idx * 128
-        group_stop = group_start + 128
-        exact_ref = torch.matmul(
-            p_norm.float(), v_ref_f32[:128, group_start:group_stop].float()
-        )
-        owner_norm = out_group * (
-            pv_alpha / (PROB_GLOBAL_SCALE * torch.clamp(row_l[:, None], min=1.0e-20))
-        )
-        result = {"persistent_owner_pv_group_stage": True}
-        result.update(compare("owner_vs_exact", owner_norm, exact_ref))
-        print(result)
-        return
-
-    if args.persistent_owner_full_tile_check_only:
-        (
-            q_cutlass,
-            q_cutlass_scales,
-            _,
-            k_cutlass,
-            k_cutlass_scales,
-            _,
-            qk_alpha,
-            workspace,
-            tactic,
-        ) = cutlass_qk_inputs()
-        v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
-        owner_out = torch.empty((128, HEAD_DIM), device=device, dtype=torch.float32)
-        pv_alpha = 1.0 / v_pv_cutlass_global
-        ext.persistent_mainloop_owner_full_tile_stage(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            v_pv_cutlass,
-            v_pv_cutlass_scales,
-            owner_out,
-            workspace,
-            float(qk_alpha.item()),
-            float(pv_alpha.item()),
-            0,
-            0,
-        )
-        torch.cuda.synchronize()
-        qk_ref = qk_runner_ref(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            qk_alpha,
-            workspace,
-            tactic,
-        )
-        probs = torch.softmax(qk_ref.float() / (HEAD_DIM**0.5), dim=-1)
-        exact_ref = torch.matmul(probs.float(), v_ref_f32[:128].float())
-        result = {"persistent_owner_full_tile_stage": True}
-        result.update(compare("owner_vs_exact", owner_out, exact_ref))
-        if args.bench:
-            result["bench_persistent_owner_full_tile"] = event_ms(
-                lambda: ext.persistent_mainloop_owner_full_tile_stage(
-                    q_cutlass,
-                    q_cutlass_scales,
-                    k_cutlass,
-                    k_cutlass_scales,
-                    v_pv_cutlass,
-                    v_pv_cutlass_scales,
-                    owner_out,
-                    workspace,
-                    float(qk_alpha.item()),
-                    float(pv_alpha.item()),
-                    0,
-                    0,
-                ),
-                warmup=args.warmup,
-                repeat=args.repeat,
-            )
-        print(result)
-        return
-
-    if (
-        args.persistent_owner_group_online_check_only
-        or args.persistent_owner_group_online_register_check_only
-        or args.persistent_owner_group_online_register_q_check_only
-    ):
-        if args.persistent_owner_group_online_register_q_check_only:
-            stage_name = "persistent_owner_group_online_register_q_stage"
-            stage_fn = ext.persistent_mainloop_owner_group_online_register_q_stage
-        elif args.persistent_owner_group_online_register_check_only:
-            stage_name = "persistent_owner_group_online_register_stage"
-            stage_fn = ext.persistent_mainloop_owner_group_online_register_stage
-        else:
-            stage_name = "persistent_owner_group_online_stage"
-            stage_fn = ext.persistent_mainloop_owner_group_online_stage
-        num_tiles = args.persistent_owner_online_kv_tiles
-        if num_tiles <= 0 or num_tiles > (k_ref_f32.shape[0] // 128):
-            raise ValueError("--persistent-owner-online-kv-tiles out of range")
-        (
-            q_cutlass,
-            q_cutlass_scales,
-            _,
-            k_cutlass,
-            k_cutlass_scales,
-            _,
-            qk_alpha,
-            workspace,
-            tactic,
-        ) = cutlass_qk_inputs()
-        v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
-        out_group = torch.empty((128, 128), device=device, dtype=torch.float32)
-        pv_alpha = 1.0 / v_pv_cutlass_global
-        out_group_idx = 0
-        stage_fn(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            v_pv_cutlass,
-            v_pv_cutlass_scales,
-            out_group,
-            workspace,
-            float(qk_alpha.item()),
-            float(pv_alpha.item()),
-            0,
-            0,
-            num_tiles,
-            out_group_idx,
-        )
-        torch.cuda.synchronize()
-        kv_rows = num_tiles * 128
         qk_ref = qk_runner_ref(
             q_cutlass,
             q_cutlass_scales,
@@ -513,19 +295,263 @@ def main() -> None:
             workspace,
             tactic,
             q_rows=128,
-            kv_rows=kv_rows,
+            kv_rows=128,
+        ).float()
+        result = {
+            "sm120_qk_load_collective_stage": True,
+            "storage_bytes": metadata["sm120_qk_load_collective_storage_bytes"],
+            "storage_margin_bytes": metadata[
+                "sm120_qk_load_collective_storage_margin_bytes"
+            ],
+        }
+        result.update(
+            compare(
+                "load_collective_vs_runner",
+                qk_load_collective * qk_alpha,
+                qk_ref,
+            )
+        )
+        if args.bench:
+            result["bench_sm120_qk_load_collective_stage"] = event_ms(
+                lambda: ext.sm120_nvfp4_qk_load_collective_stage(
+                    q_cutlass,
+                    q_cutlass_scales,
+                    k_cutlass,
+                    k_cutlass_scales,
+                    qk_load_collective,
+                    workspace,
+                    0,
+                    0,
+                ),
+                warmup=args.warmup,
+                repeat=args.repeat,
+            )
+        print(result)
+        return
+
+    if args.sm120_qkv_load_collective_check_only:
+        (
+            q_cutlass,
+            q_cutlass_scales,
+            _,
+            k_cutlass,
+            k_cutlass_scales,
+            _,
+            qk_alpha,
+            workspace,
+            tactic,
+        ) = cutlass_qk_inputs()
+        _, v_pv_cutlass, v_pv_cutlass_scales, _ = cutlass_v_inputs()
+        qk_load_collective = torch.empty((128, 128), device=device, dtype=torch.float32)
+        ext.sm120_nvfp4_qkv_load_collective_stage(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            qk_load_collective,
+            workspace,
+            0,
+            0,
+            0,
+        )
+        torch.cuda.synchronize()
+        qk_ref = qk_runner_ref(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            qk_alpha,
+            workspace,
+            tactic,
+            q_rows=128,
+            kv_rows=128,
+        ).float()
+        result = {
+            "sm120_qkv_load_collective_stage": True,
+            "storage_bytes": metadata["sm120_qkv_load_collective_storage_bytes"],
+            "storage_margin_bytes": metadata[
+                "sm120_qkv_load_collective_storage_margin_bytes"
+            ],
+        }
+        result.update(
+            compare(
+                "qkv_load_collective_qk_vs_runner",
+                qk_load_collective * qk_alpha,
+                qk_ref,
+            )
+        )
+        if args.bench:
+            result["bench_sm120_qkv_load_collective_stage"] = event_ms(
+                lambda: ext.sm120_nvfp4_qkv_load_collective_stage(
+                    q_cutlass,
+                    q_cutlass_scales,
+                    k_cutlass,
+                    k_cutlass_scales,
+                    v_pv_cutlass,
+                    v_pv_cutlass_scales,
+                    qk_load_collective,
+                    workspace,
+                    0,
+                    0,
+                    0,
+                ),
+                warmup=args.warmup,
+                repeat=args.repeat,
+            )
+        print(result)
+        return
+
+    if args.sm120_qkv_role_handoff_check_only:
+        (
+            q_cutlass,
+            q_cutlass_scales,
+            _,
+            k_cutlass,
+            k_cutlass_scales,
+            _,
+            qk_alpha,
+            workspace,
+            tactic,
+        ) = cutlass_qk_inputs()
+        v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
+        score_scratch = torch.empty((128, 128), device=device, dtype=torch.float32)
+        out_group = torch.empty((128, 128), device=device, dtype=torch.float32)
+        out_group_idx = 0
+        pv_alpha = 1.0 / v_pv_cutlass_global
+        stage_name = "sm120_qkv_role_handoff_stage"
+        stage_fn = ext.sm120_nvfp4_qkv_role_handoff_stage
+        stage_fn(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            score_scratch,
+            out_group,
+            workspace,
+            float(qk_alpha.item()),
+            float(pv_alpha.item()),
+            0,
+            0,
+            out_group_idx,
+        )
+        torch.cuda.synchronize()
+        qk_ref = qk_runner_ref(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            qk_alpha,
+            workspace,
+            tactic,
+            q_rows=128,
+            kv_rows=128,
         )
         probs = torch.softmax(qk_ref.float() / (HEAD_DIM**0.5), dim=-1)
         group_start = out_group_idx * 128
         group_stop = group_start + 128
         exact_ref = torch.matmul(
-            probs.float(), v_ref_f32[:kv_rows, group_start:group_stop].float()
+            probs.float(), v_ref_f32[:128, group_start:group_stop].float()
         )
-        result = {stage_name: True, "num_kv_tiles": num_tiles}
-        result.update(compare("owner_vs_exact", out_group, exact_ref))
+        result = {
+            stage_name: True,
+            "storage_bytes": metadata["sm120_qkv_load_collective_storage_bytes"],
+            "storage_margin_bytes": metadata[
+                "sm120_qkv_load_collective_storage_margin_bytes"
+            ],
+        }
+        result.update(compare(f"{stage_name}_vs_exact", out_group, exact_ref))
         if args.bench:
             result[f"bench_{stage_name}"] = event_ms(
                 lambda: stage_fn(
+                    q_cutlass,
+                    q_cutlass_scales,
+                    k_cutlass,
+                    k_cutlass_scales,
+                    v_pv_cutlass,
+                    v_pv_cutlass_scales,
+                    score_scratch,
+                    out_group,
+                    workspace,
+                    float(qk_alpha.item()),
+                    float(pv_alpha.item()),
+                    0,
+                    0,
+                    out_group_idx,
+                ),
+                warmup=args.warmup,
+                repeat=args.repeat,
+            )
+        print(result)
+        return
+
+    if args.sm120_qkv_online_check_only:
+        (
+            q_cutlass,
+            q_cutlass_scales,
+            _,
+            k_cutlass,
+            k_cutlass_scales,
+            _,
+            qk_alpha,
+            workspace,
+            tactic,
+        ) = cutlass_qk_inputs()
+        v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
+        out_group = torch.empty((128, 128), device=device, dtype=torch.float32)
+        out_group_idx = 0
+        kv_tiles = args.online_kv_tiles
+        pv_alpha = 1.0 / v_pv_cutlass_global
+        ext.sm120_nvfp4_qkv_online_register_q_stage(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            out_group,
+            workspace,
+            float(qk_alpha.item()),
+            float(pv_alpha.item()),
+            0,
+            0,
+            kv_tiles,
+            out_group_idx,
+        )
+        torch.cuda.synchronize()
+        qk_ref = qk_runner_ref(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            qk_alpha,
+            workspace,
+            tactic,
+            q_rows=128,
+            kv_rows=128 * kv_tiles,
+        )
+        probs = torch.softmax(qk_ref.float() / (HEAD_DIM**0.5), dim=-1)
+        group_start = out_group_idx * 128
+        group_stop = group_start + 128
+        exact_ref = torch.matmul(
+            probs.float(),
+            v_ref_f32[: 128 * kv_tiles, group_start:group_stop].float(),
+        )
+        result = {
+            "sm120_qkv_online_register_q_stage": True,
+            "kv_tiles": kv_tiles,
+            "storage_bytes": metadata["sm120_qkv_load_collective_storage_bytes"],
+            "storage_margin_bytes": metadata[
+                "sm120_qkv_load_collective_storage_margin_bytes"
+            ],
+        }
+        result.update(compare("online_register_q_vs_exact", out_group, exact_ref))
+        if args.bench:
+            result["bench_sm120_qkv_online_register_q_stage"] = event_ms(
+                lambda: ext.sm120_nvfp4_qkv_online_register_q_stage(
                     q_cutlass,
                     q_cutlass_scales,
                     k_cutlass,
@@ -538,12 +564,81 @@ def main() -> None:
                     float(pv_alpha.item()),
                     0,
                     0,
-                    num_tiles,
+                    kv_tiles,
                     out_group_idx,
                 ),
                 warmup=args.warmup,
                 repeat=args.repeat,
             )
+        print(result)
+        return
+
+    if args.sm120_qkv_online_full_grid_bench:
+        (
+            q_cutlass,
+            q_cutlass_scales,
+            _,
+            k_cutlass,
+            k_cutlass_scales,
+            _,
+            qk_alpha,
+            workspace,
+            tactic,
+        ) = cutlass_qk_inputs()
+        v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
+        out = torch.empty((Q_LEN * GROUP, HEAD_DIM), device=device, dtype=torch.float32)
+        pv_alpha = 1.0 / v_pv_cutlass_global
+        ext.sm120_nvfp4_qkv_online_register_q_full_grid(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            out,
+            workspace,
+            float(qk_alpha.item()),
+            float(pv_alpha.item()),
+        )
+        torch.cuda.synchronize()
+        qk_ref = qk_runner_ref(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            qk_alpha,
+            workspace,
+            tactic,
+            q_rows=128,
+            kv_rows=k_cutlass.shape[0],
+        )
+        probs = torch.softmax(qk_ref.float() / (HEAD_DIM**0.5), dim=-1)
+        exact_ref = torch.matmul(probs.float(), v_ref_f32[:, :128].float())
+        result = {
+            "sm120_qkv_online_register_q_full_grid": True,
+            "output_shape": tuple(out.shape),
+            "storage_bytes": metadata["sm120_qkv_load_collective_storage_bytes"],
+            "storage_margin_bytes": metadata[
+                "sm120_qkv_load_collective_storage_margin_bytes"
+            ],
+        }
+        result.update(compare("full_grid_first_tile_vs_exact", out[:128, :128], exact_ref))
+        result["bench_sm120_qkv_online_register_q_full_grid"] = event_ms(
+            lambda: ext.sm120_nvfp4_qkv_online_register_q_full_grid(
+                q_cutlass,
+                q_cutlass_scales,
+                k_cutlass,
+                k_cutlass_scales,
+                v_pv_cutlass,
+                v_pv_cutlass_scales,
+                out,
+                workspace,
+                float(qk_alpha.item()),
+                float(pv_alpha.item()),
+            ),
+            warmup=args.warmup,
+            repeat=args.repeat,
+        )
         print(result)
         return
 

@@ -4497,3 +4497,1088 @@ The persistent PV pipeline introduced stack and increased register use, but the
 kernel is still below the 255-register architectural ceiling. The stack should
 not ship, but it does not change the conclusion: the next useful work is
 register-resident Q, not more helper-loop tuning.
+
+## Register-Resident Q First Measurement
+
+2026-04-28T16:15:00-05:00
+
+After the benchmark cleanup checkpoint (`fb9f534`), the active
+`persistent_owner_group_online_register_q_stage` path was remeasured:
+
+```text
+num_kv_tiles=2:  mean_abs 0.0019029246, max_abs 0.0086733261, cosine 0.9864801, min 0.107008 ms
+num_kv_tiles=8:  mean_abs 0.0009381340, max_abs 0.0050215498, cosine 0.9870479, min 0.251072 ms
+num_kv_tiles=32: mean_abs 0.0004734976, max_abs 0.0024820382, cosine 0.9886041, min 0.828544 ms
+num_kv_tiles=64: mean_abs 0.0003284118, max_abs 0.0016009322, cosine 0.9883098, min 1.600960 ms
+```
+
+This is a correctness pass but a performance regression versus the previous
+persistent-PV helper-loop path:
+
+```text
+previous persistent-PV helper-loop path:
+num_kv_tiles=2:  0.065888 ms
+num_kv_tiles=8:  0.180960 ms
+num_kv_tiles=32: 0.636640 ms
+num_kv_tiles=64: 1.246272 ms
+```
+
+Interpretation:
+
+```text
+Register-resident Q is still the right architectural direction, but the first
+prototype is not the right implementation. The likely cost is not the one-time
+Q register residency itself; the current path replaces the validated QK
+collective helper with a manual K/SFB TMA pipeline and explicit score
+writeback, and that path is slower at every measured tile count.
+
+Next step: isolate QK-only cost for the register-Q K-streaming path versus the
+validated QK collective helper. Do not tune PV or softmax until the QK delta is
+known.
+
+## Reference Diff: Examples 77/88 vs Current Register-Q Prototype
+
+2026-04-28T16:31:00-05:00
+
+Before more tuning, compared the current SM120 prototype against the working
+FMHA references:
+
+```text
+3rdparty/cutlass/examples/88_hopper_fmha/collective/fmha_collective_load.hpp
+3rdparty/cutlass/examples/88_hopper_fmha/collective/fmha_collective_tma.hpp
+3rdparty/cutlass/examples/77_blackwell_fmha/collective/sm100_fmha_load_tma_warpspecialized.hpp
+3rdparty/cutlass/examples/77_blackwell_fmha/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+include/flashinfer/attention/blackwell/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp
+```
+
+Important differences:
+
+```text
+Reference pattern:
+- Dedicated load role/warpgroup owns TMA descriptor prefetch and TMA producer
+  state.
+- Q has its own pipeline (`PipelineQ` / `MainloopPipelineQ`) and is loaded with
+  TMA through the MMA-derived `partition_A` / `tma_partition` path.
+- K and V are streamed through load pipelines with producer/consumer states
+  that persist across the FMHA mainloop.
+- The consumer waits on Q once, keeps the Q fragment/view live, and only advances
+  the KV pipeline in the loop.
+
+Current SM120 prototype:
+- Consumer warpgroups manually read packed Q bytes from global memory and write
+  Q/SFA into shared memory.
+- Q is then copied from shared memory into register fragments before the KV loop.
+- K/SFB streaming is manually reconstructed for QK instead of reusing the same
+  load-role/TMA-partition convention as the references.
+- PV uses a separate pipeline from QK; the QK/PV phase sequencing is not yet the
+  alternating K/V pipeline used by the references.
+```
+
+Conclusion:
+
+```text
+The first register-Q prototype is slower because it mixes a reference-style
+register-Q idea with a non-reference producer path. The next production-shaped
+fix should not be more pipeline-depth guessing. It should move Q/SFA loading and
+K/SFB streaming into the same loader-owned, partition-derived TMA convention as
+Examples 77/88:
+
+1. Add a dedicated Q/SFA TMA load path for the SM120 block-scaled Q operand.
+2. Have the load role issue Q once before the KV loop.
+3. Have consumers wait on Q once and copy/hold the Q fragments.
+4. Keep K/SFB producer state loader-owned and persistent across KV tiles.
+5. Only after QK matches the reference ownership model, revisit K/V interleave
+   and softmax/PV overlap.
+```
+
+## SM100 Mainloop Structural Diff
+
+2026-04-28T14:49:34-05:00
+
+Stopped kernel edits and produced a side-by-side structural diff against the
+FlashInfer SM100 FMHA reference:
+
+```text
+SM120_NVFP4_SM100_MAINLOOP_DIFF.md
+```
+
+Key finding:
+
+```text
+The current SM120 benchmark adopted register-resident Q but did not adopt the
+SM100 ownership model that makes register-resident Q safe and fast. The failed
+TMA-Q attempts confirm that independent PipelineQ storage and lifetime are
+load-bearing. Reusing QK pipeline storage to stage Q deadlocks.
+```
+
+Next implementation direction from the diff:
+
+```text
+Create an SM120 NVFP4 load collective modeled on
+Sm100FmhaLoadTmaWarpspecialized:
+- dedicated PipelineQ for Q/SFA,
+- dedicated PipelineK for K/SFB,
+- dedicated PipelineV for V/SFB,
+- loader role issues Q1, K1, Q2, V1, K2, V2, ...
+
+Do not continue helper-call-per-tile tuning until this structure exists.
+```
+
+## SM120 Q/K Load Collective Port Slice
+
+2026-04-28T15:30:00-05:00
+
+Implemented the first compileable SM100-structured port slice in
+`benchmarks/sm120_nvfp4_cutlass_fused_attention.cu`:
+
+```text
+Sm120Nvfp4QkLoadCollectiveStorage
+- one CUTLASS SM120 NVFP4 tensor tile storage,
+- dedicated PipelineQ storage,
+- dedicated PipelineK storage.
+```
+
+The new smoke kernel is `sm120_nvfp4_qk_load_collective_stage_kernel`. It keeps
+the SM100 lifetime pattern for the QK subset:
+
+```text
+loader role:
+  Q0 -> K0 -> Q1 -> K1
+
+consumer roles:
+  wait/copy Q0 into register fragment,
+  wait/copy Q1 into register fragment,
+  wait K0 and QK MMA with Q0,
+  wait K1 and QK MMA with Q1.
+```
+
+This intentionally validates only the Q/K load collective before adding V/PV.
+It is not another helper-call-per-tile attention path. The specific convention
+being validated is independent Q/K pipeline storage plus partition-derived TMA
+writes for both packed FP4 payloads and UE4M3 scale sidecars.
+
+Validation:
+
+```text
+command:
+  CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2
+  python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py
+    --device 0 --sm120-qk-load-collective-check-only
+    --bench --warmup 1 --repeat 2
+
+result:
+  finite: true
+  mean_abs vs CUTLASS QK runner: 0.0015516469720751047
+  max_abs  vs CUTLASS QK runner: 0.015534400939941406
+  cosine   vs CUTLASS QK runner: 0.9999986290931702
+  storage: 74752 bytes
+  SM120 opt-in shared-memory margin: 26624 bytes
+  min wall time: 0.016416 ms
+```
+
+Conclusion:
+
+```text
+The independent PipelineQ/PipelineK pattern is viable and fits in SM120 shared
+memory for the QK subset. The previous TMA-Q deadlock was caused by violating
+pipeline lifetime/aliasing rules, not by Q/K tensor storage capacity.
+```
+
+## SM120 Q/K/V Load Collective Port Slice
+
+2026-04-28T15:55:00-05:00
+
+Added the next load-collective slice:
+
+```text
+Sm120Nvfp4QkvLoadCollectiveStorage
+- QK tensor storage for Q/K payloads and scale sidecars,
+- dedicated PipelineQ storage,
+- dedicated PipelineK storage,
+- compact V-only stage-2 storage:
+  - PV B smem sidecar,
+  - PV SFB smem sidecar,
+  - dedicated PipelineV storage.
+```
+
+Important storage finding:
+
+```text
+Full independent QK + PV shared storage does not fit:
+  QK SharedStorage + PV SharedStorage = 149504 bytes
+  SM120 opt-in limit                 = 101376 bytes
+
+The compact V-only stage-2 path does fit:
+  Q/K/V load collective storage = 95232 bytes
+  SM120 margin                  = 6144 bytes
+```
+
+This means the SM120 port cannot mirror SM100 by naively allocating full
+independent Q/K/V/P tensor storage. The shippable SM120 structure needs compact
+V-only storage while reusing the QK tensor region for post-QK P staging.
+
+The storage number includes the row max/sum state added for the first
+softmax/PV handoff slice.
+
+Validation:
+
+```text
+command:
+  CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2
+  python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py
+    --device 0 --sm120-qkv-load-collective-check-only
+    --bench --warmup 1 --repeat 2
+
+result:
+  finite: true
+  QK mean_abs vs CUTLASS QK runner: 0.0015516469720751047
+  QK max_abs  vs CUTLASS QK runner: 0.015534400939941406
+  QK cosine   vs CUTLASS QK runner: 0.9999986290931702
+  storage: 95232 bytes
+  SM120 opt-in shared-memory margin: 6144 bytes
+  min wall time: 0.018688 ms
+```
+
+Conclusion:
+
+```text
+The loader-owned Q/K/V pipeline topology now fits and runs inside one CTA. The
+next step is not more storage probing: use the same compact storage to add the
+MMA-to-softmax-to-PV handoff, with the QK tensor region aliased as P staging
+after QK has consumed K.
+```
+
+## SM120 QK -> Softmax/P -> PV Handoff Slice
+
+2026-04-28T16:20:00-05:00
+
+Added the first fused handoff smoke on top of the compact Q/K/V load collective:
+
+```text
+sm120_nvfp4_qkv_handoff_stage_kernel
+```
+
+Flow:
+
+```text
+1. Loader role issues Q0, K0, Q1, V0, K1 with independent Q/K/V pipelines.
+2. Consumers copy Q0/Q1 to register fragments.
+3. Consumers copy V0 to register fragments from compact V-only storage.
+4. Consumers run QK with register-resident Q and K from PipelineK.
+5. QK scores are materialized to an external 128x128 score scratch.
+6. Softmax quantizes P directly into aliased QK smem:
+   - QK smem_A is reinterpreted as PV A/P storage.
+   - QK smem_SFA is reinterpreted as PV SFA/P-scale storage.
+7. PV runs with P from aliased smem and V from register fragments.
+```
+
+Important limitation:
+
+```text
+This is a correctness/structure slice, not the final production mainloop. It
+still materializes the 128x128 score tile to an external scratch tensor. The
+production path must replace that with role-local score fragments and a
+pipeline contract for softmax/P quantization. The important structural result
+here is that P staging is already on-chip and aliases the QK tensor region
+after K is consumed.
+```
+
+Validation:
+
+```text
+command:
+  CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2
+  python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py
+    --device 0 --sm120-qkv-handoff-check-only
+    --bench --warmup 1 --repeat 2
+
+result:
+  finite: true
+  mean_abs vs exact one-tile attention: 0.0025387569330632687
+  max_abs  vs exact one-tile attention: 0.014001144096255302
+  cosine   vs exact one-tile attention: 0.9896034598350525
+  storage: 95232 bytes
+  SM120 opt-in shared-memory margin: 6144 bytes
+  min wall time: 0.07599999755620956 ms
+```
+
+Conclusion:
+
+```text
+The compact storage supports the full QK -> softmax/P-quant -> PV dataflow in
+one CTA. The next performance-relevant step is removing the external score
+scratch by turning QK score fragments into the producer side of a softmax/P
+stage, matching the SM100 mainloop's role handoff rather than the current
+block-wide score materialization.
+```
+
+### On-Chip BF16 Logits Handoff
+
+2026-04-28T16:45:00-05:00
+
+Replaced the external-score compute dependency in the handoff smoke with an
+on-chip BF16 logits tile:
+
+```text
+QK accumulator fragment
+  -> scale by qk_alpha / sqrt(D)
+  -> store BF16 logits into aliased QK smem_B
+  -> softmax/P quant reads BF16 logits from smem_B
+  -> P is still staged into aliased QK smem_A/smem_SFA for PV
+```
+
+The `score_scratch` tensor remains in the API only as a debug mirror of raw QK
+scores. It is no longer the input to softmax/P quantization.
+
+Important storage fact:
+
+```text
+QK smem_B is free after K is consumed and is large enough to hold a 128x128
+BF16 logits scratch (32768 bytes). This preserves the compact storage layout:
+
+  total storage: 95232 bytes
+  SM120 opt-in shared-memory margin: 6144 bytes
+```
+
+Validation:
+
+```text
+command:
+  CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2
+  python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py
+    --device 0 --sm120-qkv-handoff-check-only
+    --bench --warmup 1 --repeat 2
+
+result:
+  finite: true
+  mean_abs vs exact one-tile attention: 0.0025383096653968096
+  max_abs  vs exact one-tile attention: 0.014019200578331947
+  cosine   vs exact one-tile attention: 0.9895987510681152
+  storage: 95232 bytes
+  SM120 opt-in shared-memory margin: 6144 bytes
+  min wall time: 0.06492800265550613 ms
+```
+
+Conclusion:
+
+```text
+The first HBM score round-trip is removed from the handoff slice without
+changing the shared-memory footprint. The remaining non-production behavior is
+that logits are materialized as a whole BF16 tile in smem_B before softmax/P
+quantization. The next step is the persistent inner mainloop: keep Q register-
+resident across KV tiles, rotate K/V stages through the compact load collective,
+and replace this one-tile handoff with online row max/sum + PV rescale over
+successive KV tiles.
+```
+
+## Compact Q/K/V Online Register-Q Slice
+
+2026-04-28T17:15:00-05:00
+
+Added the first compact-storage multi-KV online-softmax smoke:
+
+```text
+sm120_nvfp4_qkv_online_register_q_stage_kernel
+```
+
+Dataflow:
+
+```text
+1. Q0/Q1 are loaded once through the Q collective and copied into register
+   fragments.
+2. For each 128-token KV tile:
+   - K0/K1 stream through the K collective.
+   - V streams through the compact V-only StageCount<2> collective.
+   - QK uses register-resident Q.
+   - QK B smem is aliased as a BF16 logits tile after K is consumed.
+   - row_m/row_l are computed from the BF16 logits tile.
+   - global_m/global_l plus old_scale/tile_scale perform online softmax
+     rescaling.
+   - P is quantized into aliased QK A/SFA smem with tile_scale applied.
+   - PV accumulates into register fragments, with old_scale applied to the
+     existing accumulator before adding the current tile.
+3. The final output divides by global_l and applies the PV alpha scale.
+```
+
+Storage:
+
+```text
+Added online state to the compact load collective:
+  row_m/row_l
+  global_m/global_l
+  old_scale/tile_scale
+
+total storage: 97280 bytes
+SM120 opt-in shared-memory margin: 4096 bytes
+```
+
+Validation and scaling:
+
+```text
+command:
+  CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2
+  python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py
+    --device 0 --sm120-qkv-online-check-only
+    --persistent-owner-online-kv-tiles {1,2,4,8}
+    --bench --warmup 1 --repeat 3
+
+results:
+  kv_tiles=1:
+    finite: true
+    mean_abs vs exact: 0.0025383096653968096
+    max_abs  vs exact: 0.014019200578331947
+    cosine   vs exact: 0.9895987510681152
+    min wall time: 0.0793600007891655 ms
+
+  kv_tiles=2:
+    finite: true
+    mean_abs vs exact: 0.00184237165376544
+    max_abs  vs exact: 0.009134171530604362
+    cosine   vs exact: 0.9872949719429016
+    min wall time: 0.13152000308036804 ms
+
+  kv_tiles=4:
+    finite: true
+    mean_abs vs exact: 0.001257083029486239
+    max_abs  vs exact: 0.005877412855625153
+    cosine   vs exact: 0.9887419939041138
+    min wall time: 0.2300799936056137 ms
+
+  kv_tiles=8:
+    finite: true
+    mean_abs vs exact: 0.0008950772462412715
+    max_abs  vs exact: 0.004760183393955231
+    cosine   vs exact: 0.9883692860603333
+    min wall time: 0.4264639914035797 ms
+```
+
+Conclusion:
+
+```text
+The compact load collective now supports a real online-softmax register-Q loop
+over multiple KV tiles with correctness preserved. Runtime is still close to
+serial per-tile cost, so the next perf lever is pipeline lifetime/overlap:
+preload the next K/V tile while consumers run QK/softmax/PV for the current
+tile, rather than issuing current-tile K/V and immediately waiting on it.
+```
+
+### Next-Tile K/V Prefetch Probe
+
+2026-04-28T17:35:00-05:00
+
+Changed the compact online loop so K/V for tile `n+1` are issued after tile
+`n` P staging and before tile `n` PV. This is the earliest safe point for K
+prefetch because QK smem_B is used as the BF16 logits tile until P staging has
+finished. V is already register-resident by then, so its compact smem region is
+also free.
+
+Result:
+
+```text
+kv_tiles=1: 0.08099199831485748 ms
+kv_tiles=2: 0.13065600395202637 ms
+kv_tiles=4: 0.23001599311828613 ms
+kv_tiles=8: 0.4249599874019623 ms
+```
+
+Conclusion:
+
+```text
+The schedule is correct but does not produce material overlap. The likely
+reason is structural: K/V TMA issue is still serialized behind block-wide
+softmax/P staging barriers and the producer has too little independent work
+ahead of the consumer. The next step needs profiling on this compact online
+kernel, not more blind scheduling tweaks.
+```
+
+## Compact Online Kernel NCU And SM100-Diff Gap
+
+2026-04-28T18:05:00-05:00
+
+Profiled the compact online register-Q kernel at `num_kv_tiles=4`:
+
+```text
+report:
+  reports/sm120_qkv_online_register_q_4tiles_full.ncu-rep
+
+shape:
+  D=512, group=8 output slice, q_tile=128 rows, 4 * 128 KV tokens
+
+kernel time in NCU:
+  210.24 us
+
+selected counters:
+  smsp__inst_executed_op_ldgsts.sum:                    0
+  smsp__inst_executed_op_tma_ld.sum:                    28
+  smsp__sass_inst_executed_op_tma_ld.sum:               28
+  smsp__warps_eligible.avg.per_cycle_active:            0.371951
+  sm__warps_active.avg.pct_of_peak_sustained_active:    24.843031
+  smsp__issue_active.avg.pct_of_peak_sustained_active:  33.134299
+  sm__pipe_tensor_cycles_active.avg.pct_active:         4.308432
+  l1tex shared load bank conflicts:                     39114
+  l1tex shared store bank conflicts:                    7299
+  gpu__dram_throughput.avg.pct_elapsed:                 0.079810
+  lts__throughput.avg.pct_elapsed:                      0.173428
+
+dominant issue-stall ratios per issue-active:
+  wait:              2.833684
+  barrier:           2.922031
+  short scoreboard:  0.881129
+  long scoreboard:   0.493230
+```
+
+Interpretation:
+
+```text
+The load path is no longer the old synchronous LDG/STS path: LDGSTS is zero and
+TMA loads are present. The kernel is also not DRAM-bandwidth-bound. The
+remaining profile matches the structural diff: phase barriers and shared-memory
+handoffs dominate because load, MMA, softmax, correction, and epilogue are still
+collapsed into one phase-loop owner flow.
+```
+
+Current alignment with `SM120_NVFP4_SM100_MAINLOOP_DIFF.md`:
+
+```text
+implemented:
+  independent Q/K/V pipelines
+  independent Q/K/V pipeline storage
+  register-resident Q across the KV loop
+  NVFP4 data + SFA/SFB sidecar plumbing
+
+not implemented:
+  SM100-style role decomposition
+  SM100 load issue order Q1,K1,Q2,V1,K2,V2,...
+  MMA-to-softmax pipeline
+  separate softmax role
+  separate correction role
+  production kernel/collective stack
+```
+
+SM120-specific constraints for the next role port:
+
+```text
+1. SM100 hands S/P through TMEM. SM120 has no TMEM, so S/P handoff must use
+   shared memory, registers owned by one role, or HBM. Registers cannot hand
+   data across roles. HBM reintroduces the rejected score round-trip. The viable
+   path is a shared-memory S/P pipeline.
+
+2. The current compact D512 storage is already 97280 bytes with only 4096 bytes
+   of SM120 opt-in shared-memory margin. A full 128x128 BF16 logits tile costs
+   32768 bytes, so an independent double-buffered S pipeline does not fit unless
+   some existing region is aliased by a proved lifetime or the handoff tile is
+   reduced.
+
+3. The current compact kernel aliases QK smem_B as the BF16 logits tile after K
+   is consumed. That is correct for the phase-loop scaffold, but it blocks true
+   SM100-style overlap: the next K tile cannot occupy the same B storage while
+   a softmax role is still reading logits from it.
+
+4. P staging into the SM120 block-scaled PV A/SFA layout currently uses the
+   CUTLASS StageCount<2> copy atom and expects the 256-thread MMA producer
+   mapping. A separate softmax role can own P quantization only if its local
+   thread mapping writes through the same `partition_D` convention, or the P
+   writer is split into a dedicated 256-thread role.
+
+5. The SM100 16-warp schedule does not map one-to-one. SM100 has a one-warp
+   MMA control role because TCGEN/TMEM carries the tensor work. The SM120
+   `mma.sync` block-scaled CUTLASS atom consumes a 256-thread MMA group, so the
+   SM120 role schedule must budget 8 warps for MMA in addition to load,
+   softmax, correction, and epilogue roles.
+```
+
+Next implementation direction:
+
+```text
+Stop tuning the compact phase-loop kernel. Keep it as a correctness scaffold.
+The next kernel slice should define an explicit SM120 role schedule and an
+S/P handoff strategy before moving more math:
+
+  Load role:
+    owns Q/K/V descriptor prefetch and issues Q1,K1,Q2,V1,K2,V2,...
+
+  MMA role:
+    owns the 256-thread SM120 block-scaled MMA group, holds Q fragments in
+    registers, consumes K/V pipelines, and produces S/P handoff signals.
+
+  Softmax role:
+    consumes S/logits from an explicit pipeline, computes row_m/row_l, and
+    writes P/SFA through a partition-derived SM120 PV-A producer mapping.
+
+  Correction role:
+    owns global_m/global_l, old_scale/tile_scale, and O rescale.
+
+  Epilogue role:
+    owns final normalization/output write and later the production BF16/LSE
+    contract.
+```
+
+### SM120 Role Schedule Contract
+
+2026-04-28T18:25:00-05:00
+
+Added an explicit SM120 role schedule to the benchmark extension:
+
+```text
+role order mirrors SM100:
+  warps  0-3:  Softmax0
+  warps  4-7:  Softmax1
+  warps  8-11: Correction
+  warps 12-19: MMA
+  warp     20: Load
+  warp     21: Epilogue
+
+total:
+  22 warps
+  704 threads
+```
+
+Why this differs from SM100:
+
+```text
+SM100 uses one MMA control warp because TCGEN/TMEM owns the tensor work.
+SM120 uses `mma.sync.aligned.kind::mxf4nvf4.block_scale...` through the
+CUTLASS block-scaled collective, and that collective consumes 256 MMA
+participant threads. The SM120 schedule therefore expands only the MMA role
+from 1 warp to 8 warps while preserving the SM100 role order around it.
+```
+
+Validation:
+
+```text
+command:
+  CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2
+  python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py
+    --device 0 --sm120-role-schedule-check-only
+
+result:
+  softmax0 warps: 4
+  softmax1 warps: 4
+  correction warps: 4
+  mma warps: 8
+  load warps: 1
+  epilogue warps: 1
+  empty warps: 0
+  mma threads: 256
+  total threads: 704
+```
+
+Storage feasibility exposed by the same metadata:
+
+```text
+current compact Q/K/V online storage:       97280 bytes
+SM120 opt-in shared-memory margin:          4096 bytes
+128x128 BF16 logits tile:                  32768 bytes
+double-buffered independent 128x128 S gap: -61440 bytes
+double-buffered independent  64x128 S gap: -28672 bytes
+```
+
+Conclusion:
+
+```text
+The role split is now a compile-checked contract. A separate independent
+S/logits buffer is impossible with the current compact D512 storage. The next
+implementation step has to make the S/P pipeline use an explicitly proven
+aliasing lifetime, not add side buffers. The viable first target is a
+role-decomposed one-tile handoff where:
+
+  Load issues Q1,K1,Q2,V1,K2.
+  MMA consumes Q/K/V and writes S into aliased QK smem_B.
+  Softmax0/1 consume S and write P into aliased QK smem_A/SFA.
+  MMA consumes P/V for PV.
+
+That still does not solve multi-tile overlap, but it moves the code from
+block-wide phase ownership to role-specific ownership without changing the
+storage footprint.
+```
+
+### Dead Kernel Cleanup And Active Gate Sweep
+
+2026-04-28T19:05:00-05:00
+
+Deleted the superseded benchmark kernels and public entry points:
+
+```text
+removed:
+  persistent_mainloop_owner_layout_smoke
+  sm120_nvfp4_qkv_handoff_stage
+  persistent_mainloop_owner_qk_stage
+  persistent_mainloop_owner_softmax_stage
+  persistent_mainloop_owner_pv_group_stage
+  persistent_mainloop_owner_full_tile_stage
+  persistent_mainloop_owner_group_online_stage
+  persistent_mainloop_owner_group_online_register_stage
+  persistent_mainloop_owner_group_online_register_q_stage
+  old split-reduction kernels
+  old non-stage K128 PV helper layer
+  old non-role softmax/P staging helpers
+
+kept:
+  atom-level QK/PV gates
+  SM120 role schedule gate
+  QK load collective gate
+  QKV load collective gate
+  role-decomposed one-tile handoff gate
+  compact online register-Q scaffold
+  CUTLASS runner baseline hook
+```
+
+Compile surface changed from:
+
+```text
+CUDA benchmark source: 7282 lines -> 3510 lines
+Python harness:        1200 lines -> 858 lines
+```
+
+Validation after cleanup:
+
+```text
+commands:
+  --sm120-role-schedule-check-only
+  --sm120-qkv-load-collective-check-only
+  --sm120-qkv-role-handoff-check-only
+  --sm120-qkv-online-check-only --online-kv-tiles 2
+
+results:
+  role schedule: pass
+  QKV load collective: finite, mean_abs=0.0015516469720751047,
+                       max_abs=0.015534400939941406,
+                       cosine=0.9999986290931702
+  role handoff: finite, mean_abs=0.0025383096653968096,
+                max_abs=0.014019200578331947,
+                cosine=0.9895987510681152
+  online register-Q: finite, mean_abs=0.00184237165376544,
+                     max_abs=0.009134171530604362,
+                     cosine=0.9872949719429016
+```
+
+Next structural milestone:
+
+```text
+Port the multi-tile online register-Q scaffold from the old 384-thread
+producer/consumer shape to the explicit 704-thread SM120 role schedule. This
+is the first multi-tile kernel where load, MMA, softmax, correction, and
+epilogue roles exist in the same block shape as the SM100 reference. The
+storage constraint remains unchanged: S/P must alias QK smem_B/A by lifetime.
+```
+
+### Online Register-Q Port To Explicit Role Schedule
+
+2026-04-28T16:32:33-05:00
+
+Ported `sm120_nvfp4_qkv_online_register_q_stage_kernel` from the old
+384-thread producer/consumer warpgroup shape to the explicit 704-thread SM120
+FMHA role schedule:
+
+```text
+roles:
+  Softmax0/Softmax1: row stats and P quantization
+  Correction:        online max/sum correction state
+  MMA:               register-resident Q, QK MMA, PV MMA
+  Load:              Q/K/V TMA producer
+  Epilogue:          reserved in the block shape
+```
+
+Implementation changes:
+
+```text
+online launch shape:   384 threads -> 704 threads
+Q residency:           unchanged, Q fragments stay in registers across tiles
+softmax/correction:    moved out of block-wide helpers into role-owned helpers
+S/P storage:           still aliases QK smem_B/A by lifetime
+old phase barriers:    replaced with role barriers:
+  MMA+Softmax+Load:    protects aliased logits from K reload overwrite
+  Softmax+Correction:  transfers row_m/row_l to correction
+  Softmax+MMA+Load:    protects P staging before PV / next-K issue
+```
+
+Important correctness bug found during the port:
+
+```text
+The first role-scheduled version let the Load role skip the MMA->Softmax and
+Softmax->MMA barriers. Because K staging and logits both alias qk_sB, the Load
+role could issue the next K tile after the K pipeline consumer released the
+stage but before softmax consumed the current logits. That produced finite but
+wildly incorrect output:
+
+  mean_abs = 1.1700510711338762e+18
+  max_abs  = 8.43750005914374e+19
+  cosine   = 0.0
+
+Fix: include the Load role in the handoff barriers around the aliased qk_sB
+lifetime. The Load role can still stream ahead after P is staged, but it cannot
+overwrite qk_sB while it contains live logits.
+```
+
+Validation after the structural port:
+
+```text
+commands:
+  git diff --check
+  python3 -m py_compile benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py
+  --sm120-role-schedule-check-only
+  --sm120-qkv-load-collective-check-only
+  --sm120-qkv-role-handoff-check-only
+  --sm120-qkv-online-check-only --online-kv-tiles 2
+
+results:
+  role schedule: pass
+  QKV load collective: finite, mean_abs=0.0015516469720751047,
+                       max_abs=0.015534400939941406,
+                       cosine=0.9999986290931702
+  role handoff: finite, mean_abs=0.0025383096653968096,
+                max_abs=0.014019200578331947,
+                cosine=0.9895987510681152
+  online register-Q role schedule: finite,
+                                   mean_abs=0.00184237165376544,
+                                   max_abs=0.009134171530604362,
+                                   cosine=0.9872949719429016
+```
+
+Next structural milestone:
+
+```text
+Use the explicit role schedule as the active online scaffold, then remove the
+remaining helper-call-per-tile behavior from the online path. The next target
+is an explicit MMA/softmax/correction/PV state machine that keeps the role
+handoff structure but reduces the per-tile phase serialization still present in
+the scaffold.
+```
+
+### Online Scaffold Timing And V-Consumption Move
+
+2026-04-28T16:37:42-05:00
+
+Measured the role-scheduled online scaffold before the next structural change:
+
+```text
+kv_tiles=2:   0.154336 ms min, 0.156764 ms mean
+kv_tiles=8:   0.516384 ms min, 0.533705 ms mean
+kv_tiles=32:  1.967456 ms min, 2.012096 ms mean
+```
+
+Two-stage CUTLASS reference in the same extension:
+
+```text
+QK 128x32768:        0.022848 ms min, 0.023870 ms mean
+PV 128x512 k32768:   0.131328 ms min, 0.132813 ms mean
+QK 4096x32768:       0.222528 ms min, 0.224521 ms mean
+PV 4096x512 k32768:  0.159552 ms min, 0.162362 ms mean
+```
+
+Conclusion:
+
+```text
+The role-scheduled scaffold is correct but still structurally too slow. It
+scales roughly linearly with KV tiles because the inner loop is still a
+helper-call-per-tile sequence. The next optimization cannot be a small barrier
+tweak; the remaining work is replacing that sequence with a real persistent
+mainloop state machine.
+```
+
+Applied one structural ordering fix from the SM100 pattern:
+
+```text
+Before:
+  MMA role waited on/copied V into registers before QK.
+
+After:
+  MMA role performs QK first, softmax/correction/P staging next, then waits on
+  V only at the PV point.
+```
+
+Rationale:
+
+```text
+V is independent of QK logits. Waiting on V before QK serializes V arrival in
+front of the critical QK->softmax path and extends V fragment live ranges. The
+SM100 structure lets QK and softmax advance while V is in flight, then consumes
+V at PV.
+```
+
+Validation after moving V consumption:
+
+```text
+role schedule: pass
+QKV load collective: finite, mean_abs=0.0015516469720751047,
+                     max_abs=0.015534400939941406,
+                     cosine=0.9999986290931702
+role handoff: finite, mean_abs=0.0025383096653968096,
+              max_abs=0.014019200578331947,
+              cosine=0.9895987510681152
+online register-Q, kv_tiles=2: finite,
+                                   mean_abs=0.00184237165376544,
+                                   max_abs=0.009134171530604362,
+                                   cosine=0.9872949719429016
+online register-Q, kv_tiles=32: finite,
+                                    mean_abs=0.0004577414656523615,
+                                    max_abs=0.002065679058432579,
+                                    cosine=0.9896405935287476
+                                    min_ms=1.921056
+```
+
+Effect:
+
+```text
+kv_tiles=32 improved from 1.967456 ms -> 1.921056 ms min. This is only a small
+win, but it confirms the corrected V lifetime is safe and removes one
+avoidable serialization point before the larger mainloop rewrite.
+```
+
+### Full Shape-B Grid Launch Surface
+
+2026-04-28T16:41:24-05:00
+
+Added `sm120_nvfp4_qkv_online_register_q_full_grid`, which launches the
+role-scheduled online owner over the full Shape-B output tile grid:
+
+```text
+grid:
+  q tiles:      4096 / 128 = 32
+  output groups: 512 / 128 = 4
+  CTAs total:   128
+  kv tiles:     32768 / 128 = 256 per CTA
+output:
+  float32 [4096, 512] lab artifact
+```
+
+Correctness gate:
+
+```text
+first output tile vs exact reference:
+  finite:   true
+  mean_abs: 0.00015529035590589046
+  max_abs:  0.0009055592236109078
+  cosine:   0.9929453134536743
+```
+
+Timing:
+
+```text
+full Shape-B role owner:
+  min_ms:  15.708160
+  mean_ms: 15.727123
+  max_ms:  15.776544
+```
+
+Conclusion:
+
+```text
+The full-grid launch surface confirms the scaffold is correct but far from
+the shipping target. The gap to the two-stage CUTLASS ceiling (~0.634 ms) is
+~25x. This is not a launch-grid problem anymore; it is the inner mainloop.
+Each CTA still executes 256 helper-call KV iterations with multiple named
+barriers and QK/PV helper boundaries. The next optimization target is the
+inner loop itself.
+```
+
+### Concurrent Role-Loop Mainloop Rewrite
+
+2026-04-28T16:56:44-05:00
+
+Profile input:
+
+```text
+Nsight Compute on the full-grid role owner:
+  tensor pipe:      2.46%
+  issue slots busy: 19.61%
+  barrier stalls:   11.19 cycles / issued instruction
+  no eligible:      70.83%
+```
+
+Conclusion from the profile:
+
+```text
+Barrier stalls dominate. The correct next move is not deleting one handoff at a
+time. The online owner needs a role-owned mainloop where each role progresses
+through its own loop and synchronizes only at real data-dependency boundaries.
+```
+
+Structural change:
+
+```text
+Rewrote sm120_nvfp4_qkv_online_register_q_stage_kernel from one serial
+role-conditional tile loop into role-specific concurrent loop bodies:
+
+  Load role:
+    Q1, K1, Q2, V1, K2 initial issue
+    then waits for P-ready before issuing next K/V tile
+
+  MMA role:
+    loads Q into register fragments once
+    loops QK -> logits handoff -> P-ready wait -> V wait -> PV
+    writes the lab float output from PV accumulator
+
+  Softmax role:
+    waits for logits
+    computes row_m/row_l
+    hands stats to correction
+    waits for correction scales
+    stages P into aliased qk_sA/SFA
+    signals P-ready
+
+  Correction role:
+    waits for row stats
+    updates global_m/global_l and old/tile scales
+    signals corrected scales
+
+  Epilogue role:
+    still reserved in the block shape. Output remains MMA-owned because the
+    current lab kernel has no separate O handoff storage; adding that is a
+    later production-epilogue milestone.
+```
+
+Remaining synchronization points after the rewrite:
+
+```text
+MMA -> Softmax:       logits in aliased qk_sB are valid
+Softmax -> Correction: row_m/row_l are valid
+Correction -> Softmax: old/tile scales are valid
+Softmax -> MMA/Load: P in aliased qk_sA/SFA is valid and logits lifetime ended
+```
+
+Validation:
+
+```text
+git diff --check: pass
+python py_compile bench harness: pass
+role schedule: pass
+QKV load collective: finite, mean_abs=0.0015516469720751047,
+                     max_abs=0.015534400939941406,
+                     cosine=0.9999986290931702
+role handoff: finite, mean_abs=0.0025383096653968096,
+              max_abs=0.014019200578331947,
+              cosine=0.9895987510681152
+online register-Q, kv_tiles=2: finite,
+                                   mean_abs=0.00184237165376544,
+                                   max_abs=0.009134171530604362,
+                                   cosine=0.9872949719429016
+full-grid first tile vs exact: finite,
+                               mean_abs=0.00015529035590589046,
+                               max_abs=0.0009055592236109078,
+                               cosine=0.9929453134536743
+```
+
+Performance effect:
+
+```text
+full Shape-B role owner before role-loop rewrite:
+  min_ms: 15.708160
+
+after concurrent role-loop rewrite:
+  min_ms: 12.918880
+  mean_ms: 12.950957
+  max_ms: 12.976832
+
+speedup: 1.216x
+```
+
+Conclusion:
+
+```text
+The rewrite is a real structural improvement and validates the concurrent role
+ownership direction. It is still ~20x slower than the two-stage CUTLASS
+ceiling, so the next milestone must remove the helper-call-per-tile QK/PV
+boundaries inside the MMA loop and inline the CUTLASS atom copy/MMA sequence
+directly into that role loop.
+```
