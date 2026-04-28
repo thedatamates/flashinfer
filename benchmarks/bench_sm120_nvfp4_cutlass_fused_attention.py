@@ -123,6 +123,18 @@ def main() -> None:
     parser.add_argument("--fused-tma-qk-tma-pv-online-split-k128-full-width-check-only", action="store_true")
     parser.add_argument("--fused-tma-qk-pv-128-check-only", action="store_true")
     parser.add_argument("--fused-tma-qk-tma-pv-128-check-only", action="store_true")
+    parser.add_argument("--persistent-owner-layout-check-only", action="store_true")
+    parser.add_argument("--persistent-owner-qk-check-only", action="store_true")
+    parser.add_argument("--persistent-owner-softmax-check-only", action="store_true")
+    parser.add_argument("--persistent-owner-pv-group-check-only", action="store_true")
+    parser.add_argument("--persistent-owner-full-tile-check-only", action="store_true")
+    parser.add_argument("--persistent-owner-group-online-check-only", action="store_true")
+    parser.add_argument("--persistent-owner-group-online-register-check-only", action="store_true")
+    parser.add_argument(
+        "--persistent-owner-group-online-register-q-check-only",
+        action="store_true",
+    )
+    parser.add_argument("--persistent-owner-online-kv-tiles", type=int, default=2)
     parser.add_argument("--fused-smem-online-kv-tiles", type=int, default=4)
     parser.add_argument("--fused-smem-online-splits", type=int, default=8)
     parser.add_argument("--fused-smem-online-q-tiles", type=int, default=1)
@@ -146,6 +158,25 @@ def main() -> None:
     q, k, v, k_scales, v_scales = make_inputs(device)
     ext = build_extension()
     metadata = dict(ext.cutlass_sm120_blockscaled_collective_metadata())
+    if args.persistent_owner_layout_check_only:
+        marker = torch.empty(8, device=device, dtype=torch.float32)
+        ext.persistent_mainloop_owner_layout_smoke(marker)
+        torch.cuda.synchronize()
+        marker_values = marker.cpu().tolist()
+        result = {
+            "persistent_owner_layout_smoke": True,
+            "marker": marker_values,
+            "sm120_optin_smem_bytes": metadata["sm120_optin_smem_bytes"],
+            "phased_storage_bytes": int(marker_values[1]),
+            "independent_qk_pv_fits_sm120": metadata[
+                "persistent_independent_qk_pv_fits_sm120"
+            ],
+            "independent_qk_pv_smem_margin_bytes": metadata[
+                "persistent_independent_qk_pv_smem_margin_bytes"
+            ],
+        }
+        print(result)
+        return
 
     q_expected, q_scales_expected = fp32_to_nvfp4_rowmajor(
         q.reshape(Q_LEN * GROUP, HEAD_DIM)
@@ -160,6 +191,427 @@ def main() -> None:
     q_dequant_delta = (q_actual_f32 - q_expected_f32).abs()
 
     k_ref_f32 = nvfp4_rowmajor_to_fp32(k, k_scales)
+    if args.persistent_owner_qk_check_only:
+        q_cutlass, q_cutlass_scales, q_cutlass_global = quantize_cutlass(
+            q.reshape(Q_LEN * GROUP, HEAD_DIM)
+        )
+        k_cutlass, k_cutlass_scales, k_cutlass_global = quantize_cutlass(
+            k_ref_f32.to(torch.bfloat16)
+        )
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        qk_owner = torch.empty((128, 128), device=device, dtype=torch.float32)
+        ext.persistent_mainloop_owner_qk_stage(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            qk_owner,
+            workspace,
+            0,
+            0,
+        )
+        torch.cuda.synchronize()
+        qk_official = torch.empty(
+            (128, k_cutlass.shape[0]), device=device, dtype=torch.bfloat16
+        )
+        qk_alpha = 1.0 / (q_cutlass_global * k_cutlass_global)
+        tactic = min(2, int(metadata["runner_tactic_count"]) - 1)
+        ext.cutlass_runner_fp4_gemm(
+            q_cutlass[:128].contiguous(),
+            k_cutlass.contiguous(),
+            q_cutlass_scales[:128].contiguous(),
+            k_cutlass_scales.contiguous(),
+            qk_alpha,
+            qk_official,
+            workspace,
+            tactic,
+        )
+        torch.cuda.synchronize()
+        qk_owner_scaled = qk_owner * qk_alpha
+        qk_ref = qk_official[:, :128].float()
+        delta = (qk_owner_scaled - qk_ref).abs()
+        cos = torch.sum(qk_owner_scaled * qk_ref) / torch.clamp(
+            torch.linalg.vector_norm(qk_owner_scaled) * torch.linalg.vector_norm(qk_ref),
+            min=1.0e-20,
+        )
+        result = {
+            "persistent_owner_qk_stage": True,
+            "finite": bool(torch.isfinite(qk_owner_scaled).all().item()),
+            "mean_abs": float(delta.mean().item()),
+            "max_abs": float(delta.max().item()),
+            "cosine": float(cos.item()),
+        }
+        print(result)
+        return
+    if args.persistent_owner_softmax_check_only:
+        q_cutlass, q_cutlass_scales, q_cutlass_global = quantize_cutlass(
+            q.reshape(Q_LEN * GROUP, HEAD_DIM)
+        )
+        k_cutlass, k_cutlass_scales, k_cutlass_global = quantize_cutlass(
+            k_ref_f32.to(torch.bfloat16)
+        )
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        p_packed = torch.empty((128, 64), device=device, dtype=torch.uint8)
+        p_scales = torch.empty((128, 8), device=device, dtype=torch.uint8)
+        row_m = torch.empty((128,), device=device, dtype=torch.float32)
+        row_l = torch.empty((128,), device=device, dtype=torch.float32)
+        qk_alpha = 1.0 / (q_cutlass_global * k_cutlass_global)
+        ext.persistent_mainloop_owner_softmax_stage(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            p_packed,
+            p_scales,
+            row_m,
+            row_l,
+            workspace,
+            float(qk_alpha.item()),
+            0,
+            0,
+        )
+        torch.cuda.synchronize()
+        qk_official = torch.empty(
+            (128, k_cutlass.shape[0]), device=device, dtype=torch.bfloat16
+        )
+        tactic = min(2, int(metadata["runner_tactic_count"]) - 1)
+        ext.cutlass_runner_fp4_gemm(
+            q_cutlass[:128].contiguous(),
+            k_cutlass.contiguous(),
+            q_cutlass_scales[:128].contiguous(),
+            k_cutlass_scales.contiguous(),
+            qk_alpha,
+            qk_official,
+            workspace,
+            tactic,
+        )
+        torch.cuda.synchronize()
+        logits = qk_official[:, :128].float() * (HEAD_DIM**-0.5)
+        row_m_ref = logits.amax(dim=-1)
+        p_ref = torch.exp(logits - row_m_ref[:, None])
+        row_l_ref = p_ref.sum(dim=-1)
+        p_dequant = nvfp4_rowmajor_to_fp32(p_packed, p_scales) / PROB_GLOBAL_SCALE
+        p_delta = (p_dequant - p_ref).abs()
+        row_m_delta = (row_m - row_m_ref).abs()
+        row_l_delta = (row_l - row_l_ref).abs()
+        p_cos = torch.sum(p_dequant * p_ref) / torch.clamp(
+            torch.linalg.vector_norm(p_dequant) * torch.linalg.vector_norm(p_ref),
+            min=1.0e-20,
+        )
+        result = {
+            "persistent_owner_softmax_stage": True,
+            "finite": bool(
+                torch.isfinite(p_dequant).all().item()
+                and torch.isfinite(row_m).all().item()
+                and torch.isfinite(row_l).all().item()
+            ),
+            "p_mean_abs": float(p_delta.mean().item()),
+            "p_max_abs": float(p_delta.max().item()),
+            "p_cosine": float(p_cos.item()),
+            "row_m_max_abs": float(row_m_delta.max().item()),
+            "row_l_max_abs": float(row_l_delta.max().item()),
+        }
+        print(result)
+        return
+    if args.persistent_owner_pv_group_check_only:
+        q_cutlass, q_cutlass_scales, q_cutlass_global = quantize_cutlass(
+            q.reshape(Q_LEN * GROUP, HEAD_DIM)
+        )
+        k_cutlass, k_cutlass_scales, k_cutlass_global = quantize_cutlass(
+            k_ref_f32.to(torch.bfloat16)
+        )
+        v_ref_f32 = nvfp4_rowmajor_to_fp32(v, v_scales)
+        v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = quantize_cutlass(
+            v_ref_f32.T.contiguous().to(torch.bfloat16)
+        )
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        out_group = torch.empty((128, 128), device=device, dtype=torch.float32)
+        p_packed = torch.empty((128, 64), device=device, dtype=torch.uint8)
+        p_scales = torch.empty((128, 8), device=device, dtype=torch.uint8)
+        row_m = torch.empty((128,), device=device, dtype=torch.float32)
+        row_l = torch.empty((128,), device=device, dtype=torch.float32)
+        qk_alpha = 1.0 / (q_cutlass_global * k_cutlass_global)
+        out_group_idx = 0
+        ext.persistent_mainloop_owner_pv_group_stage(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            out_group,
+            p_packed,
+            p_scales,
+            row_m,
+            row_l,
+            workspace,
+            float(qk_alpha.item()),
+            0,
+            0,
+            out_group_idx,
+        )
+        torch.cuda.synchronize()
+
+        pv_alpha = 1.0 / v_pv_cutlass_global
+        group_start = out_group_idx * 128
+        group_stop = group_start + 128
+        full_out = torch.empty((128, HEAD_DIM), device=device, dtype=torch.float32)
+        ext.fused_cutlass_tma_qk_tma_pv_128tile(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            full_out,
+            workspace,
+            float(qk_alpha.item()),
+            float(pv_alpha.item()),
+            0,
+            0,
+        )
+        torch.cuda.synchronize()
+
+        owner_norm = out_group * (
+            pv_alpha / (PROB_GLOBAL_SCALE * torch.clamp(row_l[:, None], min=1.0e-20))
+        )
+        full_ref = full_out[:, group_start:group_stop]
+        full_delta = (owner_norm - full_ref).abs()
+        full_cos = torch.sum(owner_norm * full_ref) / torch.clamp(
+            torch.linalg.vector_norm(owner_norm) * torch.linalg.vector_norm(full_ref),
+            min=1.0e-20,
+        )
+
+        p_dequant = nvfp4_rowmajor_to_fp32(p_packed, p_scales) / PROB_GLOBAL_SCALE
+        p_norm = p_dequant / torch.clamp(row_l[:, None], min=1.0e-20)
+        exact_ref = torch.matmul(
+            p_norm.float(), v_ref_f32[:128, group_start:group_stop].float()
+        )
+        exact_delta = (owner_norm - exact_ref).abs()
+        exact_cos = torch.sum(owner_norm * exact_ref) / torch.clamp(
+            torch.linalg.vector_norm(owner_norm) * torch.linalg.vector_norm(exact_ref),
+            min=1.0e-20,
+        )
+
+        result = {
+            "persistent_owner_pv_group_stage": True,
+            "finite": bool(
+                torch.isfinite(out_group).all().item()
+                and torch.isfinite(p_dequant).all().item()
+                and torch.isfinite(row_m).all().item()
+                and torch.isfinite(row_l).all().item()
+            ),
+            "owner_vs_full_tma_mean_abs": float(full_delta.mean().item()),
+            "owner_vs_full_tma_max_abs": float(full_delta.max().item()),
+            "owner_vs_full_tma_cosine": float(full_cos.item()),
+            "owner_vs_exact_mean_abs": float(exact_delta.mean().item()),
+            "owner_vs_exact_max_abs": float(exact_delta.max().item()),
+            "owner_vs_exact_cosine": float(exact_cos.item()),
+        }
+        print(result)
+        return
+    if args.persistent_owner_full_tile_check_only:
+        q_cutlass, q_cutlass_scales, q_cutlass_global = quantize_cutlass(
+            q.reshape(Q_LEN * GROUP, HEAD_DIM)
+        )
+        k_cutlass, k_cutlass_scales, k_cutlass_global = quantize_cutlass(
+            k_ref_f32.to(torch.bfloat16)
+        )
+        v_ref_f32 = nvfp4_rowmajor_to_fp32(v, v_scales)
+        v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = quantize_cutlass(
+            v_ref_f32.T.contiguous().to(torch.bfloat16)
+        )
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        owner_out = torch.empty((128, HEAD_DIM), device=device, dtype=torch.float32)
+        full_ref = torch.empty_like(owner_out)
+        qk_alpha = 1.0 / (q_cutlass_global * k_cutlass_global)
+        pv_alpha = 1.0 / v_pv_cutlass_global
+        ext.persistent_mainloop_owner_full_tile_stage(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            owner_out,
+            workspace,
+            float(qk_alpha.item()),
+            float(pv_alpha.item()),
+            0,
+            0,
+        )
+        ext.fused_cutlass_tma_qk_tma_pv_128tile(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            full_ref,
+            workspace,
+            float(qk_alpha.item()),
+            float(pv_alpha.item()),
+            0,
+            0,
+        )
+        torch.cuda.synchronize()
+        delta = (owner_out - full_ref).abs()
+        cos = torch.sum(owner_out * full_ref) / torch.clamp(
+            torch.linalg.vector_norm(owner_out) * torch.linalg.vector_norm(full_ref),
+            min=1.0e-20,
+        )
+        result = {
+            "persistent_owner_full_tile_stage": True,
+            "finite": bool(torch.isfinite(owner_out).all().item()),
+            "owner_vs_full_tma_mean_abs": float(delta.mean().item()),
+            "owner_vs_full_tma_max_abs": float(delta.max().item()),
+            "owner_vs_full_tma_cosine": float(cos.item()),
+        }
+        if args.bench:
+            result["bench_persistent_owner_full_tile"] = event_ms(
+                lambda: ext.persistent_mainloop_owner_full_tile_stage(
+                    q_cutlass,
+                    q_cutlass_scales,
+                    k_cutlass,
+                    k_cutlass_scales,
+                    v_pv_cutlass,
+                    v_pv_cutlass_scales,
+                    owner_out,
+                    workspace,
+                    float(qk_alpha.item()),
+                    float(pv_alpha.item()),
+                    0,
+                    0,
+                ),
+                warmup=args.warmup,
+                repeat=args.repeat,
+            )
+            result["bench_existing_full_tma_tile"] = event_ms(
+                lambda: ext.fused_cutlass_tma_qk_tma_pv_128tile(
+                    q_cutlass,
+                    q_cutlass_scales,
+                    k_cutlass,
+                    k_cutlass_scales,
+                    v_pv_cutlass,
+                    v_pv_cutlass_scales,
+                    full_ref,
+                    workspace,
+                    float(qk_alpha.item()),
+                    float(pv_alpha.item()),
+                    0,
+                    0,
+                ),
+                warmup=args.warmup,
+                repeat=args.repeat,
+            )
+        print(result)
+        return
+    if (
+        args.persistent_owner_group_online_check_only
+        or args.persistent_owner_group_online_register_check_only
+        or args.persistent_owner_group_online_register_q_check_only
+    ):
+        if args.persistent_owner_group_online_register_q_check_only:
+            stage_name = "persistent_owner_group_online_register_q_stage"
+            stage_fn = ext.persistent_mainloop_owner_group_online_register_q_stage
+        elif args.persistent_owner_group_online_register_check_only:
+            stage_name = "persistent_owner_group_online_register_stage"
+            stage_fn = ext.persistent_mainloop_owner_group_online_register_stage
+        else:
+            stage_name = "persistent_owner_group_online_stage"
+            stage_fn = ext.persistent_mainloop_owner_group_online_stage
+        num_tiles = args.persistent_owner_online_kv_tiles
+        if num_tiles <= 0 or num_tiles > (k_ref_f32.shape[0] // 128):
+            raise ValueError("--persistent-owner-online-kv-tiles out of range")
+        q_cutlass, q_cutlass_scales, q_cutlass_global = quantize_cutlass(
+            q.reshape(Q_LEN * GROUP, HEAD_DIM)
+        )
+        k_cutlass, k_cutlass_scales, k_cutlass_global = quantize_cutlass(
+            k_ref_f32.to(torch.bfloat16)
+        )
+        v_ref_f32 = nvfp4_rowmajor_to_fp32(v, v_scales)
+        v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = quantize_cutlass(
+            v_ref_f32.T.contiguous().to(torch.bfloat16)
+        )
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        out_group = torch.empty((128, 128), device=device, dtype=torch.float32)
+        qk_alpha = 1.0 / (q_cutlass_global * k_cutlass_global)
+        pv_alpha = 1.0 / v_pv_cutlass_global
+        out_group_idx = 0
+        stage_fn(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            out_group,
+            workspace,
+            float(qk_alpha.item()),
+            float(pv_alpha.item()),
+            0,
+            0,
+            num_tiles,
+            out_group_idx,
+        )
+        torch.cuda.synchronize()
+
+        kv_rows = num_tiles * 128
+        tactic = min(2, int(metadata["runner_tactic_count"]) - 1)
+        qk_ref = torch.empty((128, kv_rows), device=device, dtype=torch.bfloat16)
+        ext.cutlass_runner_fp4_gemm(
+            q_cutlass[:128].contiguous(),
+            k_cutlass[:kv_rows].contiguous(),
+            q_cutlass_scales[:128].contiguous(),
+            k_cutlass_scales[:kv_rows].contiguous(),
+            qk_alpha,
+            qk_ref,
+            workspace,
+            tactic,
+        )
+        torch.cuda.synchronize()
+        probs = torch.softmax(qk_ref.float() / (HEAD_DIM**0.5), dim=-1)
+        group_start = out_group_idx * 128
+        group_stop = group_start + 128
+        exact_ref = torch.matmul(
+            probs.float(), v_ref_f32[:kv_rows, group_start:group_stop].float()
+        )
+        delta = (out_group - exact_ref).abs()
+        cos = torch.sum(out_group * exact_ref) / torch.clamp(
+            torch.linalg.vector_norm(out_group) * torch.linalg.vector_norm(exact_ref),
+            min=1.0e-20,
+        )
+        result = {
+            stage_name: True,
+            "num_kv_tiles": num_tiles,
+            "finite": bool(torch.isfinite(out_group).all().item()),
+            "owner_vs_exact_mean_abs": float(delta.mean().item()),
+            "owner_vs_exact_max_abs": float(delta.max().item()),
+            "owner_vs_exact_cosine": float(cos.item()),
+        }
+        if args.bench:
+            result[f"bench_{stage_name}"] = event_ms(
+                lambda: stage_fn(
+                    q_cutlass,
+                    q_cutlass_scales,
+                    k_cutlass,
+                    k_cutlass_scales,
+                    v_pv_cutlass,
+                    v_pv_cutlass_scales,
+                    out_group,
+                    workspace,
+                    float(qk_alpha.item()),
+                    float(pv_alpha.item()),
+                    0,
+                    0,
+                    num_tiles,
+                    out_group_idx,
+                ),
+                warmup=args.warmup,
+                repeat=args.repeat,
+            )
+        print(result)
+        return
     if args.smem_atom_unit_scales:
         q_scales_actual.fill_(0x38)
         k_scales.fill_(0x38)

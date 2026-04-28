@@ -3800,3 +3800,700 @@ The TMA-QK/TMA-PV scaffold remains useful for validating embedded CUTLASS
 pieces and launch mechanics, but it is not the correctness or performance
 target.
 ```
+
+## Rejected Naive K128 TMA-QK Bridge
+
+2026-04-28T11:44:17-05:00
+
+Tried a direct K128 TMA-QK bridge using `CutlassCollectiveMainloopK128` so QK
+and PV could share the same `128x128x128` tile shape.
+
+Implementation notes:
+
+```text
+- The first compile failed because the global K128 debug kernel was inside the
+  `__CUDA_ARCH__` guard and the host wrapper could not see the symbol.
+- Moving the global launcher outside the device-only guard fixed compilation.
+- Runtime compiled and launched, but the kernel pegged GPU2 at 100% for several
+  minutes with no output and was killed.
+```
+
+Conclusion:
+
+```text
+Do not carry the naive K128 QK bridge forward. K128 TMA-QK cannot be obtained by
+copying the validated K256 QK bridge and changing only the K tile count to four.
+
+Keep the validated K256 QK bridge and K128 PV helper as scaffold components, but
+do not expose a K128 QK benchmark path. The real fused kernel must follow the
+Examples 77/88 persistent-mainloop pattern at CUTLASS/CuTe atom level instead
+of trying to compose or clone cooperative GEMM collectives per tile.
+```
+
+## Persistent-Mainloop Reference Constraints
+
+2026-04-28T11:44:17-05:00
+
+Line-level source review of the required C++ references:
+
+```text
+3rdparty/cutlass/examples/88_hopper_fmha/collective/fmha_collective_tma.hpp
+3rdparty/cutlass/examples/88_hopper_fmha/collective/fmha_collective_softmax.hpp
+3rdparty/cutlass/examples/77_blackwell_fmha/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+include/flashinfer/attention/blackwell/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+```
+
+Implementation facts to carry into the SM120 prototype:
+
+```text
+- Example 88 owns `pipeline`, `pipeline_q`, read/write pipeline states, Q/K/V
+  load states, QK MMA, softmax state, and PV MMA in one `compute()` function.
+- The K/V pipeline is prefilled with alternating K and V loads. The mainloop
+  performs QK on the current K stage, applies online softmax/rescale, then
+  performs PV on the matching V stage without reinitializing pipeline storage.
+- `CollectiveSoftmax::step_interleave_begin()` is the reference for row-max
+  update plus rescaling the running PV accumulator.
+- `CollectiveSoftmax::step_interleave_step()` is the reference for converting
+  the current QK accumulator tile into probabilities while accumulating row
+  sums before PV.
+- The SM100 FlashInfer path uses separate role pipelines for load, MMA, softmax,
+  correction, and epilogue. It is not directly portable to SM120 because it uses
+  TMEM/TCGEN, but it confirms the same ownership rule: pipeline state lives at
+  mainloop scope, not inside repeated helper calls.
+```
+
+Next code rule:
+
+```text
+The next prototype should introduce one dedicated owner kernel/body for Shape B
+that explicitly carries Q/K/V pipeline states, online softmax state, and PV
+accumulator state across the KV loop. It may reuse validated CUTLASS atom/layout
+pieces, but it must not call the existing QK or PV helper as the unit of
+composition inside the KV loop.
+```
+
+SM120 shared-memory budget constraint:
+
+```text
+SM120 opt-in shared memory:                    101376 bytes
+QK 128x128x256 mainloop SharedStorage:          74752 bytes
+PV 128x128x128 mainloop SharedStorage:          74752 bytes
+Independent QK + PV SharedStorage:             149504 bytes
+Independent QK + PV margin vs SM120 opt-in:    -48128 bytes
+```
+
+This rules out a literal D512 port of Example 88 with independent Q, K, and V
+smem regions using the existing CUTLASS collective storage. The SM120 owner
+kernel must either reuse a single storage region phase-by-phase, reduce tile
+footprint, or implement a custom atom-level smem layout that stages only the
+minimal live Q/K/V/P data needed by the interleaved mainloop.
+
+## Persistent Owner Layout Smoke
+
+2026-04-28T11:44:17-05:00
+
+Added `persistent_mainloop_owner_layout_smoke`, a minimal SM120 launch that
+uses the phased single-storage layout intended for the owner mainloop:
+
+```text
+dynamic shared storage: CutlassFusedTmaQkPv128Storage
+storage bytes:          84992
+QK SharedStorage:       74752
+PV K128 SharedStorage:  74752
+QK/PV storage policy:   alias PV K128 storage over the QK storage region
+```
+
+Smoke command:
+
+```bash
+timeout 1200s env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2 TORCH_CUDA_ARCH_LIST=12.0f PYTHONPATH=/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv:/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv/benchmarks /home/josh/tdm/infer/current/.venv/bin/python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py --device 0 --persistent-owner-layout-check-only
+```
+
+Result:
+
+```text
+marker: [1.0, 84992.0, 74752.0, 74752.0, 0.0, 0.0, 0.0, 0.0]
+independent_qk_pv_fits_sm120: false
+independent_qk_pv_smem_margin_bytes: -48128
+```
+
+This is not a performance path yet. It establishes that the next owner kernel
+can launch with one phased storage region and can construct QK and PV pipeline
+objects sequentially on that region. The next implementation step is to move the
+validated QK TMA load/MMA body into this owner body first, then add the PV phase
+without reinitializing helper-level state per KV tile.
+
+## Persistent Owner QK Stage
+
+2026-04-28T11:44:17-05:00
+
+Added `persistent_mainloop_owner_qk_stage`, a real QK TMA load/MMA smoke running
+inside the phased owner storage. This is intentionally the first executable
+piece of the future owner mainloop:
+
+```text
+storage: CutlassFusedTmaQkPv128Storage
+QK phase: 128x128x256 SM120 block-scaled CUTLASS mainloop
+PV phase: not wired yet
+```
+
+Smoke command:
+
+```bash
+timeout 1200s env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2 TORCH_CUDA_ARCH_LIST=12.0f PYTHONPATH=/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv:/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv/benchmarks /home/josh/tdm/infer/current/.venv/bin/python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py --device 0 --persistent-owner-qk-check-only
+```
+
+Result versus the official CUTLASS runner tile:
+
+```text
+finite:   true
+mean_abs: 0.0015516469720751047
+max_abs:  0.015534400939941406
+cosine:   0.9999986290931702
+```
+
+Conclusion:
+
+```text
+The validated TMA QK stage can run correctly inside the phased owner storage.
+The next step is to add owner-controlled softmax/P quantization against this QK
+tile, then add the PV phase using the same owner storage instead of calling the
+old PV helper as the unit of composition.
+```
+
+Regression smoke after adding the owner hooks:
+
+```text
+256-split TMA-QK/TMA-PV fallback remains finite.
+min/max output: -0.004217686131596565 / 0.004578343126922846
+partial_m_finite: true
+partial_l_finite: true
+```
+
+## Persistent Owner Softmax/P-Quant Stage
+
+2026-04-28T11:44:17-05:00
+
+Factored the 128-token tile softmax/P quantization into
+`softmax_quant_scores_128()` and reused it from the existing TMA-QK/TMA-PV
+partial scaffold. Added `persistent_mainloop_owner_softmax_stage`, which runs
+the owner-storage QK stage, writes the QK accumulator tile into owner scratch,
+then computes row max/sum and quantizes unnormalized P to NVFP4.
+
+Smoke command:
+
+```bash
+timeout 1200s env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2 TORCH_CUDA_ARCH_LIST=12.0f PYTHONPATH=/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv:/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv/benchmarks /home/josh/tdm/infer/current/.venv/bin/python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py --device 0 --persistent-owner-softmax-check-only
+```
+
+Result versus the CUTLASS-runner QK reference:
+
+```text
+finite:        true
+p_mean_abs:    0.08929884433746338
+p_max_abs:     0.16704505681991577
+p_cosine:      0.9952029585838318
+row_m_max_abs: 0.000685274600982666
+row_l_max_abs: 0.0724029541015625
+```
+
+Conclusion:
+
+```text
+The owner path now has QK plus owner-controlled softmax/P quantization running
+inside the phased storage policy that fits SM120. The next executable step is a
+single PV output-group stage in the same owner kernel. That PV step should
+inline the relevant CUTLASS K128 TMA/PV logic for one output group instead of
+calling the old full-width PV helper loop as the composition unit.
+```
+
+Regression smoke after factoring `softmax_quant_scores_128()`:
+
+```text
+256-split TMA-QK/TMA-PV fallback remains finite.
+min/max output: -0.004217686131596565 / 0.004578343126922846
+partial_m_finite: true
+partial_l_finite: true
+```
+
+## Persistent Owner PV Group Stage
+
+2026-04-28T12:26:22-05:00
+
+Added `persistent_mainloop_owner_pv_group_stage`, the next executable slice of
+the owner kernel. It runs:
+
+```text
+QK TMA collective tile
+owner softmax/P quantization
+manual P staging into the aliased K128 PV shared storage
+one TMA-V/PV output group
+```
+
+This intentionally validates one 128-column PV group before attempting the full
+512-column output inside the owner body.
+
+Important bug fixed while validating this stage:
+
+```text
+The old TMA-PV helper used `thread_idx` for C-fragment output mapping.
+For Consumer1, that collapsed the thread slice to 0 instead of using
+`mma_thread_idx = threadIdx.x % ThreadCount`.
+```
+
+Observed effect:
+
+```text
+before fix: TMA-PV cosine vs reference ~0.70
+after fix:  TMA-PV cosine vs reference ~0.9946
+```
+
+The same fix was applied to the new one-group PV primitive.
+
+Also corrected the Python check: the CUTLASS runner is not a valid reference for
+owner-produced row-major P scales, and the row-major NVFP4 dequant helper is not
+valid for CUTLASS-layout V scales. The owner PV group is now compared against
+the existing full-width TMA scaffold and an exact P x V reference using the
+original V tensor.
+
+Smoke command:
+
+```bash
+timeout 1200s env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2 TORCH_CUDA_ARCH_LIST=12.0f PYTHONPATH=/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv:/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv/benchmarks /home/josh/tdm/infer/current/.venv/bin/python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py --device 0 --persistent-owner-pv-group-check-only
+```
+
+Result:
+
+```text
+finite:                         true
+owner_vs_full_tma_mean_abs:     1.8463700013349182e-10
+owner_vs_full_tma_max_abs:      7.450580596923828e-09
+owner_vs_full_tma_cosine:       0.9999998807907104
+owner_vs_exact_mean_abs:        0.0016403645277023315
+owner_vs_exact_max_abs:         0.007171541452407837
+owner_vs_exact_cosine:          0.9952133893966675
+```
+
+Regression smokes:
+
+```text
+fused_tma_qk_tma_pv_128_check_only:
+  finite: true
+  mean_abs vs exact: 0.002146251266822219
+  cosine vs exact: 0.9945906400680542
+  tma_vs_smem_mean_abs: 0.0004941504448652267
+
+256-split TMA-QK/TMA-PV fallback:
+  finite: true
+  min/max output: -0.004217686131596565 / 0.005271007772535086
+  partial_m_finite: true
+  partial_l_finite: true
+```
+
+Conclusion:
+
+```text
+The phased owner path now has QK, P quantization, and one correct TMA-PV output
+group running in the same owner kernel. The next implementation step is to
+extend the owner body to all four 128-column PV groups, then replace the
+per-128-token partial scaffold with an owner-controlled full 128x512 tile.
+```
+
+## Persistent Owner Full-Tile Stage
+
+2026-04-28T12:31:12-05:00
+
+Added `persistent_mainloop_owner_full_tile_stage`, which expands the one-group
+owner stage to all four 128-column PV groups and normalizes the 128x512 output
+inside the kernel:
+
+```text
+QK TMA collective tile
+owner softmax/P quantization
+manual P staging into aliased K128 PV storage once
+TMA-V/PV group 0
+TMA-V/PV group 1
+TMA-V/PV group 2
+TMA-V/PV group 3
+row_l normalization
+```
+
+Smoke command:
+
+```bash
+timeout 1200s env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2 TORCH_CUDA_ARCH_LIST=12.0f PYTHONPATH=/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv:/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv/benchmarks /home/josh/tdm/infer/current/.venv/bin/python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py --device 0 --persistent-owner-full-tile-check-only
+```
+
+Result versus the existing full-width TMA scaffold:
+
+```text
+finite:                    true
+owner_vs_full_tma_mean_abs: 0.0
+owner_vs_full_tma_max_abs:  0.0
+owner_vs_full_tma_cosine:   1.0
+```
+
+Per-tile timing command:
+
+```bash
+timeout 1200s env PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2 TORCH_CUDA_ARCH_LIST=12.0f PYTHONPATH=/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv:/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv/benchmarks /home/josh/tdm/infer/current/.venv/bin/python benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py --device 0 --persistent-owner-full-tile-check-only --bench --warmup 10 --repeat 50
+```
+
+Timing result:
+
+```text
+persistent_owner_full_tile min/mean/max ms: 0.075936 / 0.078143 / 0.083296
+existing_full_tma_tile     min/mean/max ms: 0.075456 / 0.076749 / 0.078496
+```
+
+Conclusion:
+
+```text
+The owner body now reproduces the helper-based 128x512 tile exactly. It is not
+faster yet because it still reuses the same per-output-group PV pipeline and
+does not persist pipeline state across KV tiles. The correctness baseline is now
+clean enough to start replacing the 256 independent partial CTAs with an
+owner-controlled multi-KV-tile mainloop.
+```
+
+## Reference Mainloop Notes For Multi-KV Owner
+
+2026-04-28T12:32:29-05:00
+
+Line-level review of the requested references:
+
+```text
+3rdparty/cutlass/examples/88_hopper_fmha/collective/fmha_collective_tma.hpp
+```
+
+Key structure:
+
+```text
+LoadQ once.
+Prime alternating K/V TMA pipeline.
+Allocate acc_pv once.
+For each KV tile:
+  QK MMA into acc_qk.
+  online softmax step updates row max/sum and rescales acc_pv.
+  convert softmaxed QK tile into PV A operand layout.
+  PV MMA accumulates into the persistent acc_pv fragment.
+Tail normalizes acc_pv by final row sums.
+```
+
+Important implementation point:
+
+```text
+The persistent win comes from keeping `acc_pv` live across KV tiles and applying
+online-softmax rescale before each PV contribution. It is not achieved by
+launching one helper-call-per-KV-tile and reducing global partials later.
+```
+
+```text
+3rdparty/cutlass/examples/77_blackwell_fmha/collective/sm100_fmha_load_tma_warpspecialized.hpp
+```
+
+Key structure:
+
+```text
+The producer issues Q1, K1, Q2, V1, then alternates Ki/Vi through one KV
+pipeline. This is the producer-side template for the SM120 owner kernel: keep
+one persistent KV pipeline and alternate K/V stages instead of constructing a
+fresh CUTLASS mainloop pipeline for every tile.
+```
+
+```text
+3rdparty/cutlass/examples/77_blackwell_fmha/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp
+```
+
+Key structure:
+
+```text
+The consumer side waits K, computes QK into S, softmax/correction owns S/P, waits
+V, then computes PV into O. It keeps O state live and applies correction/rescale
+as row max changes.
+```
+
+SM120 consequence:
+
+```text
+The next real prototype should be a one-output-group persistent owner kernel,
+not a full-head four-group kernel. A single group can keep its 128-column
+`acc_pv` live across KV tiles. A full 512-column head would require four PV
+accumulator groups live at once or HBM round-tripping; neither is the first
+target. The price of one-output-group CTAs is recomputing QK per group, which
+must be measured against avoiding QK/P HBM traffic.
+```
+
+## Owner Online Group Prototype
+
+2026-04-28T12:47:58-05:00
+
+Added `persistent_mainloop_owner_group_online_stage`, a one-output-group online
+prototype:
+
+```text
+for each KV tile:
+  QK TMA collective tile
+  softmax/P quantization for the 128-column tile
+  online row max/sum update
+  PV TMA-V group accumulation into one 128-column output group
+normalize the output group by final row sums
+```
+
+This is a correctness and state-management bridge, not the final performance
+path. It still calls the existing QK and PV helper bodies once per KV tile, so
+it reinitializes helper-local pipeline state repeatedly. The shipping direction
+remains a CUTLASS Example 77/88-style persistent mainloop where the Q load, K/V
+pipeline state, softmax state, and PV accumulator live across the full KV loop.
+
+Launch/register finding:
+
+```text
+without targeted launch bounds:
+  persistent_mainloop_owner_group_online_stage_kernel: 192 regs/thread
+  launch result: cudaErrorLaunchOutOfResources
+
+with __launch_bounds__(384, 1):
+  persistent_mainloop_owner_group_online_stage_kernel: 154 regs/thread, 0 stack
+  persistent_mainloop_owner_full_tile_stage_kernel:    148 regs/thread, 0 stack
+```
+
+Online-group smoke results against exact softmax(QK) @ V for output group 0:
+
+```text
+num_kv_tiles=2: mean_abs 0.0018509341, max_abs 0.0096779848, cosine 0.9871958, ~0.068 ms
+num_kv_tiles=4: mean_abs 0.0012544346, max_abs 0.0070589883, cosine 0.9887136, ~0.109 ms
+num_kv_tiles=8: mean_abs 0.0008975492, max_abs 0.0048882170, cosine 0.9882689, ~0.193 ms
+```
+
+Conclusion:
+
+```text
+The online row-rescale + PV accumulation math is viable and launches without a
+global maxrregcount cap. The current helper-loop implementation is expected to
+scale poorly to the full q=512/kv=32768 cell because it rebuilds the QK/PV
+collective machinery for every KV tile. The next implementation step is not
+more threshold or swizzle tuning; it is replacing the helper-loop body with a
+single persistent mainloop based on the CUTLASS Example 77/88 structure.
+```
+
+## Register-Accumulating Owner Prototype
+
+2026-04-28T13:18:26-05:00
+
+Attempted a one-output-group register-accumulating variant:
+
+```text
+keep PV accumulator fragment live in registers
+scale old accumulator rows by online old_scale
+stage P into the PV A operand layout
+run a copied no-clear SM120 PV MMA body
+write output group once at the end
+```
+
+The first implementation baked `pv_alpha / PROB_GLOBAL_SCALE` into the P scale
+sidecar. That underflowed/over-quantized the e4m3 scale path:
+
+```text
+num_kv_tiles=1: mean_abs 0.0169163, max_abs 0.0617323, cosine 0.0
+```
+
+Moving the constant scale to final FP32 writeback and leaving tile 0 P scales
+unchanged fixed the one-tile result:
+
+```text
+num_kv_tiles=1: mean_abs 0.00253876, max_abs 0.0140011, cosine 0.989603, ~0.049 ms
+```
+
+However, repeated helper reentry is not safe:
+
+```text
+num_kv_tiles=2: deadlocks / runs indefinitely with GPU at 100%
+```
+
+Adding an explicit consumer named barrier after the copied no-clear MMA did not
+fix the multi-tile deadlock. The register-accumulating helper-loop path is now
+guarded to `num_kv_tiles == 1` so it cannot accidentally hang benchmark runs.
+
+Conclusion:
+
+```text
+The no-clear PV MMA can reproduce the one-tile PV result, but trying to stitch
+multiple helper invocations together still fights the CUTLASS collective
+pipeline lifetime. This confirms the prior direction: the real implementation
+must be one persistent mainloop with one Q/K/V pipeline lifetime, not repeated
+construction and teardown of helper-local collectives.
+```
+
+## Register-Accumulating Owner Prototype: Dedicated PV Pipeline Storage
+
+2026-04-28T14:09:00-05:00
+
+The multi-tile deadlock was caused by unsafe reuse of the aliased QK collective
+storage for PV helper pipeline state across repeated helper invocations. Adding
+a dedicated PV pipeline-storage sidecar to the owner storage fixed the repeated
+reentry hang while still fitting SM120 shared memory:
+
+```text
+SM120 opt-in shared memory:       101376 bytes
+owner phased storage with PV pipe: 88064 bytes
+QK SharedStorage:                 74752 bytes
+PV K128 SharedStorage:            74752 bytes
+independent QK + PV storage:     149504 bytes (does not fit)
+```
+
+Register-accumulating helper-loop results against exact softmax(QK) @ V for
+output group 0:
+
+```text
+num_kv_tiles=2:  mean_abs 0.0018606472, max_abs 0.0094464933, cosine 0.9871230, min 0.067136 ms
+num_kv_tiles=4:  mean_abs 0.0012737792, max_abs 0.0071084099, cosine 0.9885631, min 0.108000 ms
+num_kv_tiles=8:  mean_abs 0.0009108213, max_abs 0.0049337139, cosine 0.9880465, min 0.185088 ms
+num_kv_tiles=16: mean_abs 0.0006633630, max_abs 0.0035498557, cosine 0.9885939, min 0.343168 ms
+num_kv_tiles=32: mean_abs 0.0004634701, max_abs 0.0023278608, cosine 0.9893481, min 0.661696 ms
+num_kv_tiles=64: mean_abs 0.0003213732, max_abs 0.0015640703, cosine 0.9890051, min 1.296544 ms
+```
+
+Interpretation:
+
+```text
+The register accumulator is now a correct multi-tile bridge and avoids the
+global read/modify/write used by the earlier helper-loop path. It is still
+nearly linear in KV tiles because every tile reconstructs helper-local QK and
+PV collective state. Extrapolating 64 -> 256 tiles gives roughly 5.2 ms for one
+output group at kv=32768, far above the 0.634 ms two-stage CUTLASS reference.
+
+This closes the helper-loop line of work. The next implementation must be a
+single CUTLASS Example 77/88-style persistent mainloop: persistent Q/K/V
+pipeline state, QK MMA, online softmax + P quantization, and PV MMA in one
+kernel body, without helper reconstruction per KV tile.
+```
+
+## Persistent PV Pipeline Inside Register Owner
+
+2026-04-28T14:41:00-05:00
+
+Changed the register-owner prototype so the PV TMA pipeline object and
+read/write pipeline states live across the KV loop instead of being reconstructed
+for every tile. The first attempt staged P only into shared-memory stage 0 while
+the persistent pipeline rotated stages, which produced the expected wrong-stage
+failure:
+
+```text
+num_kv_tiles=2: mean_abs 0.0085940678, max_abs 0.0336251892, cosine 0.6582672
+```
+
+Fix: stage P and P scales into `tile % PvPipeline::Stages`, matching the V TMA
+stage consumed by the PV MMA. Correctness returned to the prior level.
+
+Timings after persistent PV pipeline:
+
+```text
+num_kv_tiles=2:   mean_abs 0.0018606472, max_abs 0.0094464933, cosine 0.9871230, min 0.065888 ms
+num_kv_tiles=8:   mean_abs 0.0009108213, max_abs 0.0049337139, cosine 0.9880465, min 0.180960 ms
+num_kv_tiles=32:  mean_abs 0.0004634701, max_abs 0.0023278608, cosine 0.9893481, min 0.636640 ms
+num_kv_tiles=64:  mean_abs 0.0003213732, max_abs 0.0015640703, cosine 0.9890051, min 1.246272 ms
+num_kv_tiles=256: mean_abs 0.0001594797, max_abs 0.0008670320, cosine 0.9926619, min 4.907872 ms
+```
+
+Interpretation:
+
+```text
+Keeping PV pipeline state alive removes a small fixed/reconstruction cost:
+64 tiles improved from 1.296544 ms to 1.246272 ms. This is useful evidence but
+not close to the 0.634 ms two-stage reference. The dominant remaining cost is
+the QK helper-loop structure: it reloads/rebuilds QK for every KV tile, and the
+one-output-group CTA policy would repeat QK once per 128-column output group.
+
+Next target: split the QK collective load path so Q is loaded once per Q tile
+and K is streamed across KV tiles with persistent pipeline state, matching the
+Example 88 separate-Q and K/V pipeline structure.
+```
+
+## Rejected: QK K-Only Reuse With Aliased PV Storage
+
+2026-04-28T15:05:00-05:00
+
+Attempted to make tile 0 load Q/K normally, then reuse resident Q/SFA and load
+only K/SFB on later KV tiles. This gave a small timing win:
+
+```text
+num_kv_tiles=32: 0.636640 ms -> 0.623264 ms
+num_kv_tiles=256: 4.907872 ms -> 4.784288 ms
+```
+
+But it is not a valid implementation in the current owner-storage layout.
+`owner_storage.qk` is deliberately aliased as the PV shared storage; after each
+QK tile, PV staging writes P into `smem_A` and P scales into `smem_SFA`. That
+overwrites the Q/SFA stages the K-only QK path tries to reuse. The correctness
+drop is visible:
+
+```text
+num_kv_tiles=2: cosine 0.9871230 -> 0.9843483
+num_kv_tiles=8: cosine 0.9880465 -> 0.9812438
+num_kv_tiles=32: cosine 0.9893481 -> 0.9808549
+num_kv_tiles=256: cosine 0.9926619 -> 0.9863577
+```
+
+A resident Q/SFA sidecar also does not fit SM120 shared memory with the current
+tile shape:
+
+```text
+owner storage with aliased QK/PV: 88064 bytes
+Q/SFA sidecar estimate:          36864 bytes
+combined:                       124928 bytes
+SM120 opt-in limit:             101376 bytes
+```
+
+Conclusion:
+
+```text
+Do not retry K-only QK reuse while PV aliases QK tensor storage. Correct Q reuse
+requires a different mainloop layout: either a smaller QK/PV tile shape that
+leaves room for resident Q/SFA, or an Example 88-style layout with separate Q
+pipeline storage designed from the start.
+```
+
+## Pivot: Register-Resident Q Is The Active Path
+
+2026-04-28T15:24:00-05:00
+
+The active path is not tile-shape sweeping or split-KV reduction. Those are
+sideways moves against already-measured ceilings:
+
+```text
+tile-shape sidecar: tries to make smem-resident Q fit, but still avoids the
+                    canonical FA mainloop structure.
+split-KV reduction: returns to the partial-output HBM round-trip path that
+                    measured around 4-5 ms, far above the 0.634 ms target.
+```
+
+The canonical path from CUTLASS Examples 77/88 and FlashInfer's SM100 FMHA is
+register-resident Q:
+
+```text
+load Q once -> partition into MMA A register fragments -> keep those fragments
+live across the KV loop -> alias Q smem for P/V staging -> stream K/V tiles.
+```
+
+This is the only path that simultaneously avoids Q reload and avoids the SM120
+shared-memory budget conflict. The current prototype still calls the full QK
+collective once per KV tile, so it cannot reach the two-stage CUTLASS ceiling.
+The next implementation step is to replace that full helper call with an
+atom-level QK mainloop that owns the Q register fragments across KV tiles.
+
+Resource note after adding the persistent PV pipeline:
+
+```text
+persistent_mainloop_owner_group_online_register_stage_kernel:
+  REG 168, STACK 232, SHARED 1024 static
+persistent_mainloop_owner_group_online_stage_kernel:
+  REG 154, STACK 0,   SHARED 1024 static
+persistent_mainloop_owner_full_tile_stage_kernel:
+  REG 148, STACK 0,   SHARED 1024 static
+```
+
+The persistent PV pipeline introduced stack and increased register use, but the
+kernel is still below the 255-register architectural ceiling. The stack should
+not ship, but it does not change the conclusion: the next useful work is
+register-resident Q, not more helper-loop tuning.

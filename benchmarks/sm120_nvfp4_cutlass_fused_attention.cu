@@ -199,11 +199,20 @@ struct CutlassFusedOneTileStorageK128 {
 
 struct CutlassFusedTmaQkPv128Storage {
   alignas(128) typename CutlassCollectiveMainloop::SharedStorage qk;
+  alignas(16) typename CutlassCollectiveMainloopK128::PipelineStorage
+      pv_pipeline_storage;
   alignas(16) uint8_t p_packed[kCutlassTileM * (kCutlassTileK128 / 2)];
   alignas(16) uint8_t p_scales[kCutlassTileM * (kCutlassTileK128 / 16)];
   alignas(16) float row_m[kCutlassTileM];
   alignas(16) float row_l[kCutlassTileM];
+  alignas(16) float global_m[kCutlassTileM];
+  alignas(16) float global_l[kCutlassTileM];
+  alignas(16) float old_scale[kCutlassTileM];
+  alignas(16) float tile_scale[kCutlassTileM];
 };
+
+static_assert(sizeof(CutlassFusedTmaQkPv128Storage) <= (99u << 10),
+              "phased QK/PV owner storage must fit SM120 opt-in shared memory");
 
 __device__ __forceinline__ bool finite_f32(float x) {
   return x == x && fabsf(x) != INFINITY;
@@ -2739,9 +2748,10 @@ __device__ __forceinline__ void cutlass_smem_pv_k128_reuse_p_tma_v_full_width_bo
                      shared.tensors, pv_params.mainloop);
       collective.mma_tail(pipeline, pipe_read, 1);
 
+      auto output_thread_mma = tiled_mma.get_thread_slice(mma_thread_idx);
       auto cC = cute::make_identity_tensor(
           cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
-      auto tCcC = thread_mma.partition_C(cC);
+      auto tCcC = output_thread_mma.partition_C(cC);
       const int out_col_base = out_group * kCutlassTileN;
       for (int i = 0; i < cute::size(accum); ++i) {
         auto coord = tCcC(i);
@@ -2754,6 +2764,702 @@ __device__ __forceinline__ void cutlass_smem_pv_k128_reuse_p_tma_v_full_width_bo
     }
     __syncthreads();
   }
+}
+
+__device__ __forceinline__ void cutlass_smem_pv_k128_stage_p_body(
+    typename CutlassCollectiveMainloopK128::SharedStorage& shared,
+    const uint8_t* p_packed,
+    const uint8_t* p_scales,
+    const float* row_scale = nullptr,
+    float base_scale = 1.0f,
+    int smem_stage = 0) {
+  using cute::_;
+
+  const int block_thread_idx = int(threadIdx.x);
+  const bool mma_thread_active =
+      block_thread_idx < CutlassCollectiveMainloopK128::ThreadCount;
+  const int thread_idx = mma_thread_active ? block_thread_idx : 0;
+
+  CutlassCollectiveMainloopK128 collective;
+  auto tiled_mma = typename CutlassCollectiveMainloopK128::TiledMma{};
+  auto sA = cute::make_tensor(cute::make_smem_ptr(shared.tensors.smem_A.begin()),
+                              typename CutlassCollectiveMainloopK128::SmemLayoutA{});
+  auto sSFA = cute::make_tensor(
+      cute::make_smem_ptr(shared.tensors.smem_SFA.begin()),
+      typename CutlassCollectiveMainloopK128::SmemLayoutSFA{});
+
+  auto smem_tiled_copy_A = cute::make_tiled_copy_A(
+      typename CutlassCollectiveMainloopK128::SmemCopyAtomA{}, tiled_mma);
+  auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(thread_idx);
+  auto cA = cute::make_identity_tensor(
+      cute::make_shape(cute::Int<kCutlassTileM>{},
+                       cute::Int<kCutlassTileK128>{}, cute::Int<1>{}));
+  auto tAsA_prod = smem_thr_copy_A.partition_D(sA);
+  auto tAcA_prod = smem_thr_copy_A.partition_D(cA);
+
+  auto write_partitioned_fp4 = [&](auto tDst,
+                                   auto tCoord,
+                                   const uint8_t* packed,
+                                   int source_row_base,
+                                   int source_col_base,
+                                   int packed_cols) {
+    for (int i = 0; i < int(cute::size(tDst)); ++i) {
+      auto coord = tCoord(i);
+      const int row = int(cute::get<0>(coord));
+      const int k = int(cute::get<1>(coord));
+      const int source_col = source_col_base + k;
+      const uint8_t byte =
+          packed[(source_row_base + row) * packed_cols + (source_col >> 1)];
+      const uint8_t code =
+          static_cast<uint8_t>((source_col & 1) ? ((byte >> 4) & 0x0f)
+                                                : (byte & 0x0f));
+      tDst(i) = cute::uint4_t(code);
+    }
+  };
+
+  uint8_t* smem_a_bytes = cute::recast_ptr<uint8_t>(shared.tensors.smem_A.begin());
+  constexpr int kSmemABytes =
+      (cute::cosize_v<typename CutlassCollectiveMainloopK128::SmemLayoutA> + 1) /
+      2;
+  for (int idx = block_thread_idx; idx < kSmemABytes; idx += blockDim.x) {
+    smem_a_bytes[idx] = 0;
+  }
+  __syncthreads();
+
+  auto K_BLOCK_MAX_PROD = cute::size<2>(tAsA_prod);
+  if (mma_thread_active) {
+    cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{}, [&](auto k_block) {
+      write_partitioned_fp4(tAsA_prod(_, _, k_block, smem_stage),
+                            tAcA_prod(_, _, k_block, cute::Int<0>{}),
+                            p_packed, 0, 0, kCutlassTileK128 / 2);
+    });
+  }
+
+  for (int idx = block_thread_idx;
+       idx < kCutlassTileM * kCutlassTileK128 / 2;
+       idx += blockDim.x) {
+    const int row = idx / (kCutlassTileK128 / 2);
+    const int packed_k = idx - row * (kCutlassTileK128 / 2);
+    const int k0 = 2 * packed_k;
+    const int scale_col = k0 >> 4;
+    uint8_t scale_byte = p_scales[row * (kCutlassTileK128 / 16) + scale_col];
+    if (row_scale != nullptr) {
+      const float scale =
+          e4m3_byte_to_fp32(scale_byte) * row_scale[row] * base_scale;
+      scale_byte = fp32_to_e4m3_byte(scale);
+    }
+    sSFA(row, k0, smem_stage) = make_ue4m3_raw(scale_byte);
+  }
+  __syncthreads();
+}
+
+template <class FrgTensorC>
+__device__ __forceinline__ void cutlass_smem_pv_k128_scale_or_clear_accum(
+    FrgTensorC& accum,
+    const float* row_scale,
+    int mma_thread_idx,
+    int clear_accum) {
+  auto tiled_mma = typename CutlassCollectiveMainloopK128::TiledMma{};
+  auto thread_mma = tiled_mma.get_thread_slice(mma_thread_idx);
+  auto cC = cute::make_identity_tensor(
+      cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+  auto tCcC = thread_mma.partition_C(cC);
+  for (int i = 0; i < cute::size(accum); ++i) {
+    if (clear_accum != 0) {
+      accum(i) = 0.0f;
+      continue;
+    }
+    auto coord = tCcC(i);
+    const int row = int(cute::get<0>(coord));
+    if (row < kCutlassTileM) {
+      accum(i) *= row_scale[row];
+    }
+  }
+}
+
+template <class FrgTensorC>
+__device__ __forceinline__ void cutlass_smem_pv_k128_mma_no_clear(
+    typename CutlassCollectiveMainloopK128::MainloopPipeline pipeline,
+    typename CutlassCollectiveMainloopK128::PipelineState& smem_pipe_read,
+    FrgTensorC& accum,
+    int k_tile_count,
+    int thread_idx,
+    typename CutlassCollectiveMainloopK128::TensorStorage& shared_tensors) {
+  using namespace cute;
+
+  Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()),
+                          typename CutlassCollectiveMainloopK128::SmemLayoutA{});
+  Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()),
+                          typename CutlassCollectiveMainloopK128::SmemLayoutB{});
+  Tensor sSFA = make_tensor(
+      make_smem_ptr(shared_tensors.smem_SFA.begin()),
+      typename CutlassCollectiveMainloopK128::SmemLayoutSFA{});
+  Tensor sSFB = make_tensor(
+      make_smem_ptr(shared_tensors.smem_SFB.begin()),
+      typename CutlassCollectiveMainloopK128::SmemLayoutSFB{});
+
+  auto tiled_mma = typename CutlassCollectiveMainloopK128::TiledMma{};
+  CutlassCollectiveMainloopK128 collective;
+  auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+
+  Tensor tCrA = thread_mma.partition_fragment_A(sA(_, _, Int<0>{}));
+  Tensor tCrB = thread_mma.partition_fragment_B(sB(_, _, Int<0>{}));
+  Tensor tCrSFA =
+      collective.partition_fragment_SFA(sSFA(_, _, Int<0>{}), thread_mma);
+  Tensor tCrSFB =
+      collective.partition_fragment_SFB(sSFB(_, _, Int<0>{}), thread_mma);
+
+  auto smem_tiled_copy_A = make_tiled_copy_A(
+      typename CutlassCollectiveMainloopK128::SmemCopyAtomA{}, tiled_mma);
+  auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(thread_idx);
+  Tensor tCsA = smem_thr_copy_A.partition_S(
+      as_position_independent_swizzle_tensor(sA));
+  Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+
+  auto smem_tiled_copy_B = make_tiled_copy_B(
+      typename CutlassCollectiveMainloopK128::SmemCopyAtomB{}, tiled_mma);
+  auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx);
+  Tensor tCsB = smem_thr_copy_B.partition_S(
+      as_position_independent_swizzle_tensor(sB));
+  Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+
+  auto tile_shape_mnk = tile_shape(tiled_mma);
+  auto smem_tiled_copy_SFA = make_tiled_copy_impl(
+      typename CutlassCollectiveMainloopK128::SmemCopyAtomSFA{},
+      collective.get_layoutSFA_TV(tiled_mma),
+      make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+  auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
+  Tensor tCsSFA = smem_thr_copy_SFA.partition_S(
+      as_position_independent_swizzle_tensor(sSFA));
+  Tensor tCrSFA_copy_view = smem_thr_copy_SFA.retile_D(tCrSFA);
+
+  auto smem_tiled_copy_SFB = make_tiled_copy_impl(
+      typename CutlassCollectiveMainloopK128::SmemCopyAtomSFB{},
+      collective.get_layoutSFB_TV(tiled_mma),
+      make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+  auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
+  Tensor tCsSFB = smem_thr_copy_SFB.partition_S(
+      as_position_independent_swizzle_tensor(sSFB));
+  Tensor tCrSFB_copy_view = smem_thr_copy_SFB.retile_D(tCrSFB);
+
+  auto K_BLOCK_MAX = size<2>(tCrA);
+  int read_stage = smem_pipe_read.index();
+  auto tCsA_stage = tCsA(_, _, _, read_stage);
+  auto tCsB_stage = tCsB(_, _, _, read_stage);
+  auto tCsSFA_stage = tCsSFA(_, _, _, read_stage);
+  auto tCsSFB_stage = tCsSFB(_, _, _, read_stage);
+
+  auto copy_kblock = [&](auto k_block) {
+    copy(smem_tiled_copy_A, tCsA_stage(_, _, k_block),
+         tCrA_copy_view(_, _, k_block));
+    copy(smem_tiled_copy_B, tCsB_stage(_, _, k_block),
+         tCrB_copy_view(_, _, k_block));
+    using MMAOp = typename CutlassCollectiveMainloopK128::TiledMma::MMA_Op;
+    fp4_shift_A(MMAOp{}, tCrA_copy_view(_, _, k_block));
+    fp4_shift_B(MMAOp{}, tCrB_copy_view(_, _, k_block));
+    copy(tCsSFA_stage(_, _, k_block), tCrSFA_copy_view(_, _, k_block));
+    copy(tCsSFB_stage(_, _, k_block), tCrSFB_copy_view(_, _, k_block));
+  };
+
+  auto gemm_kblock = [&](auto k_block) {
+    cute::gemm(tiled_mma,
+               make_zip_tensor(tCrA(_, _, k_block), tCrSFA(_, _, k_block)),
+               make_zip_tensor(tCrB(_, _, k_block), tCrSFB(_, _, k_block)),
+               accum);
+  };
+
+  pipeline.consumer_wait(smem_pipe_read);
+  copy_kblock(_0{});
+
+  CUTLASS_PRAGMA_NO_UNROLL
+  for (; k_tile_count > 1; --k_tile_count) {
+    for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+      auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+      if (k_block == K_BLOCK_MAX - 1) {
+        cutlass::arch::NamedBarrier::sync(
+            thr_size(tiled_mma),
+            cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+        pipeline.consumer_release(smem_pipe_read);
+        ++smem_pipe_read;
+        read_stage = smem_pipe_read.index();
+        tCsA_stage = tCsA(_, _, _, read_stage);
+        tCsB_stage = tCsB(_, _, _, read_stage);
+        tCsSFA_stage = tCsSFA(_, _, _, read_stage);
+        tCsSFB_stage = tCsSFB(_, _, _, read_stage);
+        pipeline.consumer_wait(smem_pipe_read);
+      }
+      copy_kblock(k_block_next);
+      gemm_kblock(k_block);
+    });
+  }
+
+  for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+    auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+    if (k_block == K_BLOCK_MAX - 1) {
+      cutlass::arch::NamedBarrier::sync(
+          thr_size(tiled_mma),
+          cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+      pipeline.consumer_release(smem_pipe_read);
+      ++smem_pipe_read;
+    }
+    if (k_block_next > 0) {
+      copy_kblock(k_block_next);
+    }
+    gemm_kblock(k_block);
+  });
+
+  cutlass::arch::NamedBarrier::sync(
+      thr_size(tiled_mma),
+      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+}
+
+template <class FrgTensorA, class FrgTensorSFA, class FrgTensorC>
+__device__ __forceinline__ void cutlass_qk_tma_k_mma_register_q_stage(
+    typename CutlassCollectiveMainloop::MainloopPipeline pipeline,
+    typename CutlassCollectiveMainloop::PipelineState& smem_pipe_read,
+    FrgTensorA const& q_frag,
+    FrgTensorSFA const& q_scale_frag,
+    FrgTensorC& accum,
+    int thread_idx,
+    typename CutlassCollectiveMainloop::TensorStorage& shared_tensors) {
+  using namespace cute;
+
+  Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()),
+                          typename CutlassCollectiveMainloop::SmemLayoutB{});
+  Tensor sSFB = make_tensor(
+      make_smem_ptr(shared_tensors.smem_SFB.begin()),
+      typename CutlassCollectiveMainloop::SmemLayoutSFB{});
+
+  auto tiled_mma = typename CutlassCollectiveMainloop::TiledMma{};
+  CutlassCollectiveMainloop collective;
+  auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+
+  Tensor tCrB = thread_mma.partition_fragment_B(sB(_, _, Int<0>{}));
+  Tensor tCrSFB =
+      collective.partition_fragment_SFB(sSFB(_, _, Int<0>{}), thread_mma);
+
+  auto smem_tiled_copy_B = make_tiled_copy_B(
+      typename CutlassCollectiveMainloop::SmemCopyAtomB{}, tiled_mma);
+  auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx);
+  Tensor tCsB = smem_thr_copy_B.partition_S(
+      as_position_independent_swizzle_tensor(sB));
+  Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+
+  auto tile_shape_mnk = tile_shape(tiled_mma);
+  auto smem_tiled_copy_SFB = make_tiled_copy_impl(
+      typename CutlassCollectiveMainloop::SmemCopyAtomSFB{},
+      collective.get_layoutSFB_TV(tiled_mma),
+      make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+  auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
+  Tensor tCsSFB = smem_thr_copy_SFB.partition_S(
+      as_position_independent_swizzle_tensor(sSFB));
+  Tensor tCrSFB_copy_view = smem_thr_copy_SFB.retile_D(tCrSFB);
+
+  auto K_BLOCK_MAX = size<2>(q_frag);
+  int read_stage = smem_pipe_read.index();
+  auto tCsB_stage = tCsB(_, _, _, read_stage);
+  auto tCsSFB_stage = tCsSFB(_, _, _, read_stage);
+
+  auto copy_kblock = [&](auto k_block) {
+    copy(smem_tiled_copy_B, tCsB_stage(_, _, k_block),
+         tCrB_copy_view(_, _, k_block));
+    using MMAOp = typename CutlassCollectiveMainloop::TiledMma::MMA_Op;
+    fp4_shift_B(MMAOp{}, tCrB_copy_view(_, _, k_block));
+    copy(tCsSFB_stage(_, _, k_block), tCrSFB_copy_view(_, _, k_block));
+  };
+
+  auto gemm_kblock = [&](auto k_block) {
+    cute::gemm(tiled_mma,
+               make_zip_tensor(q_frag(_, _, k_block),
+                               q_scale_frag(_, _, k_block)),
+               make_zip_tensor(tCrB(_, _, k_block),
+                               tCrSFB(_, _, k_block)),
+               accum);
+  };
+
+  pipeline.consumer_wait(smem_pipe_read);
+  copy_kblock(_0{});
+
+  for_each(make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+    auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+    if (k_block == K_BLOCK_MAX - 1) {
+      cutlass::arch::NamedBarrier::sync(
+          thr_size(tiled_mma),
+          cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+      pipeline.consumer_release(smem_pipe_read);
+      ++smem_pipe_read;
+    }
+    if (k_block_next > 0) {
+      copy_kblock(k_block_next);
+    }
+    gemm_kblock(k_block);
+  });
+
+  cutlass::arch::NamedBarrier::sync(
+      thr_size(tiled_mma),
+      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+}
+
+__device__ __forceinline__ void cutlass_smem_pv_k128_tma_v_group_body(
+    typename CutlassGemmKernelK128::Params const& pv_params,
+    typename CutlassCollectiveMainloopK128::SharedStorage& shared,
+    float* out,
+    int out_stride,
+    int out_col_base,
+    int out_group,
+    int kv_tile_128,
+    const float* old_scale = nullptr,
+    const float* tile_scale = nullptr,
+    float output_scale = 1.0f,
+    int accumulate = 0) {
+  using cute::_;
+
+  const int block_thread_idx = int(threadIdx.x);
+  const int thread_idx =
+      block_thread_idx < CutlassCollectiveMainloopK128::ThreadCount
+          ? block_thread_idx
+          : 0;
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int warp_idx_in_warp_group = warp_idx % cutlass::NumWarpsPerWarpGroup;
+  const int warp_group_thread_idx =
+      block_thread_idx % cutlass::NumThreadsPerWarpGroup;
+  const int mma_thread_idx =
+      block_thread_idx % CutlassCollectiveMainloopK128::ThreadCount;
+  const bool lane_predicate = cute::elect_one_sync();
+
+  enum class WarpGroupRole {
+    Producer = 0,
+    Consumer0 = 1,
+    Consumer1 = 2,
+  };
+  enum class ProducerWarpRole {
+    Mainloop = 0,
+    Warp1 = 1,
+    Epilogue = 2,
+    MainloopAux = 3,
+  };
+
+  auto warp_group_role = WarpGroupRole(cutlass::canonical_warp_group_idx());
+  auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
+
+  CutlassCollectiveMainloopK128 collective;
+  auto sB = cute::make_tensor(cute::make_smem_ptr(shared.tensors.smem_B.begin()),
+                              typename CutlassCollectiveMainloopK128::SmemLayoutB{});
+  auto sSFB = cute::make_tensor(
+      cute::make_smem_ptr(shared.tensors.smem_SFB.begin()),
+      typename CutlassCollectiveMainloopK128::SmemLayoutSFB{});
+
+  if (warp_idx == 0 && lane_predicate) {
+    CutlassCollectiveMainloopK128::prefetch_tma_descriptors(
+        pv_params.mainloop);
+  }
+  __syncthreads();
+
+  using MainloopPipeline =
+      typename CutlassCollectiveMainloopK128::MainloopPipeline;
+  typename MainloopPipeline::Params pipeline_params;
+  if (warp_group_role == WarpGroupRole::Producer &&
+      (producer_warp_role == ProducerWarpRole::Mainloop ||
+       producer_warp_role == ProducerWarpRole::MainloopAux)) {
+    pipeline_params.role = MainloopPipeline::ThreadCategory::Producer;
+  }
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    pipeline_params.role = MainloopPipeline::ThreadCategory::Consumer;
+  }
+  pipeline_params.is_leader = warp_group_thread_idx == 0;
+  pipeline_params.num_consumers = CutlassCollectiveMainloopK128::ThreadCount;
+  pipeline_params.num_producers =
+      CutlassCollectiveMainloopK128::NumProducerThreadEvents;
+  pipeline_params.transaction_bytes =
+      pv_params.mainloop.tma_transaction_bytes_nk;
+
+  MainloopPipeline pipeline(shared.pipeline_storage, pipeline_params,
+                            CutlassClusterShape{});
+  typename CutlassCollectiveMainloopK128::PipelineState pipe_read;
+  typename CutlassCollectiveMainloopK128::PipelineState pipe_write =
+      cutlass::make_producer_start_state<MainloopPipeline>();
+  __syncthreads();
+
+  auto problem_shape_mnkl =
+      cute::append<4>(pv_params.problem_shape, cute::Int<1>{});
+  auto load_inputs = collective.load_init(problem_shape_mnkl,
+                                          pv_params.mainloop);
+  auto [gA_mkl, gB_nkl, gSFA_mkl, gSFB_nkl] = load_inputs;
+
+  if (warp_group_role == WarpGroupRole::Producer &&
+      producer_warp_role == ProducerWarpRole::Mainloop) {
+    if (lane_predicate) {
+      auto block_tma_b = pv_params.mainloop.tma_load_b.get_slice(0);
+      auto block_tma_sfb = pv_params.mainloop.tma_load_sfb.get_slice(0);
+      auto gB = gB_nkl(_, _, out_group, _, 0);
+      auto gSFB = gSFB_nkl(_, _, out_group, _, 0);
+      auto tBgB = block_tma_b.partition_S(gB);
+      auto tBsB = block_tma_b.partition_D(sB);
+      auto tBgSFB = block_tma_sfb.partition_S(gSFB);
+      auto tBsSFB = block_tma_sfb.partition_D(sSFB);
+
+      auto k_tile_iter = cute::make_coord_iterator(
+          cute::idx2crd(kv_tile_128, cute::shape<3>(gB_nkl)),
+          cute::shape<3>(gB_nkl));
+      pipeline.producer_acquire(pipe_write);
+      using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+      BarrierType* tma_barrier = pipeline.producer_get_barrier(pipe_write);
+      int write_stage = pipe_write.index();
+      copy(pv_params.mainloop.tma_load_b.with(*tma_barrier),
+           tBgB(_, _, _, *k_tile_iter), tBsB(_, _, _, write_stage));
+      copy(pv_params.mainloop.tma_load_sfb.with(*tma_barrier),
+           tBgSFB(_, _, _, *k_tile_iter), tBsSFB(_, _, _, write_stage));
+      ++pipe_write;
+    }
+    collective.load_tail(pipeline, pipe_write);
+  }
+
+  auto tiled_mma = typename CutlassCollectiveMainloopK128::TiledMma{};
+  auto accum = cute::partition_fragment_C(
+      tiled_mma, cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    collective.mma(pipeline, pipe_read, accum, 1, mma_thread_idx,
+                   shared.tensors, pv_params.mainloop);
+    collective.mma_tail(pipeline, pipe_read, 1);
+
+    auto thread_mma = tiled_mma.get_thread_slice(mma_thread_idx);
+    auto cC = cute::make_identity_tensor(
+        cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+    auto tCcC = thread_mma.partition_C(cC);
+    for (int i = 0; i < cute::size(accum); ++i) {
+      auto coord = tCcC(i);
+      const int row = int(cute::get<0>(coord));
+      const int col = int(cute::get<1>(coord));
+      if (row < kCutlassTileM && col < kCutlassTileN) {
+        float value = accum(i);
+        if (tile_scale != nullptr) {
+          value *= tile_scale[row] * output_scale;
+        }
+        const int out_idx = row * out_stride + out_col_base + col;
+        if (accumulate != 0) {
+          value += out[out_idx] * old_scale[row];
+        }
+        out[out_idx] = value;
+      }
+    }
+  }
+  __syncthreads();
+}
+
+template <class FrgTensorC>
+__device__ __forceinline__ void cutlass_smem_pv_k128_tma_v_group_accum_body(
+    typename CutlassGemmKernelK128::Params const& pv_params,
+    typename CutlassCollectiveMainloopK128::SharedStorage& shared,
+    FrgTensorC& accum,
+    int out_group,
+    int kv_tile_128,
+    typename CutlassCollectiveMainloopK128::PipelineStorage*
+        pipeline_storage_override = nullptr) {
+  using cute::_;
+
+  const int block_thread_idx = int(threadIdx.x);
+  const int thread_idx =
+      block_thread_idx < CutlassCollectiveMainloopK128::ThreadCount
+          ? block_thread_idx
+          : 0;
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int warp_idx_in_warp_group = warp_idx % cutlass::NumWarpsPerWarpGroup;
+  const int warp_group_thread_idx =
+      block_thread_idx % cutlass::NumThreadsPerWarpGroup;
+  const int mma_thread_idx =
+      block_thread_idx % CutlassCollectiveMainloopK128::ThreadCount;
+  const bool lane_predicate = cute::elect_one_sync();
+
+  enum class WarpGroupRole {
+    Producer = 0,
+    Consumer0 = 1,
+    Consumer1 = 2,
+  };
+  enum class ProducerWarpRole {
+    Mainloop = 0,
+    Warp1 = 1,
+    Epilogue = 2,
+    MainloopAux = 3,
+  };
+
+  auto warp_group_role = WarpGroupRole(cutlass::canonical_warp_group_idx());
+  auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
+
+  CutlassCollectiveMainloopK128 collective;
+  auto sB = cute::make_tensor(cute::make_smem_ptr(shared.tensors.smem_B.begin()),
+                              typename CutlassCollectiveMainloopK128::SmemLayoutB{});
+  auto sSFB = cute::make_tensor(
+      cute::make_smem_ptr(shared.tensors.smem_SFB.begin()),
+      typename CutlassCollectiveMainloopK128::SmemLayoutSFB{});
+
+  if (warp_idx == 0 && lane_predicate) {
+    CutlassCollectiveMainloopK128::prefetch_tma_descriptors(
+        pv_params.mainloop);
+  }
+  __syncthreads();
+
+  using MainloopPipeline =
+      typename CutlassCollectiveMainloopK128::MainloopPipeline;
+  typename MainloopPipeline::Params pipeline_params;
+  if (warp_group_role == WarpGroupRole::Producer &&
+      (producer_warp_role == ProducerWarpRole::Mainloop ||
+       producer_warp_role == ProducerWarpRole::MainloopAux)) {
+    pipeline_params.role = MainloopPipeline::ThreadCategory::Producer;
+  }
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    pipeline_params.role = MainloopPipeline::ThreadCategory::Consumer;
+  }
+  pipeline_params.is_leader = warp_group_thread_idx == 0;
+  pipeline_params.num_consumers = CutlassCollectiveMainloopK128::ThreadCount;
+  pipeline_params.num_producers =
+      CutlassCollectiveMainloopK128::NumProducerThreadEvents;
+  pipeline_params.transaction_bytes =
+      pv_params.mainloop.tma_transaction_bytes_nk;
+
+  auto* pipeline_storage = pipeline_storage_override != nullptr
+                               ? pipeline_storage_override
+                               : &shared.pipeline_storage;
+  MainloopPipeline pipeline(*pipeline_storage, pipeline_params,
+                            CutlassClusterShape{});
+  typename CutlassCollectiveMainloopK128::PipelineState pipe_read;
+  typename CutlassCollectiveMainloopK128::PipelineState pipe_write =
+      cutlass::make_producer_start_state<MainloopPipeline>();
+  __syncthreads();
+
+  auto problem_shape_mnkl =
+      cute::append<4>(pv_params.problem_shape, cute::Int<1>{});
+  auto load_inputs = collective.load_init(problem_shape_mnkl,
+                                          pv_params.mainloop);
+  auto [gA_mkl, gB_nkl, gSFA_mkl, gSFB_nkl] = load_inputs;
+
+  if (warp_group_role == WarpGroupRole::Producer &&
+      producer_warp_role == ProducerWarpRole::Mainloop) {
+    if (lane_predicate) {
+      auto block_tma_b = pv_params.mainloop.tma_load_b.get_slice(0);
+      auto block_tma_sfb = pv_params.mainloop.tma_load_sfb.get_slice(0);
+      auto gB = gB_nkl(_, _, out_group, _, 0);
+      auto gSFB = gSFB_nkl(_, _, out_group, _, 0);
+      auto tBgB = block_tma_b.partition_S(gB);
+      auto tBsB = block_tma_b.partition_D(sB);
+      auto tBgSFB = block_tma_sfb.partition_S(gSFB);
+      auto tBsSFB = block_tma_sfb.partition_D(sSFB);
+
+      auto k_tile_iter = cute::make_coord_iterator(
+          cute::idx2crd(kv_tile_128, cute::shape<3>(gB_nkl)),
+          cute::shape<3>(gB_nkl));
+      pipeline.producer_acquire(pipe_write);
+      using BarrierType = typename MainloopPipeline::ProducerBarrierType;
+      BarrierType* tma_barrier = pipeline.producer_get_barrier(pipe_write);
+      int write_stage = pipe_write.index();
+      copy(pv_params.mainloop.tma_load_b.with(*tma_barrier),
+           tBgB(_, _, _, *k_tile_iter), tBsB(_, _, _, write_stage));
+      copy(pv_params.mainloop.tma_load_sfb.with(*tma_barrier),
+           tBgSFB(_, _, _, *k_tile_iter), tBsSFB(_, _, _, write_stage));
+      ++pipe_write;
+    }
+    collective.load_tail(pipeline, pipe_write);
+  }
+
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    cutlass_smem_pv_k128_mma_no_clear(
+        pipeline, pipe_read, accum, 1, mma_thread_idx, shared.tensors);
+    collective.mma_tail(pipeline, pipe_read, 1);
+  }
+  __syncthreads();
+}
+
+template <class FrgTensorC>
+__device__ __forceinline__
+void cutlass_smem_pv_k128_tma_v_group_accum_persistent_step(
+    typename CutlassGemmKernelK128::Params const& pv_params,
+    typename CutlassCollectiveMainloopK128::SharedStorage& shared,
+    typename CutlassCollectiveMainloopK128::MainloopPipeline& pipeline,
+    typename CutlassCollectiveMainloopK128::PipelineState& pipe_read,
+    typename CutlassCollectiveMainloopK128::PipelineState& pipe_write,
+    FrgTensorC& accum,
+    int out_group,
+    int kv_tile_128) {
+  using cute::_;
+
+  const int block_thread_idx = int(threadIdx.x);
+  const int thread_idx =
+      block_thread_idx < CutlassCollectiveMainloopK128::ThreadCount
+          ? block_thread_idx
+          : 0;
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int warp_idx_in_warp_group = warp_idx % cutlass::NumWarpsPerWarpGroup;
+  const int warp_group_thread_idx =
+      block_thread_idx % cutlass::NumThreadsPerWarpGroup;
+  const int mma_thread_idx =
+      block_thread_idx % CutlassCollectiveMainloopK128::ThreadCount;
+  const bool lane_predicate = cute::elect_one_sync();
+
+  enum class WarpGroupRole {
+    Producer = 0,
+    Consumer0 = 1,
+    Consumer1 = 2,
+  };
+  enum class ProducerWarpRole {
+    Mainloop = 0,
+    Warp1 = 1,
+    Epilogue = 2,
+    MainloopAux = 3,
+  };
+
+  auto warp_group_role = WarpGroupRole(cutlass::canonical_warp_group_idx());
+  auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
+
+  CutlassCollectiveMainloopK128 collective;
+  auto sB = cute::make_tensor(cute::make_smem_ptr(shared.tensors.smem_B.begin()),
+                              typename CutlassCollectiveMainloopK128::SmemLayoutB{});
+  auto sSFB = cute::make_tensor(
+      cute::make_smem_ptr(shared.tensors.smem_SFB.begin()),
+      typename CutlassCollectiveMainloopK128::SmemLayoutSFB{});
+  auto problem_shape_mnkl =
+      cute::append<4>(pv_params.problem_shape, cute::Int<1>{});
+  auto load_inputs = collective.load_init(problem_shape_mnkl,
+                                          pv_params.mainloop);
+  auto [gA_mkl, gB_nkl, gSFA_mkl, gSFB_nkl] = load_inputs;
+
+  if (warp_group_role == WarpGroupRole::Producer &&
+      producer_warp_role == ProducerWarpRole::Mainloop) {
+    if (lane_predicate) {
+      auto block_tma_b = pv_params.mainloop.tma_load_b.get_slice(0);
+      auto block_tma_sfb = pv_params.mainloop.tma_load_sfb.get_slice(0);
+      auto gB = gB_nkl(_, _, out_group, _, 0);
+      auto gSFB = gSFB_nkl(_, _, out_group, _, 0);
+      auto tBgB = block_tma_b.partition_S(gB);
+      auto tBsB = block_tma_b.partition_D(sB);
+      auto tBgSFB = block_tma_sfb.partition_S(gSFB);
+      auto tBsSFB = block_tma_sfb.partition_D(sSFB);
+
+      auto k_tile_iter = cute::make_coord_iterator(
+          cute::idx2crd(kv_tile_128, cute::shape<3>(gB_nkl)),
+          cute::shape<3>(gB_nkl));
+      pipeline.producer_acquire(pipe_write);
+      using BarrierType =
+          typename CutlassCollectiveMainloopK128::MainloopPipeline::
+              ProducerBarrierType;
+      BarrierType* tma_barrier = pipeline.producer_get_barrier(pipe_write);
+      int write_stage = pipe_write.index();
+      copy(pv_params.mainloop.tma_load_b.with(*tma_barrier),
+           tBgB(_, _, _, *k_tile_iter), tBsB(_, _, _, write_stage));
+      copy(pv_params.mainloop.tma_load_sfb.with(*tma_barrier),
+           tBgSFB(_, _, _, *k_tile_iter), tBsSFB(_, _, _, write_stage));
+      ++pipe_write;
+    }
+  }
+
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    cutlass_smem_pv_k128_mma_no_clear(
+        pipeline, pipe_read, accum, 1, mma_thread_idx, shared.tensors);
+  }
+  __syncthreads();
 }
 #endif
 
@@ -2932,6 +3638,66 @@ __global__ void fused_cutlass_tma_qk_tma_pv_128tile_kernel(
 #endif
 }
 
+__device__ __forceinline__ void softmax_quant_scores_128(
+    const float* scores,
+    float qk_alpha,
+    uint8_t* p_packed,
+    uint8_t* p_scales,
+    float* row_m_out,
+    float* row_l_out) {
+  const int tid = int(threadIdx.x);
+
+  for (int row = tid; row < kCutlassTileM; row += blockDim.x) {
+    float row_m = -INFINITY;
+#pragma unroll
+    for (int col = 0; col < kCutlassTileN; ++col) {
+      const float logit =
+          scores[row * kCutlassTileN + col] * qk_alpha * kQkScale;
+      row_m = fmaxf(row_m, logit);
+    }
+    float row_l = 0.0f;
+#pragma unroll
+    for (int col = 0; col < kCutlassTileN; ++col) {
+      const float logit =
+          scores[row * kCutlassTileN + col] * qk_alpha * kQkScale;
+      row_l += __expf(logit - row_m);
+    }
+    row_m_out[row] = row_m;
+    row_l_out[row] = row_l;
+  }
+  __syncthreads();
+
+  for (int idx = tid; idx < kCutlassTileM * (kCutlassTileN / 16);
+       idx += blockDim.x) {
+    const int row = idx / (kCutlassTileN / 16);
+    const int scale_group = idx - row * (kCutlassTileN / 16);
+    const int local_col = scale_group * 16;
+    const float row_m = row_m_out[row];
+    float probs[16];
+    float vec_max = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const float logit =
+          scores[row * kCutlassTileN + local_col + i] * qk_alpha * kQkScale;
+      const float p = __expf(logit - row_m);
+      probs[i] = p;
+      vec_max = fmaxf(vec_max, p);
+    }
+    const uint8_t scale_byte =
+        fp32_to_e4m3_byte(fmaxf(kProbGlobalScale * vec_max / 6.0f, 1.0e-8f));
+    p_scales[row * (kCutlassTileK128 / 16) + scale_group] = scale_byte;
+    const float scale = fmaxf(e4m3_byte_to_fp32(scale_byte), 1.0e-8f);
+    const float output_scale = kProbGlobalScale / scale;
+    uint8_t* packed = p_packed + row * (kCutlassTileK128 / 2) + local_col / 2;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      packed[i] = fp32_pair_to_e2m1_byte(probs[2 * i] * output_scale,
+                                         probs[2 * i + 1] * output_scale);
+    }
+  }
+  __syncthreads();
+}
+
 __global__ void fused_cutlass_tma_qk_tma_pv_128tile_partial_kernel(
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128::Params const pv_params,
@@ -2961,58 +3727,8 @@ __global__ void fused_cutlass_tma_qk_tma_pv_128tile_partial_kernel(
   qk_cutlass_collective_tile_body(qk_params, storage.qk, scores, q_tile,
                                   kv_tile_128, kCutlassTileN);
 
-  for (int row = tid; row < kCutlassTileM; row += blockDim.x) {
-    float row_m = -INFINITY;
-#pragma unroll
-    for (int col = 0; col < kCutlassTileN; ++col) {
-      const float logit =
-          scores[row * kCutlassTileN + col] * qk_alpha * kQkScale;
-      row_m = fmaxf(row_m, logit);
-    }
-    float row_l = 0.0f;
-#pragma unroll
-    for (int col = 0; col < kCutlassTileN; ++col) {
-      const float logit =
-          scores[row * kCutlassTileN + col] * qk_alpha * kQkScale;
-      row_l += __expf(logit - row_m);
-    }
-    storage.row_m[row] = row_m;
-    storage.row_l[row] = row_l;
-  }
-  __syncthreads();
-
-  for (int idx = tid; idx < kCutlassTileM * (kCutlassTileN / 16);
-       idx += blockDim.x) {
-    const int row = idx / (kCutlassTileN / 16);
-    const int scale_group = idx - row * (kCutlassTileN / 16);
-    const int local_col = scale_group * 16;
-    const float row_m = storage.row_m[row];
-    float probs[16];
-    float vec_max = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-      const float logit =
-          scores[row * kCutlassTileN + local_col + i] * qk_alpha *
-              kQkScale;
-      const float p = __expf(logit - row_m);
-      probs[i] = p;
-      vec_max = fmaxf(vec_max, p);
-    }
-    const uint8_t scale_byte =
-        fp32_to_e4m3_byte(fmaxf(kProbGlobalScale * vec_max / 6.0f, 1.0e-8f));
-    storage.p_scales[row * (kCutlassTileK128 / 16) + scale_group] =
-        scale_byte;
-    const float scale = fmaxf(e4m3_byte_to_fp32(scale_byte), 1.0e-8f);
-    const float output_scale = kProbGlobalScale / scale;
-    uint8_t* packed =
-        storage.p_packed + row * (kCutlassTileK128 / 2) + local_col / 2;
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      packed[i] = fp32_pair_to_e2m1_byte(probs[2 * i] * output_scale,
-                                         probs[2 * i + 1] * output_scale);
-    }
-  }
-  __syncthreads();
+  softmax_quant_scores_128(scores, qk_alpha, storage.p_packed,
+                           storage.p_scales, storage.row_m, storage.row_l);
 
   auto& pv_shared =
       *reinterpret_cast<typename CutlassCollectiveMainloopK128::SharedStorage*>(
@@ -3031,6 +3747,976 @@ __global__ void fused_cutlass_tma_qk_tma_pv_128tile_partial_kernel(
 #else
   if (threadIdx.x == 0) {
     partial_out[0] = -1.0f;
+  }
+#endif
+}
+
+__global__ void persistent_mainloop_owner_layout_smoke_kernel(float* out) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+  extern __shared__ __align__(128) char smem[];
+  auto& storage = *reinterpret_cast<CutlassFusedTmaQkPv128Storage*>(smem);
+
+  const int thread_idx = int(threadIdx.x);
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int warp_idx_in_warp_group = warp_idx % cutlass::NumWarpsPerWarpGroup;
+  const int warp_group_thread_idx = thread_idx % cutlass::NumThreadsPerWarpGroup;
+
+  enum class WarpGroupRole {
+    Producer = 0,
+    Consumer0 = 1,
+    Consumer1 = 2,
+  };
+  enum class ProducerWarpRole {
+    Mainloop = 0,
+    Warp1 = 1,
+    Epilogue = 2,
+    MainloopAux = 3,
+  };
+
+  const auto warp_group_role =
+      WarpGroupRole(cutlass::canonical_warp_group_idx());
+  const auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
+
+  using QkPipeline = typename CutlassCollectiveMainloop::MainloopPipeline;
+  typename QkPipeline::Params qk_pipeline_params;
+  if (warp_group_role == WarpGroupRole::Producer &&
+      (producer_warp_role == ProducerWarpRole::Mainloop ||
+       producer_warp_role == ProducerWarpRole::MainloopAux)) {
+    qk_pipeline_params.role = QkPipeline::ThreadCategory::Producer;
+  }
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    qk_pipeline_params.role = QkPipeline::ThreadCategory::Consumer;
+  }
+  qk_pipeline_params.is_leader = warp_group_thread_idx == 0;
+  qk_pipeline_params.num_consumers = CutlassCollectiveMainloop::ThreadCount;
+  qk_pipeline_params.num_producers =
+      CutlassCollectiveMainloop::NumProducerThreadEvents;
+  qk_pipeline_params.transaction_bytes = 0;
+  QkPipeline qk_pipeline(storage.qk.pipeline_storage, qk_pipeline_params,
+                         CutlassClusterShape{});
+  typename CutlassCollectiveMainloop::PipelineState qk_pipe_read;
+  typename CutlassCollectiveMainloop::PipelineState qk_pipe_write =
+      cutlass::make_producer_start_state<QkPipeline>();
+
+  __syncthreads();
+
+  auto& pv_shared =
+      *reinterpret_cast<typename CutlassCollectiveMainloopK128::SharedStorage*>(
+          &storage.qk);
+  using PvPipeline = typename CutlassCollectiveMainloopK128::MainloopPipeline;
+  typename PvPipeline::Params pv_pipeline_params;
+  if (warp_group_role == WarpGroupRole::Producer &&
+      (producer_warp_role == ProducerWarpRole::Mainloop ||
+       producer_warp_role == ProducerWarpRole::MainloopAux)) {
+    pv_pipeline_params.role = PvPipeline::ThreadCategory::Producer;
+  }
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    pv_pipeline_params.role = PvPipeline::ThreadCategory::Consumer;
+  }
+  pv_pipeline_params.is_leader = warp_group_thread_idx == 0;
+  pv_pipeline_params.num_consumers = CutlassCollectiveMainloopK128::ThreadCount;
+  pv_pipeline_params.num_producers =
+      CutlassCollectiveMainloopK128::NumProducerThreadEvents;
+  pv_pipeline_params.transaction_bytes = 0;
+  PvPipeline pv_pipeline(pv_shared.pipeline_storage, pv_pipeline_params,
+                         CutlassClusterShape{});
+  typename CutlassCollectiveMainloopK128::PipelineState pv_pipe_read;
+  typename CutlassCollectiveMainloopK128::PipelineState pv_pipe_write =
+      cutlass::make_producer_start_state<PvPipeline>();
+
+  if (thread_idx == 0) {
+    out[0] = 1.0f;
+    out[1] = float(sizeof(CutlassFusedTmaQkPv128Storage));
+    out[2] = float(sizeof(typename CutlassCollectiveMainloop::SharedStorage));
+    out[3] = float(sizeof(typename CutlassCollectiveMainloopK128::SharedStorage));
+    out[4] = float(qk_pipe_read.index());
+    out[5] = float(qk_pipe_write.index());
+    out[6] = float(pv_pipe_read.index());
+    out[7] = float(pv_pipe_write.index());
+  }
+#else
+  if (threadIdx.x == 0) {
+    out[0] = -1.0f;
+  }
+#endif
+}
+
+__global__ void persistent_mainloop_owner_qk_stage_kernel(
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const params,
+    float* out_tile,
+    uint8_t* p_packed_out,
+    uint8_t* p_scales_out,
+    float* row_m_out,
+    float* row_l_out,
+    float qk_alpha,
+    int q_tile,
+    int kv_tile,
+    int write_softmax) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+  using cute::_;
+
+  extern __shared__ __align__(128) char smem[];
+  auto& owner_storage = *reinterpret_cast<CutlassFusedTmaQkPv128Storage*>(smem);
+  auto& storage = owner_storage.qk;
+  float* scores = reinterpret_cast<float*>(&storage.tensors);
+
+  const int thread_idx = int(threadIdx.x);
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int warp_idx_in_warp_group = warp_idx % cutlass::NumWarpsPerWarpGroup;
+  const int warp_group_thread_idx = thread_idx % cutlass::NumThreadsPerWarpGroup;
+  const int mma_thread_idx = thread_idx % CutlassCollectiveMainloop::ThreadCount;
+  const bool lane_predicate = cute::elect_one_sync();
+  const uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
+
+  enum class WarpGroupRole {
+    Producer = 0,
+    Consumer0 = 1,
+    Consumer1 = 2,
+  };
+  enum class ProducerWarpRole {
+    Mainloop = 0,
+    Warp1 = 1,
+    Epilogue = 2,
+    MainloopAux = 3,
+  };
+
+  const auto warp_group_role =
+      WarpGroupRole(cutlass::canonical_warp_group_idx());
+  const auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
+
+  if (warp_idx == 0 && lane_predicate) {
+    CutlassCollectiveMainloop::prefetch_tma_descriptors(params.mainloop);
+  }
+
+  using MainloopPipeline = typename CutlassCollectiveMainloop::MainloopPipeline;
+  typename MainloopPipeline::Params pipeline_params;
+  if (warp_group_role == WarpGroupRole::Producer &&
+      (producer_warp_role == ProducerWarpRole::Mainloop ||
+       producer_warp_role == ProducerWarpRole::MainloopAux)) {
+    pipeline_params.role = MainloopPipeline::ThreadCategory::Producer;
+  }
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    pipeline_params.role = MainloopPipeline::ThreadCategory::Consumer;
+  }
+  pipeline_params.is_leader = warp_group_thread_idx == 0;
+  pipeline_params.num_consumers = CutlassCollectiveMainloop::ThreadCount;
+  pipeline_params.num_producers =
+      CutlassCollectiveMainloop::NumProducerThreadEvents;
+  pipeline_params.transaction_bytes = params.mainloop.tma_transaction_bytes;
+
+  MainloopPipeline pipeline(storage.pipeline_storage, pipeline_params,
+                            CutlassClusterShape{});
+  typename CutlassCollectiveMainloop::PipelineState pipe_read;
+  typename CutlassCollectiveMainloop::PipelineState pipe_write =
+      cutlass::make_producer_start_state<MainloopPipeline>();
+
+  __syncthreads();
+
+  CutlassCollectiveMainloop collective;
+  auto problem_shape_mnkl = cute::append<4>(params.problem_shape, cute::Int<1>{});
+  auto load_inputs = collective.load_init(problem_shape_mnkl, params.mainloop);
+  auto blk_coord = cute::make_coord(q_tile, kv_tile, cute::_, 0);
+  const int k_tile_count = kHeadDim / kCutlassTileK;
+  auto k_tile_iter = cute::make_coord_iterator(k_tile_count);
+
+  if (warp_group_role == WarpGroupRole::Producer &&
+      producer_warp_role == ProducerWarpRole::Mainloop) {
+    collective.load(params.mainloop, pipeline, pipe_write, load_inputs,
+                    blk_coord, k_tile_iter, k_tile_count,
+                    cutlass::canonical_lane_idx(), block_rank_in_cluster,
+                    storage.tensors);
+  }
+
+  auto tiled_mma = typename CutlassCollectiveMainloop::TiledMma{};
+  auto accum = cute::partition_fragment_C(tiled_mma,
+                                          cute::take<0, 2>(CutlassThreadBlockShape{}));
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    collective.mma(pipeline, pipe_read, accum, k_tile_count, mma_thread_idx,
+                   storage.tensors, params.mainloop);
+  }
+  if (warp_group_role == WarpGroupRole::Producer &&
+      producer_warp_role == ProducerWarpRole::Mainloop) {
+    collective.load_tail(pipeline, pipe_write);
+  }
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    collective.mma_tail(pipeline, pipe_read, k_tile_count);
+  }
+
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    auto thread_mma = tiled_mma.get_thread_slice(mma_thread_idx);
+    auto cC = cute::make_identity_tensor(
+        cute::take<0, 2>(CutlassThreadBlockShape{}));
+    auto tCcC = thread_mma.partition_C(cC);
+    for (int i = 0; i < cute::size(accum); ++i) {
+      auto coord = tCcC(i);
+      const int row = int(cute::get<0>(coord));
+      const int col = int(cute::get<1>(coord));
+      if (row < kCutlassTileM && col < kCutlassTileN) {
+        const float value = accum(i);
+        if (out_tile != nullptr) {
+          out_tile[row * kCutlassTileN + col] = value;
+        }
+        if (write_softmax != 0) {
+          scores[row * kCutlassTileN + col] = value;
+        }
+      }
+    }
+  }
+  if (write_softmax != 0) {
+    __syncthreads();
+    softmax_quant_scores_128(scores, qk_alpha, owner_storage.p_packed,
+                             owner_storage.p_scales, owner_storage.row_m,
+                             owner_storage.row_l);
+    const int tid = int(threadIdx.x);
+    for (int idx = tid; idx < kCutlassTileM * (kCutlassTileK128 / 2);
+         idx += blockDim.x) {
+      p_packed_out[idx] = owner_storage.p_packed[idx];
+    }
+    for (int idx = tid; idx < kCutlassTileM * (kCutlassTileK128 / 16);
+         idx += blockDim.x) {
+      p_scales_out[idx] = owner_storage.p_scales[idx];
+    }
+    for (int idx = tid; idx < kCutlassTileM; idx += blockDim.x) {
+      row_m_out[idx] = owner_storage.row_m[idx];
+      row_l_out[idx] = owner_storage.row_l[idx];
+    }
+  }
+#else
+  if (threadIdx.x == 0) {
+    if (out_tile != nullptr) {
+      out_tile[0] = -1.0f;
+    }
+    if (row_m_out != nullptr) {
+      row_m_out[0] = -1.0f;
+    }
+  }
+#endif
+}
+
+__global__ void persistent_mainloop_owner_pv_group_stage_kernel(
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128::Params const pv_params,
+    float* out_group,
+    uint8_t* p_packed_out,
+    uint8_t* p_scales_out,
+    float* row_m_out,
+    float* row_l_out,
+    float qk_alpha,
+    int q_tile,
+    int kv_tile,
+    int out_group_idx) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+  extern __shared__ __align__(128) char smem[];
+  auto& owner_storage = *reinterpret_cast<CutlassFusedTmaQkPv128Storage*>(smem);
+  float* scores = reinterpret_cast<float*>(&owner_storage.qk.tensors);
+  const int tid = int(threadIdx.x);
+
+  qk_cutlass_collective_tile_body(qk_params, owner_storage.qk, scores, q_tile,
+                                  kv_tile, kCutlassTileN);
+  softmax_quant_scores_128(scores, qk_alpha, owner_storage.p_packed,
+                           owner_storage.p_scales, owner_storage.row_m,
+                           owner_storage.row_l);
+
+  for (int idx = tid; idx < kCutlassTileM * (kCutlassTileK128 / 2);
+       idx += blockDim.x) {
+    p_packed_out[idx] = owner_storage.p_packed[idx];
+  }
+  for (int idx = tid; idx < kCutlassTileM * (kCutlassTileK128 / 16);
+       idx += blockDim.x) {
+    p_scales_out[idx] = owner_storage.p_scales[idx];
+  }
+  for (int idx = tid; idx < kCutlassTileM; idx += blockDim.x) {
+    row_m_out[idx] = owner_storage.row_m[idx];
+    row_l_out[idx] = owner_storage.row_l[idx];
+  }
+  __syncthreads();
+
+  auto& pv_shared =
+      *reinterpret_cast<typename CutlassCollectiveMainloopK128::SharedStorage*>(
+          &owner_storage.qk);
+  cutlass_smem_pv_k128_stage_p_body(
+      pv_shared, owner_storage.p_packed, owner_storage.p_scales);
+  cutlass_smem_pv_k128_tma_v_group_body(
+      pv_params, pv_shared, out_group, kCutlassTileN, 0, out_group_idx,
+      kv_tile);
+#else
+  if (threadIdx.x == 0) {
+    out_group[0] = -1.0f;
+    row_m_out[0] = -1.0f;
+  }
+#endif
+}
+
+__global__ void persistent_mainloop_owner_full_tile_stage_kernel(
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128::Params const pv_params,
+    float* out,
+    float qk_alpha,
+    float pv_alpha,
+    int q_tile,
+    int kv_tile) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+  extern __shared__ __align__(128) char smem[];
+  auto& owner_storage = *reinterpret_cast<CutlassFusedTmaQkPv128Storage*>(smem);
+  float* scores = reinterpret_cast<float*>(&owner_storage.qk.tensors);
+  const int tid = int(threadIdx.x);
+
+  qk_cutlass_collective_tile_body(qk_params, owner_storage.qk, scores, q_tile,
+                                  kv_tile, kCutlassTileN);
+  softmax_quant_scores_128(scores, qk_alpha, owner_storage.p_packed,
+                           owner_storage.p_scales, owner_storage.row_m,
+                           owner_storage.row_l);
+
+  auto& pv_shared =
+      *reinterpret_cast<typename CutlassCollectiveMainloopK128::SharedStorage*>(
+          &owner_storage.qk);
+  cutlass_smem_pv_k128_stage_p_body(
+      pv_shared, owner_storage.p_packed, owner_storage.p_scales);
+#pragma unroll
+  for (int out_group_idx = 0; out_group_idx < kHeadDim / kCutlassTileN;
+       ++out_group_idx) {
+    cutlass_smem_pv_k128_tma_v_group_body(
+        pv_params, pv_shared, out, kHeadDim, out_group_idx * kCutlassTileN,
+        out_group_idx, kv_tile);
+  }
+
+  for (int idx = tid; idx < kCutlassTileM * kHeadDim; idx += blockDim.x) {
+    const int row = idx / kHeadDim;
+    out[idx] *= pv_alpha /
+                (kProbGlobalScale * fmaxf(owner_storage.row_l[row], 1.0e-20f));
+  }
+#else
+  if (threadIdx.x == 0) {
+    out[0] = -1.0f;
+  }
+#endif
+}
+
+__global__ __launch_bounds__(384, 1)
+void persistent_mainloop_owner_group_online_stage_kernel(
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128::Params const pv_params,
+    float* out_group,
+    float qk_alpha,
+    float pv_alpha,
+    int q_tile,
+    int kv_tile_start,
+    int num_kv_tiles,
+    int out_group_idx) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+  extern __shared__ __align__(128) char smem[];
+  auto& owner_storage = *reinterpret_cast<CutlassFusedTmaQkPv128Storage*>(smem);
+  float* scores = reinterpret_cast<float*>(&owner_storage.qk.tensors);
+  const int tid = int(threadIdx.x);
+  const float pv_base_scale = pv_alpha / kProbGlobalScale;
+
+  for (int tile = 0; tile < num_kv_tiles; ++tile) {
+    const int kv_tile = kv_tile_start + tile;
+    qk_cutlass_collective_tile_body(qk_params, owner_storage.qk, scores, q_tile,
+                                    kv_tile, kCutlassTileN);
+    softmax_quant_scores_128(scores, qk_alpha, owner_storage.p_packed,
+                             owner_storage.p_scales, owner_storage.row_m,
+                             owner_storage.row_l);
+
+    if (tile == 0) {
+      for (int row = tid; row < kCutlassTileM; row += blockDim.x) {
+        owner_storage.global_m[row] = owner_storage.row_m[row];
+        owner_storage.global_l[row] = owner_storage.row_l[row];
+        owner_storage.old_scale[row] = 0.0f;
+        owner_storage.tile_scale[row] = 1.0f;
+      }
+    } else {
+      for (int row = tid; row < kCutlassTileM; row += blockDim.x) {
+        const float old_m = owner_storage.global_m[row];
+        const float tile_m = owner_storage.row_m[row];
+        const float new_m = fmaxf(old_m, tile_m);
+        const float old_scale = __expf(old_m - new_m);
+        const float tile_scale = __expf(tile_m - new_m);
+        owner_storage.global_m[row] = new_m;
+        owner_storage.global_l[row] =
+            owner_storage.global_l[row] * old_scale +
+            owner_storage.row_l[row] * tile_scale;
+        owner_storage.old_scale[row] = old_scale;
+        owner_storage.tile_scale[row] = tile_scale;
+      }
+    }
+    __syncthreads();
+
+    auto& pv_shared =
+        *reinterpret_cast<typename CutlassCollectiveMainloopK128::SharedStorage*>(
+            &owner_storage.qk);
+    cutlass_smem_pv_k128_stage_p_body(
+        pv_shared, owner_storage.p_packed, owner_storage.p_scales);
+    cutlass_smem_pv_k128_tma_v_group_body(
+        pv_params, pv_shared, out_group, kCutlassTileN, 0, out_group_idx,
+        kv_tile, owner_storage.old_scale, owner_storage.tile_scale,
+        pv_base_scale, tile == 0 ? 0 : 1);
+  }
+
+  for (int idx = tid; idx < kCutlassTileM * kCutlassTileN; idx += blockDim.x) {
+    const int row = idx / kCutlassTileN;
+    out_group[idx] /= fmaxf(owner_storage.global_l[row], 1.0e-20f);
+  }
+#else
+  if (threadIdx.x == 0) {
+    out_group[0] = -1.0f;
+  }
+#endif
+}
+
+__global__ __launch_bounds__(384, 1)
+void persistent_mainloop_owner_group_online_register_stage_kernel(
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128::Params const pv_params,
+    float* out_group,
+    float qk_alpha,
+    float pv_alpha,
+    int q_tile,
+    int kv_tile_start,
+    int num_kv_tiles,
+    int out_group_idx) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+  extern __shared__ __align__(128) char smem[];
+  auto& owner_storage = *reinterpret_cast<CutlassFusedTmaQkPv128Storage*>(smem);
+  float* scores = reinterpret_cast<float*>(&owner_storage.qk.tensors);
+  const int tid = int(threadIdx.x);
+  const int block_thread_idx = int(threadIdx.x);
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int warp_idx_in_warp_group = warp_idx % cutlass::NumWarpsPerWarpGroup;
+  const int warp_group_thread_idx =
+      block_thread_idx % cutlass::NumThreadsPerWarpGroup;
+  const int warp_group_idx = cutlass::canonical_warp_group_idx();
+  const bool is_consumer = warp_group_idx == 1 || warp_group_idx == 2;
+  const int mma_thread_idx =
+      block_thread_idx % CutlassCollectiveMainloopK128::ThreadCount;
+  const bool lane_predicate = cute::elect_one_sync();
+  const float pv_base_scale = pv_alpha / kProbGlobalScale;
+
+  enum class WarpGroupRole {
+    Producer = 0,
+    Consumer0 = 1,
+    Consumer1 = 2,
+  };
+  enum class ProducerWarpRole {
+    Mainloop = 0,
+    Warp1 = 1,
+    Epilogue = 2,
+    MainloopAux = 3,
+  };
+
+  const auto warp_group_role = WarpGroupRole(warp_group_idx);
+  const auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
+
+  auto tiled_mma = typename CutlassCollectiveMainloopK128::TiledMma{};
+  auto accum = cute::partition_fragment_C(
+      tiled_mma, cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+  auto& pv_shared =
+      *reinterpret_cast<typename CutlassCollectiveMainloopK128::SharedStorage*>(
+          &owner_storage.qk);
+
+  if (warp_idx == 0 && lane_predicate) {
+    CutlassCollectiveMainloopK128::prefetch_tma_descriptors(
+        pv_params.mainloop);
+  }
+
+  using PvPipeline = typename CutlassCollectiveMainloopK128::MainloopPipeline;
+  typename PvPipeline::Params pv_pipeline_params;
+  if (warp_group_role == WarpGroupRole::Producer &&
+      (producer_warp_role == ProducerWarpRole::Mainloop ||
+       producer_warp_role == ProducerWarpRole::MainloopAux)) {
+    pv_pipeline_params.role = PvPipeline::ThreadCategory::Producer;
+  }
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    pv_pipeline_params.role = PvPipeline::ThreadCategory::Consumer;
+  }
+  pv_pipeline_params.is_leader = warp_group_thread_idx == 0;
+  pv_pipeline_params.num_consumers = CutlassCollectiveMainloopK128::ThreadCount;
+  pv_pipeline_params.num_producers =
+      CutlassCollectiveMainloopK128::NumProducerThreadEvents;
+  pv_pipeline_params.transaction_bytes =
+      pv_params.mainloop.tma_transaction_bytes_nk;
+  PvPipeline pv_pipeline(owner_storage.pv_pipeline_storage, pv_pipeline_params,
+                         CutlassClusterShape{});
+  typename CutlassCollectiveMainloopK128::PipelineState pv_pipe_read;
+  typename CutlassCollectiveMainloopK128::PipelineState pv_pipe_write =
+      cutlass::make_producer_start_state<PvPipeline>();
+  __syncthreads();
+
+  for (int tile = 0; tile < num_kv_tiles; ++tile) {
+    const int kv_tile = kv_tile_start + tile;
+    qk_cutlass_collective_tile_body(qk_params, owner_storage.qk, scores, q_tile,
+                                    kv_tile, kCutlassTileN);
+    softmax_quant_scores_128(scores, qk_alpha, owner_storage.p_packed,
+                             owner_storage.p_scales, owner_storage.row_m,
+                             owner_storage.row_l);
+
+    if (tile == 0) {
+      for (int row = tid; row < kCutlassTileM; row += blockDim.x) {
+        owner_storage.global_m[row] = owner_storage.row_m[row];
+        owner_storage.global_l[row] = owner_storage.row_l[row];
+        owner_storage.old_scale[row] = 0.0f;
+        owner_storage.tile_scale[row] = 1.0f;
+      }
+    } else {
+      for (int row = tid; row < kCutlassTileM; row += blockDim.x) {
+        const float old_m = owner_storage.global_m[row];
+        const float tile_m = owner_storage.row_m[row];
+        const float new_m = fmaxf(old_m, tile_m);
+        const float old_scale = __expf(old_m - new_m);
+        const float tile_scale = __expf(tile_m - new_m);
+        owner_storage.global_m[row] = new_m;
+        owner_storage.global_l[row] =
+            owner_storage.global_l[row] * old_scale +
+            owner_storage.row_l[row] * tile_scale;
+        owner_storage.old_scale[row] = old_scale;
+        owner_storage.tile_scale[row] = tile_scale;
+      }
+    }
+    __syncthreads();
+
+    auto& pv_shared =
+        *reinterpret_cast<typename CutlassCollectiveMainloopK128::SharedStorage*>(
+            &owner_storage.qk);
+    const int pv_stage = tile % PvPipeline::Stages;
+    if (tile == 0) {
+      cutlass_smem_pv_k128_stage_p_body(
+          pv_shared, owner_storage.p_packed, owner_storage.p_scales,
+          nullptr, 1.0f, pv_stage);
+    } else {
+      cutlass_smem_pv_k128_stage_p_body(
+          pv_shared, owner_storage.p_packed, owner_storage.p_scales,
+          owner_storage.tile_scale, 1.0f, pv_stage);
+    }
+    if (is_consumer) {
+      cutlass_smem_pv_k128_scale_or_clear_accum(
+          accum, owner_storage.old_scale, mma_thread_idx, tile == 0 ? 1 : 0);
+    }
+    cutlass_smem_pv_k128_tma_v_group_accum_persistent_step(
+        pv_params, pv_shared, pv_pipeline, pv_pipe_read, pv_pipe_write,
+        accum, out_group_idx, kv_tile);
+  }
+
+  if (warp_group_role == WarpGroupRole::Producer &&
+      producer_warp_role == ProducerWarpRole::Mainloop) {
+    CutlassCollectiveMainloopK128 collective;
+    collective.load_tail(pv_pipeline, pv_pipe_write);
+  }
+
+  if (is_consumer) {
+    auto thread_mma = tiled_mma.get_thread_slice(mma_thread_idx);
+    auto cC = cute::make_identity_tensor(
+        cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+    auto tCcC = thread_mma.partition_C(cC);
+    for (int i = 0; i < cute::size(accum); ++i) {
+      auto coord = tCcC(i);
+      const int row = int(cute::get<0>(coord));
+      const int col = int(cute::get<1>(coord));
+      if (row < kCutlassTileM && col < kCutlassTileN) {
+        out_group[row * kCutlassTileN + col] =
+            accum(i) * pv_base_scale /
+            fmaxf(owner_storage.global_l[row], 1.0e-20f);
+      }
+    }
+  }
+#else
+  if (threadIdx.x == 0) {
+    out_group[0] = -1.0f;
+  }
+#endif
+}
+
+__global__ __launch_bounds__(384, 1)
+void persistent_mainloop_owner_group_online_register_q_stage_kernel(
+    const uint8_t* q_packed,
+    const uint8_t* q_scales,
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
+    CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128::Params const pv_params,
+    float* out_group,
+    float qk_alpha,
+    float pv_alpha,
+    int q_tile,
+    int kv_tile_start,
+    int num_kv_tiles,
+    int out_group_idx) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
+  using cute::_;
+  extern __shared__ __align__(128) char smem[];
+  auto& owner_storage = *reinterpret_cast<CutlassFusedTmaQkPv128Storage*>(smem);
+  float* scores = reinterpret_cast<float*>(&owner_storage.qk.tensors);
+  const int tid = int(threadIdx.x);
+  const int block_thread_idx = int(threadIdx.x);
+  const int warp_idx = cutlass::canonical_warp_idx_sync();
+  const int warp_idx_in_warp_group = warp_idx % cutlass::NumWarpsPerWarpGroup;
+  const int warp_group_thread_idx =
+      block_thread_idx % cutlass::NumThreadsPerWarpGroup;
+  const int warp_group_idx = cutlass::canonical_warp_group_idx();
+  const bool is_consumer = warp_group_idx == 1 || warp_group_idx == 2;
+  const int qk_mma_thread_idx =
+      block_thread_idx % CutlassCollectiveMainloop::ThreadCount;
+  const int pv_mma_thread_idx =
+      block_thread_idx % CutlassCollectiveMainloopK128::ThreadCount;
+  const bool lane_predicate = cute::elect_one_sync();
+  const float pv_base_scale = pv_alpha / kProbGlobalScale;
+
+  enum class WarpGroupRole {
+    Producer = 0,
+    Consumer0 = 1,
+    Consumer1 = 2,
+  };
+  enum class ProducerWarpRole {
+    Mainloop = 0,
+    Warp1 = 1,
+    Epilogue = 2,
+    MainloopAux = 3,
+  };
+
+  const auto warp_group_role = WarpGroupRole(warp_group_idx);
+  const auto producer_warp_role = ProducerWarpRole(warp_idx_in_warp_group);
+
+  CutlassCollectiveMainloop qk_collective;
+  auto qk_tiled_mma = typename CutlassCollectiveMainloop::TiledMma{};
+  auto qk_thread_mma = qk_tiled_mma.get_thread_slice(qk_mma_thread_idx);
+  auto qk_sA = cute::make_tensor(
+      cute::make_smem_ptr(owner_storage.qk.tensors.smem_A.begin()),
+      typename CutlassCollectiveMainloop::SmemLayoutA{});
+  auto qk_sB = cute::make_tensor(
+      cute::make_smem_ptr(owner_storage.qk.tensors.smem_B.begin()),
+      typename CutlassCollectiveMainloop::SmemLayoutB{});
+  auto qk_sSFA = cute::make_tensor(
+      cute::make_smem_ptr(owner_storage.qk.tensors.smem_SFA.begin()),
+      typename CutlassCollectiveMainloop::SmemLayoutSFA{});
+  auto qk_sSFB = cute::make_tensor(
+      cute::make_smem_ptr(owner_storage.qk.tensors.smem_SFB.begin()),
+      typename CutlassCollectiveMainloop::SmemLayoutSFB{});
+
+  auto q_frag0 = qk_thread_mma.partition_fragment_A(
+      qk_sA(_, _, cute::Int<0>{}));
+  auto q_frag1 = qk_thread_mma.partition_fragment_A(
+      qk_sA(_, _, cute::Int<0>{}));
+  auto q_scale_frag0 =
+      qk_collective.partition_fragment_SFA(qk_sSFA(_, _, cute::Int<0>{}),
+                                           qk_thread_mma);
+  auto q_scale_frag1 =
+      qk_collective.partition_fragment_SFA(qk_sSFA(_, _, cute::Int<0>{}),
+                                           qk_thread_mma);
+
+  auto qk_smem_tiled_copy_A = cute::make_tiled_copy_A(
+      typename CutlassCollectiveMainloop::SmemCopyAtomA{}, qk_tiled_mma);
+  auto qk_smem_thr_copy_A =
+      qk_smem_tiled_copy_A.get_thread_slice(qk_mma_thread_idx);
+  auto qk_tCsA = qk_smem_thr_copy_A.partition_S(
+      cute::as_position_independent_swizzle_tensor(qk_sA));
+  auto q_frag0_copy_view = qk_smem_thr_copy_A.retile_D(q_frag0);
+  auto q_frag1_copy_view = qk_smem_thr_copy_A.retile_D(q_frag1);
+  auto qk_cA = cute::make_identity_tensor(cute::make_shape(
+      cute::Int<kCutlassTileM>{}, cute::Int<kCutlassTileK>{},
+      cute::Int<1>{}));
+  auto qk_tAsA_prod = qk_smem_thr_copy_A.partition_D(qk_sA);
+  auto qk_tAcA_prod = qk_smem_thr_copy_A.partition_D(qk_cA);
+
+  auto qk_tile_shape_mnk = cute::tile_shape(qk_tiled_mma);
+  auto qk_smem_tiled_copy_SFA = cute::make_tiled_copy_impl(
+      typename CutlassCollectiveMainloop::SmemCopyAtomSFA{},
+      qk_collective.get_layoutSFA_TV(qk_tiled_mma),
+      cute::make_shape(cute::size<0>(qk_tile_shape_mnk),
+                       cute::size<2>(qk_tile_shape_mnk)));
+  auto qk_smem_thr_copy_SFA =
+      qk_smem_tiled_copy_SFA.get_thread_slice(qk_mma_thread_idx);
+  auto qk_tCsSFA = qk_smem_thr_copy_SFA.partition_S(
+      cute::as_position_independent_swizzle_tensor(qk_sSFA));
+  auto q_scale_frag0_copy_view =
+      qk_smem_thr_copy_SFA.retile_D(q_scale_frag0);
+  auto q_scale_frag1_copy_view =
+      qk_smem_thr_copy_SFA.retile_D(q_scale_frag1);
+
+  auto write_partitioned_q_fp4 = [&](auto tDst,
+                                     auto tCoord,
+                                     int source_col_base) {
+    for (int i = 0; i < int(cute::size(tDst)); ++i) {
+      auto coord = tCoord(i);
+      const int row = int(cute::get<0>(coord));
+      const int k = int(cute::get<1>(coord));
+      const int source_col = source_col_base + k;
+      const uint8_t byte =
+          q_packed[(q_tile * kCutlassTileM + row) * kPackedHeadDim +
+                   (source_col >> 1)];
+      const uint8_t code =
+          static_cast<uint8_t>((source_col & 1) ? ((byte >> 4) & 0x0f)
+                                                : (byte & 0x0f));
+      tDst(i) = cute::uint4_t(code);
+    }
+  };
+
+  auto stage_q_register_fragment = [&](int source_col_base,
+                                       auto& q_frag_copy_view,
+                                       auto& q_scale_frag_copy_view) {
+    uint8_t* smem_a_bytes =
+        cute::recast_ptr<uint8_t>(owner_storage.qk.tensors.smem_A.begin());
+    constexpr int kSmemABytes =
+        (cute::cosize_v<typename CutlassCollectiveMainloop::SmemLayoutA> + 1) /
+        2;
+    for (int idx = block_thread_idx; idx < kSmemABytes; idx += blockDim.x) {
+      smem_a_bytes[idx] = 0;
+    }
+    __syncthreads();
+
+    auto K_BLOCK_MAX_PROD = cute::size<2>(qk_tAsA_prod);
+    if (is_consumer) {
+      cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
+                     [&](auto k_block) {
+        write_partitioned_q_fp4(qk_tAsA_prod(_, _, k_block, cute::Int<0>{}),
+                                qk_tAcA_prod(_, _, k_block, cute::Int<0>{}),
+                                source_col_base);
+      });
+    }
+    for (int idx = block_thread_idx;
+         idx < kCutlassTileM * kCutlassTileK / 2;
+         idx += blockDim.x) {
+      const int row = idx / (kCutlassTileK / 2);
+      const int packed_k = idx - row * (kCutlassTileK / 2);
+      const int k0 = 2 * packed_k;
+      const int q_scale_col = (source_col_base + k0) >> 4;
+      qk_sSFA(row, k0, cute::Int<0>{}) =
+          make_ue4m3_raw(q_scales[(q_tile * kCutlassTileM + row) *
+                                      kScaleCols +
+                                  q_scale_col]);
+    }
+    __syncthreads();
+
+    if (is_consumer) {
+      auto K_BLOCK_MAX = cute::size<2>(q_frag_copy_view);
+      cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
+        cute::copy(qk_smem_tiled_copy_A,
+                   qk_tCsA(_, _, k_block, cute::Int<0>{}),
+                   q_frag_copy_view(_, _, k_block));
+        using MMAOp = typename CutlassCollectiveMainloop::TiledMma::MMA_Op;
+        fp4_shift_A(MMAOp{}, q_frag_copy_view(_, _, k_block));
+        cute::copy(qk_tCsSFA(_, _, k_block, cute::Int<0>{}),
+                   q_scale_frag_copy_view(_, _, k_block));
+      });
+    }
+    __syncthreads();
+  };
+
+  stage_q_register_fragment(0, q_frag0_copy_view, q_scale_frag0_copy_view);
+  stage_q_register_fragment(kCutlassTileK, q_frag1_copy_view,
+                            q_scale_frag1_copy_view);
+
+  if (warp_idx == 0 && lane_predicate) {
+    cute::prefetch_tma_descriptor(
+        qk_params.mainloop.tma_load_b.get_tma_descriptor());
+    cute::prefetch_tma_descriptor(
+        qk_params.mainloop.tma_load_sfb.get_tma_descriptor());
+    CutlassCollectiveMainloopK128::prefetch_tma_descriptors(
+        pv_params.mainloop);
+  }
+
+  using QkPipeline = typename CutlassCollectiveMainloop::MainloopPipeline;
+  typename QkPipeline::Params qk_pipeline_params;
+  if (warp_group_role == WarpGroupRole::Producer &&
+      (producer_warp_role == ProducerWarpRole::Mainloop ||
+       producer_warp_role == ProducerWarpRole::MainloopAux)) {
+    qk_pipeline_params.role = QkPipeline::ThreadCategory::Producer;
+  }
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    qk_pipeline_params.role = QkPipeline::ThreadCategory::Consumer;
+  }
+  qk_pipeline_params.is_leader = warp_group_thread_idx == 0;
+  qk_pipeline_params.num_consumers = CutlassCollectiveMainloop::ThreadCount;
+  qk_pipeline_params.num_producers =
+      CutlassCollectiveMainloop::NumProducerThreadEvents;
+  qk_pipeline_params.transaction_bytes =
+      qk_params.mainloop.tma_transaction_bytes_nk;
+  QkPipeline qk_pipeline(owner_storage.qk.pipeline_storage, qk_pipeline_params,
+                         CutlassClusterShape{});
+  typename CutlassCollectiveMainloop::PipelineState qk_pipe_read;
+  typename CutlassCollectiveMainloop::PipelineState qk_pipe_write =
+      cutlass::make_producer_start_state<QkPipeline>();
+
+  using PvPipeline = typename CutlassCollectiveMainloopK128::MainloopPipeline;
+  typename PvPipeline::Params pv_pipeline_params;
+  if (warp_group_role == WarpGroupRole::Producer &&
+      (producer_warp_role == ProducerWarpRole::Mainloop ||
+       producer_warp_role == ProducerWarpRole::MainloopAux)) {
+    pv_pipeline_params.role = PvPipeline::ThreadCategory::Producer;
+  }
+  if (warp_group_role == WarpGroupRole::Consumer0 ||
+      warp_group_role == WarpGroupRole::Consumer1) {
+    pv_pipeline_params.role = PvPipeline::ThreadCategory::Consumer;
+  }
+  pv_pipeline_params.is_leader = warp_group_thread_idx == 0;
+  pv_pipeline_params.num_consumers = CutlassCollectiveMainloopK128::ThreadCount;
+  pv_pipeline_params.num_producers =
+      CutlassCollectiveMainloopK128::NumProducerThreadEvents;
+  pv_pipeline_params.transaction_bytes =
+      pv_params.mainloop.tma_transaction_bytes_nk;
+  PvPipeline pv_pipeline(owner_storage.pv_pipeline_storage, pv_pipeline_params,
+                         CutlassClusterShape{});
+  typename CutlassCollectiveMainloopK128::PipelineState pv_pipe_read;
+  typename CutlassCollectiveMainloopK128::PipelineState pv_pipe_write =
+      cutlass::make_producer_start_state<PvPipeline>();
+  __syncthreads();
+
+  auto qk_problem_shape_mnkl =
+      cute::append<4>(qk_params.problem_shape, cute::Int<1>{});
+  auto qk_load_inputs =
+      qk_collective.load_init(qk_problem_shape_mnkl, qk_params.mainloop);
+  auto [qk_gA_mkl, qk_gB_nkl, qk_gSFA_mkl, qk_gSFB_nkl] = qk_load_inputs;
+  auto qk_block_tma_b = qk_params.mainloop.tma_load_b.get_slice(0);
+  auto qk_block_tma_sfb = qk_params.mainloop.tma_load_sfb.get_slice(0);
+  auto qk_tBsB = qk_block_tma_b.partition_D(qk_sB);
+  auto qk_tBsSFB = qk_block_tma_sfb.partition_D(qk_sSFB);
+
+  auto pv_tiled_mma = typename CutlassCollectiveMainloopK128::TiledMma{};
+  auto pv_accum = cute::partition_fragment_C(
+      pv_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+  auto& pv_shared =
+      *reinterpret_cast<typename CutlassCollectiveMainloopK128::SharedStorage*>(
+          &owner_storage.qk);
+
+  for (int tile = 0; tile < num_kv_tiles; ++tile) {
+    const int kv_tile = kv_tile_start + tile;
+    auto qk_accum = cute::partition_fragment_C(
+        qk_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShape{}));
+    if (is_consumer) {
+      cute::clear(qk_accum);
+    }
+
+    auto load_qk_b_tile = [&](int k_outer) {
+      if (warp_group_role == WarpGroupRole::Producer &&
+          producer_warp_role == ProducerWarpRole::Mainloop) {
+        if (lane_predicate) {
+          auto gB = qk_gB_nkl(_, _, kv_tile, _, 0);
+          auto gSFB = qk_gSFB_nkl(_, _, kv_tile, _, 0);
+          auto qk_tBgB = qk_block_tma_b.partition_S(gB);
+          auto qk_tBgSFB = qk_block_tma_sfb.partition_S(gSFB);
+          auto k_tile_iter = cute::make_coord_iterator(
+              cute::idx2crd(k_outer, cute::shape<3>(qk_gB_nkl)),
+              cute::shape<3>(qk_gB_nkl));
+          qk_pipeline.producer_acquire(qk_pipe_write);
+          using BarrierType = typename QkPipeline::ProducerBarrierType;
+          BarrierType* tma_barrier =
+              qk_pipeline.producer_get_barrier(qk_pipe_write);
+          const int write_stage = qk_pipe_write.index();
+          cute::copy(qk_params.mainloop.tma_load_b.with(*tma_barrier),
+                     qk_tBgB(_, _, _, *k_tile_iter),
+                     qk_tBsB(_, _, _, write_stage));
+          cute::copy(qk_params.mainloop.tma_load_sfb.with(*tma_barrier),
+                     qk_tBgSFB(_, _, _, *k_tile_iter),
+                     qk_tBsSFB(_, _, _, write_stage));
+          ++qk_pipe_write;
+        }
+      }
+    };
+
+    load_qk_b_tile(0);
+    if (is_consumer) {
+      cutlass_qk_tma_k_mma_register_q_stage(
+          qk_pipeline, qk_pipe_read, q_frag0, q_scale_frag0, qk_accum,
+          qk_mma_thread_idx, owner_storage.qk.tensors);
+    }
+    load_qk_b_tile(1);
+    if (is_consumer) {
+      cutlass_qk_tma_k_mma_register_q_stage(
+          qk_pipeline, qk_pipe_read, q_frag1, q_scale_frag1, qk_accum,
+          qk_mma_thread_idx, owner_storage.qk.tensors);
+
+      auto qk_cC = cute::make_identity_tensor(
+          cute::take<0, 2>(CutlassThreadBlockShape{}));
+      auto qk_tCcC = qk_thread_mma.partition_C(qk_cC);
+      for (int i = 0; i < cute::size(qk_accum); ++i) {
+        auto coord = qk_tCcC(i);
+        const int row = int(cute::get<0>(coord));
+        const int col = int(cute::get<1>(coord));
+        if (row < kCutlassTileM && col < kCutlassTileN) {
+          scores[row * kCutlassTileN + col] = qk_accum(i);
+        }
+      }
+    }
+    __syncthreads();
+
+    softmax_quant_scores_128(scores, qk_alpha, owner_storage.p_packed,
+                             owner_storage.p_scales, owner_storage.row_m,
+                             owner_storage.row_l);
+
+    if (tile == 0) {
+      for (int row = tid; row < kCutlassTileM; row += blockDim.x) {
+        owner_storage.global_m[row] = owner_storage.row_m[row];
+        owner_storage.global_l[row] = owner_storage.row_l[row];
+        owner_storage.old_scale[row] = 0.0f;
+        owner_storage.tile_scale[row] = 1.0f;
+      }
+    } else {
+      for (int row = tid; row < kCutlassTileM; row += blockDim.x) {
+        const float old_m = owner_storage.global_m[row];
+        const float tile_m = owner_storage.row_m[row];
+        const float new_m = fmaxf(old_m, tile_m);
+        const float old_scale = __expf(old_m - new_m);
+        const float tile_scale = __expf(tile_m - new_m);
+        owner_storage.global_m[row] = new_m;
+        owner_storage.global_l[row] =
+            owner_storage.global_l[row] * old_scale +
+            owner_storage.row_l[row] * tile_scale;
+        owner_storage.old_scale[row] = old_scale;
+        owner_storage.tile_scale[row] = tile_scale;
+      }
+    }
+    __syncthreads();
+
+    const int pv_stage = tile % PvPipeline::Stages;
+    if (tile == 0) {
+      cutlass_smem_pv_k128_stage_p_body(
+          pv_shared, owner_storage.p_packed, owner_storage.p_scales, nullptr,
+          1.0f, pv_stage);
+    } else {
+      cutlass_smem_pv_k128_stage_p_body(
+          pv_shared, owner_storage.p_packed, owner_storage.p_scales,
+          owner_storage.tile_scale, 1.0f, pv_stage);
+    }
+    if (is_consumer) {
+      cutlass_smem_pv_k128_scale_or_clear_accum(
+          pv_accum, owner_storage.old_scale, pv_mma_thread_idx,
+          tile == 0 ? 1 : 0);
+    }
+    cutlass_smem_pv_k128_tma_v_group_accum_persistent_step(
+        pv_params, pv_shared, pv_pipeline, pv_pipe_read, pv_pipe_write,
+        pv_accum, out_group_idx, kv_tile);
+  }
+
+  if (warp_group_role == WarpGroupRole::Producer &&
+      producer_warp_role == ProducerWarpRole::Mainloop) {
+    qk_collective.load_tail(qk_pipeline, qk_pipe_write);
+    CutlassCollectiveMainloopK128 pv_collective;
+    pv_collective.load_tail(pv_pipeline, pv_pipe_write);
+  }
+
+  if (is_consumer) {
+    auto pv_thread_mma = pv_tiled_mma.get_thread_slice(pv_mma_thread_idx);
+    auto pv_cC = cute::make_identity_tensor(
+        cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+    auto pv_tCcC = pv_thread_mma.partition_C(pv_cC);
+    for (int i = 0; i < cute::size(pv_accum); ++i) {
+      auto coord = pv_tCcC(i);
+      const int row = int(cute::get<0>(coord));
+      const int col = int(cute::get<1>(coord));
+      if (row < kCutlassTileM && col < kCutlassTileN) {
+        out_group[row * kCutlassTileN + col] =
+            pv_accum(i) * pv_base_scale /
+            fmaxf(owner_storage.global_l[row], 1.0e-20f);
+      }
+    }
+  }
+#else
+  if (threadIdx.x == 0) {
+    out_group[0] = -1.0f;
   }
 #endif
 }
@@ -5256,6 +6942,741 @@ void fused_cutlass_tma_qk_tma_pv_online_full_width_split_k128(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void persistent_mainloop_owner_layout_smoke(torch::Tensor out) {
+  check_tensor(out, "out", torch::kFloat32);
+  TORCH_CHECK(out.numel() >= 8, "out must contain at least 8 float values");
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(CutlassFusedTmaQkPv128Storage));
+  auto kernel = persistent_mainloop_owner_layout_smoke_kernel;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  kernel<<<dim3(1, 1, 1), CutlassGemmKernel::get_block_shape(), kSmemBytes,
+           at::cuda::getCurrentCUDAStream()>>>(out.data_ptr<float>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void persistent_mainloop_owner_qk_stage(torch::Tensor q_packed,
+                                        torch::Tensor q_scales,
+                                        torch::Tensor k_packed,
+                                        torch::Tensor k_scales,
+                                        torch::Tensor out_tile,
+                                        torch::Tensor workspace,
+                                        int64_t q_tile,
+                                        int64_t kv_tile) {
+  check_tensor(q_packed, "q_packed", torch::kUInt8);
+  check_tensor(q_scales, "q_scales", torch::kUInt8);
+  check_tensor(k_packed, "k_packed", torch::kUInt8);
+  check_tensor(k_scales, "k_scales", torch::kUInt8);
+  check_tensor(out_tile, "out_tile", torch::kFloat32);
+  check_tensor(workspace, "workspace", torch::kUInt8);
+  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
+              "q_packed must have shape [4096, 256]");
+  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
+              "q_scales must have shape [4096, 32]");
+  TORCH_CHECK(k_packed.sizes() == torch::IntArrayRef({kKvLen, kPackedHeadDim}),
+              "k_packed must have shape [32768, 256]");
+  TORCH_CHECK(k_scales.sizes() == torch::IntArrayRef({kKvLen, kScaleCols}),
+              "k_scales must have shape [32768, 32]");
+  TORCH_CHECK(out_tile.sizes() ==
+                  torch::IntArrayRef({kCutlassTileM, kCutlassTileN}),
+              "out_tile must have shape [128, 128]");
+  TORCH_CHECK(q_tile >= 0 && q_tile < kQRows / kCutlassTileM,
+              "q_tile out of range");
+  TORCH_CHECK(kv_tile >= 0 && kv_tile < kKvLen / kCutlassTileN,
+              "kv_tile out of range");
+
+  float alpha = 1.0f;
+  auto args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      k_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      k_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kQRows,
+      kKvLen,
+      kHeadDim,
+      1);
+  CutlassGemm gemm;
+  const size_t workspace_size = gemm.get_workspace_size(args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(workspace_size),
+              "workspace too small: need ", workspace_size, " bytes, got ",
+              workspace.numel());
+  auto status = gemm.initialize(
+      args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS QK GEMM params");
+  auto params = gemm.params();
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(CutlassFusedTmaQkPv128Storage));
+  auto kernel = persistent_mainloop_owner_qk_stage_kernel;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  kernel<<<dim3(1, 1, 1), CutlassGemmKernel::get_block_shape(), kSmemBytes,
+           at::cuda::getCurrentCUDAStream()>>>(
+      params, out_tile.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr,
+      0.0f, static_cast<int>(q_tile), static_cast<int>(kv_tile), 0);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void persistent_mainloop_owner_softmax_stage(torch::Tensor q_packed,
+                                             torch::Tensor q_scales,
+                                             torch::Tensor k_packed,
+                                             torch::Tensor k_scales,
+                                             torch::Tensor p_packed,
+                                             torch::Tensor p_scales,
+                                             torch::Tensor row_m,
+                                             torch::Tensor row_l,
+                                             torch::Tensor workspace,
+                                             double qk_alpha,
+                                             int64_t q_tile,
+                                             int64_t kv_tile) {
+  check_tensor(q_packed, "q_packed", torch::kUInt8);
+  check_tensor(q_scales, "q_scales", torch::kUInt8);
+  check_tensor(k_packed, "k_packed", torch::kUInt8);
+  check_tensor(k_scales, "k_scales", torch::kUInt8);
+  check_tensor(p_packed, "p_packed", torch::kUInt8);
+  check_tensor(p_scales, "p_scales", torch::kUInt8);
+  check_tensor(row_m, "row_m", torch::kFloat32);
+  check_tensor(row_l, "row_l", torch::kFloat32);
+  check_tensor(workspace, "workspace", torch::kUInt8);
+  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
+              "q_packed must have shape [4096, 256]");
+  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
+              "q_scales must have shape [4096, 32]");
+  TORCH_CHECK(k_packed.sizes() == torch::IntArrayRef({kKvLen, kPackedHeadDim}),
+              "k_packed must have shape [32768, 256]");
+  TORCH_CHECK(k_scales.sizes() == torch::IntArrayRef({kKvLen, kScaleCols}),
+              "k_scales must have shape [32768, 32]");
+  TORCH_CHECK(p_packed.sizes() ==
+                  torch::IntArrayRef({kCutlassTileM, kCutlassTileK128 / 2}),
+              "p_packed must have shape [128, 64]");
+  TORCH_CHECK(p_scales.sizes() ==
+                  torch::IntArrayRef({kCutlassTileM, kCutlassTileK128 / 16}),
+              "p_scales must have shape [128, 8]");
+  TORCH_CHECK(row_m.sizes() == torch::IntArrayRef({kCutlassTileM}),
+              "row_m must have shape [128]");
+  TORCH_CHECK(row_l.sizes() == torch::IntArrayRef({kCutlassTileM}),
+              "row_l must have shape [128]");
+  TORCH_CHECK(q_tile >= 0 && q_tile < kQRows / kCutlassTileM,
+              "q_tile out of range");
+  TORCH_CHECK(kv_tile >= 0 && kv_tile < kKvLen / kCutlassTileN,
+              "kv_tile out of range");
+
+  float alpha = 1.0f;
+  auto args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      k_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      k_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kQRows,
+      kKvLen,
+      kHeadDim,
+      1);
+  CutlassGemm gemm;
+  const size_t workspace_size = gemm.get_workspace_size(args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(workspace_size),
+              "workspace too small: need ", workspace_size, " bytes, got ",
+              workspace.numel());
+  auto status = gemm.initialize(
+      args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS QK GEMM params");
+  auto params = gemm.params();
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(CutlassFusedTmaQkPv128Storage));
+  auto kernel = persistent_mainloop_owner_qk_stage_kernel;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  kernel<<<dim3(1, 1, 1), CutlassGemmKernel::get_block_shape(), kSmemBytes,
+           at::cuda::getCurrentCUDAStream()>>>(
+      params, nullptr, p_packed.data_ptr<uint8_t>(),
+      p_scales.data_ptr<uint8_t>(), row_m.data_ptr<float>(),
+      row_l.data_ptr<float>(), static_cast<float>(qk_alpha),
+      static_cast<int>(q_tile), static_cast<int>(kv_tile), 1);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void persistent_mainloop_owner_pv_group_stage(torch::Tensor q_packed,
+                                              torch::Tensor q_scales,
+                                              torch::Tensor k_packed,
+                                              torch::Tensor k_scales,
+                                              torch::Tensor v_pv_packed,
+                                              torch::Tensor v_pv_scales,
+                                              torch::Tensor out_group,
+                                              torch::Tensor p_packed,
+                                              torch::Tensor p_scales,
+                                              torch::Tensor row_m,
+                                              torch::Tensor row_l,
+                                              torch::Tensor workspace,
+                                              double qk_alpha,
+                                              int64_t q_tile,
+                                              int64_t kv_tile,
+                                              int64_t out_group_idx) {
+  check_tensor(q_packed, "q_packed", torch::kUInt8);
+  check_tensor(q_scales, "q_scales", torch::kUInt8);
+  check_tensor(k_packed, "k_packed", torch::kUInt8);
+  check_tensor(k_scales, "k_scales", torch::kUInt8);
+  check_tensor(v_pv_packed, "v_pv_packed", torch::kUInt8);
+  check_tensor(v_pv_scales, "v_pv_scales", torch::kUInt8);
+  check_tensor(out_group, "out_group", torch::kFloat32);
+  check_tensor(p_packed, "p_packed", torch::kUInt8);
+  check_tensor(p_scales, "p_scales", torch::kUInt8);
+  check_tensor(row_m, "row_m", torch::kFloat32);
+  check_tensor(row_l, "row_l", torch::kFloat32);
+  check_tensor(workspace, "workspace", torch::kUInt8);
+  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
+              "q_packed must have shape [4096, 256]");
+  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
+              "q_scales must have shape [4096, 32]");
+  TORCH_CHECK(k_packed.sizes() == torch::IntArrayRef({kKvLen, kPackedHeadDim}),
+              "k_packed must have shape [32768, 256]");
+  TORCH_CHECK(k_scales.sizes() == torch::IntArrayRef({kKvLen, kScaleCols}),
+              "k_scales must have shape [32768, 32]");
+  TORCH_CHECK(v_pv_packed.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbPackedCols}),
+              "v_pv_packed must have shape [512, 16384]");
+  TORCH_CHECK(v_pv_scales.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbScaleCols}),
+              "v_pv_scales must have shape [512, 2048]");
+  TORCH_CHECK(out_group.sizes() ==
+                  torch::IntArrayRef({kCutlassTileM, kCutlassTileN}),
+              "out_group must have shape [128, 128]");
+  TORCH_CHECK(p_packed.sizes() ==
+                  torch::IntArrayRef({kCutlassTileM, kCutlassTileK128 / 2}),
+              "p_packed must have shape [128, 64]");
+  TORCH_CHECK(p_scales.sizes() ==
+                  torch::IntArrayRef({kCutlassTileM, kCutlassTileK128 / 16}),
+              "p_scales must have shape [128, 8]");
+  TORCH_CHECK(row_m.sizes() == torch::IntArrayRef({kCutlassTileM}),
+              "row_m must have shape [128]");
+  TORCH_CHECK(row_l.sizes() == torch::IntArrayRef({kCutlassTileM}),
+              "row_l must have shape [128]");
+  TORCH_CHECK(q_tile >= 0 && q_tile < kQRows / kCutlassTileM,
+              "q_tile out of range");
+  TORCH_CHECK(kv_tile >= 0 && kv_tile < kKvLen / kCutlassTileN,
+              "kv_tile out of range");
+  TORCH_CHECK(out_group_idx >= 0 && out_group_idx < kHeadDim / kCutlassTileN,
+              "out_group_idx out of range");
+
+  float alpha = 1.0f;
+  auto qk_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      k_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      k_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kQRows,
+      kKvLen,
+      kHeadDim,
+      1);
+  CutlassGemm qk_gemm;
+  const size_t qk_workspace_size = qk_gemm.get_workspace_size(qk_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(qk_workspace_size),
+              "workspace too small for QK: need ", qk_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto qk_status = qk_gemm.initialize(
+      qk_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(qk_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS QK GEMM params");
+  auto qk_params = qk_gemm.params();
+
+  auto pv_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemmK128>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      v_pv_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      v_pv_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kCutlassTileM,
+      kHeadDim,
+      kKvLen,
+      1);
+  CutlassGemmK128 pv_gemm;
+  const size_t pv_workspace_size = pv_gemm.get_workspace_size(pv_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(pv_workspace_size),
+              "workspace too small for PV: need ", pv_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto pv_status = pv_gemm.initialize(
+      pv_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(pv_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS PV GEMM params");
+  auto pv_params = pv_gemm.params();
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(CutlassFusedTmaQkPv128Storage));
+  auto kernel = persistent_mainloop_owner_pv_group_stage_kernel;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  kernel<<<dim3(1, 1, 1), CutlassGemmKernel::get_block_shape(), kSmemBytes,
+           at::cuda::getCurrentCUDAStream()>>>(
+      qk_params, pv_params, out_group.data_ptr<float>(),
+      p_packed.data_ptr<uint8_t>(), p_scales.data_ptr<uint8_t>(),
+      row_m.data_ptr<float>(), row_l.data_ptr<float>(),
+      static_cast<float>(qk_alpha), static_cast<int>(q_tile),
+      static_cast<int>(kv_tile), static_cast<int>(out_group_idx));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void persistent_mainloop_owner_full_tile_stage(torch::Tensor q_packed,
+                                               torch::Tensor q_scales,
+                                               torch::Tensor k_packed,
+                                               torch::Tensor k_scales,
+                                               torch::Tensor v_pv_packed,
+                                               torch::Tensor v_pv_scales,
+                                               torch::Tensor out,
+                                               torch::Tensor workspace,
+                                               double qk_alpha,
+                                               double pv_alpha,
+                                               int64_t q_tile,
+                                               int64_t kv_tile) {
+  check_tensor(q_packed, "q_packed", torch::kUInt8);
+  check_tensor(q_scales, "q_scales", torch::kUInt8);
+  check_tensor(k_packed, "k_packed", torch::kUInt8);
+  check_tensor(k_scales, "k_scales", torch::kUInt8);
+  check_tensor(v_pv_packed, "v_pv_packed", torch::kUInt8);
+  check_tensor(v_pv_scales, "v_pv_scales", torch::kUInt8);
+  check_tensor(out, "out", torch::kFloat32);
+  check_tensor(workspace, "workspace", torch::kUInt8);
+  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
+              "q_packed must have shape [4096, 256]");
+  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
+              "q_scales must have shape [4096, 32]");
+  TORCH_CHECK(k_packed.sizes() == torch::IntArrayRef({kKvLen, kPackedHeadDim}),
+              "k_packed must have shape [32768, 256]");
+  TORCH_CHECK(k_scales.sizes() == torch::IntArrayRef({kKvLen, kScaleCols}),
+              "k_scales must have shape [32768, 32]");
+  TORCH_CHECK(v_pv_packed.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbPackedCols}),
+              "v_pv_packed must have shape [512, 16384]");
+  TORCH_CHECK(v_pv_scales.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbScaleCols}),
+              "v_pv_scales must have shape [512, 2048]");
+  TORCH_CHECK(out.sizes() == torch::IntArrayRef({kCutlassTileM, kHeadDim}),
+              "out must have shape [128, 512]");
+  TORCH_CHECK(q_tile >= 0 && q_tile < kQRows / kCutlassTileM,
+              "q_tile out of range");
+  TORCH_CHECK(kv_tile >= 0 && kv_tile < kKvLen / kCutlassTileN,
+              "kv_tile out of range");
+
+  float alpha = 1.0f;
+  auto qk_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      k_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      k_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kQRows,
+      kKvLen,
+      kHeadDim,
+      1);
+  CutlassGemm qk_gemm;
+  const size_t qk_workspace_size = qk_gemm.get_workspace_size(qk_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(qk_workspace_size),
+              "workspace too small for QK: need ", qk_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto qk_status = qk_gemm.initialize(
+      qk_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(qk_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS QK GEMM params");
+  auto qk_params = qk_gemm.params();
+
+  auto pv_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemmK128>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      v_pv_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      v_pv_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kCutlassTileM,
+      kHeadDim,
+      kKvLen,
+      1);
+  CutlassGemmK128 pv_gemm;
+  const size_t pv_workspace_size = pv_gemm.get_workspace_size(pv_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(pv_workspace_size),
+              "workspace too small for PV: need ", pv_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto pv_status = pv_gemm.initialize(
+      pv_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(pv_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS PV GEMM params");
+  auto pv_params = pv_gemm.params();
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(CutlassFusedTmaQkPv128Storage));
+  auto kernel = persistent_mainloop_owner_full_tile_stage_kernel;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  kernel<<<dim3(1, 1, 1), CutlassGemmKernel::get_block_shape(), kSmemBytes,
+           at::cuda::getCurrentCUDAStream()>>>(
+      qk_params, pv_params, out.data_ptr<float>(),
+      static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
+      static_cast<int>(q_tile), static_cast<int>(kv_tile));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void persistent_mainloop_owner_group_online_stage(torch::Tensor q_packed,
+                                                  torch::Tensor q_scales,
+                                                  torch::Tensor k_packed,
+                                                  torch::Tensor k_scales,
+                                                  torch::Tensor v_pv_packed,
+                                                  torch::Tensor v_pv_scales,
+                                                  torch::Tensor out_group,
+                                                  torch::Tensor workspace,
+                                                  double qk_alpha,
+                                                  double pv_alpha,
+                                                  int64_t q_tile,
+                                                  int64_t kv_tile_start,
+                                                  int64_t num_kv_tiles,
+                                                  int64_t out_group_idx) {
+  check_tensor(q_packed, "q_packed", torch::kUInt8);
+  check_tensor(q_scales, "q_scales", torch::kUInt8);
+  check_tensor(k_packed, "k_packed", torch::kUInt8);
+  check_tensor(k_scales, "k_scales", torch::kUInt8);
+  check_tensor(v_pv_packed, "v_pv_packed", torch::kUInt8);
+  check_tensor(v_pv_scales, "v_pv_scales", torch::kUInt8);
+  check_tensor(out_group, "out_group", torch::kFloat32);
+  check_tensor(workspace, "workspace", torch::kUInt8);
+  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
+              "q_packed must have shape [4096, 256]");
+  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
+              "q_scales must have shape [4096, 32]");
+  TORCH_CHECK(k_packed.sizes() == torch::IntArrayRef({kKvLen, kPackedHeadDim}),
+              "k_packed must have shape [32768, 256]");
+  TORCH_CHECK(k_scales.sizes() == torch::IntArrayRef({kKvLen, kScaleCols}),
+              "k_scales must have shape [32768, 32]");
+  TORCH_CHECK(v_pv_packed.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbPackedCols}),
+              "v_pv_packed must have shape [512, 16384]");
+  TORCH_CHECK(v_pv_scales.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbScaleCols}),
+              "v_pv_scales must have shape [512, 2048]");
+  TORCH_CHECK(out_group.sizes() ==
+                  torch::IntArrayRef({kCutlassTileM, kCutlassTileN}),
+              "out_group must have shape [128, 128]");
+  TORCH_CHECK(q_tile >= 0 && q_tile < kQRows / kCutlassTileM,
+              "q_tile out of range");
+  TORCH_CHECK(kv_tile_start >= 0 &&
+                  kv_tile_start < kKvLen / kCutlassTileN,
+              "kv_tile_start out of range");
+  TORCH_CHECK(num_kv_tiles > 0 &&
+                  kv_tile_start + num_kv_tiles <= kKvLen / kCutlassTileN,
+              "num_kv_tiles out of range");
+  TORCH_CHECK(out_group_idx >= 0 && out_group_idx < kHeadDim / kCutlassTileN,
+              "out_group_idx out of range");
+
+  float alpha = 1.0f;
+  auto qk_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      k_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      k_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kQRows,
+      kKvLen,
+      kHeadDim,
+      1);
+  CutlassGemm qk_gemm;
+  const size_t qk_workspace_size = qk_gemm.get_workspace_size(qk_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(qk_workspace_size),
+              "workspace too small for QK: need ", qk_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto qk_status = qk_gemm.initialize(
+      qk_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(qk_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS QK GEMM params");
+  auto qk_params = qk_gemm.params();
+
+  auto pv_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemmK128>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      v_pv_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      v_pv_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kCutlassTileM,
+      kHeadDim,
+      kKvLen,
+      1);
+  CutlassGemmK128 pv_gemm;
+  const size_t pv_workspace_size = pv_gemm.get_workspace_size(pv_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(pv_workspace_size),
+              "workspace too small for PV: need ", pv_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto pv_status = pv_gemm.initialize(
+      pv_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(pv_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS PV GEMM params");
+  auto pv_params = pv_gemm.params();
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(CutlassFusedTmaQkPv128Storage));
+  auto kernel = persistent_mainloop_owner_group_online_stage_kernel;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  kernel<<<dim3(1, 1, 1), CutlassGemmKernel::get_block_shape(), kSmemBytes,
+           at::cuda::getCurrentCUDAStream()>>>(
+      qk_params, pv_params, out_group.data_ptr<float>(),
+      static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
+      static_cast<int>(q_tile), static_cast<int>(kv_tile_start),
+           static_cast<int>(num_kv_tiles), static_cast<int>(out_group_idx));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void persistent_mainloop_owner_group_online_register_stage(
+    torch::Tensor q_packed,
+    torch::Tensor q_scales,
+    torch::Tensor k_packed,
+    torch::Tensor k_scales,
+    torch::Tensor v_pv_packed,
+    torch::Tensor v_pv_scales,
+    torch::Tensor out_group,
+    torch::Tensor workspace,
+    double qk_alpha,
+    double pv_alpha,
+    int64_t q_tile,
+    int64_t kv_tile_start,
+    int64_t num_kv_tiles,
+    int64_t out_group_idx) {
+  check_tensor(q_packed, "q_packed", torch::kUInt8);
+  check_tensor(q_scales, "q_scales", torch::kUInt8);
+  check_tensor(k_packed, "k_packed", torch::kUInt8);
+  check_tensor(k_scales, "k_scales", torch::kUInt8);
+  check_tensor(v_pv_packed, "v_pv_packed", torch::kUInt8);
+  check_tensor(v_pv_scales, "v_pv_scales", torch::kUInt8);
+  check_tensor(out_group, "out_group", torch::kFloat32);
+  check_tensor(workspace, "workspace", torch::kUInt8);
+  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
+              "q_packed must have shape [4096, 256]");
+  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
+              "q_scales must have shape [4096, 32]");
+  TORCH_CHECK(k_packed.sizes() == torch::IntArrayRef({kKvLen, kPackedHeadDim}),
+              "k_packed must have shape [32768, 256]");
+  TORCH_CHECK(k_scales.sizes() == torch::IntArrayRef({kKvLen, kScaleCols}),
+              "k_scales must have shape [32768, 32]");
+  TORCH_CHECK(v_pv_packed.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbPackedCols}),
+              "v_pv_packed must have shape [512, 16384]");
+  TORCH_CHECK(v_pv_scales.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbScaleCols}),
+              "v_pv_scales must have shape [512, 2048]");
+  TORCH_CHECK(out_group.sizes() ==
+                  torch::IntArrayRef({kCutlassTileM, kCutlassTileN}),
+              "out_group must have shape [128, 128]");
+  TORCH_CHECK(q_tile >= 0 && q_tile < kQRows / kCutlassTileM,
+              "q_tile out of range");
+  TORCH_CHECK(kv_tile_start >= 0 &&
+                  kv_tile_start < kKvLen / kCutlassTileN,
+              "kv_tile_start out of range");
+  TORCH_CHECK(num_kv_tiles > 0 &&
+                  kv_tile_start + num_kv_tiles <= kKvLen / kCutlassTileN,
+              "num_kv_tiles out of range");
+  TORCH_CHECK(out_group_idx >= 0 && out_group_idx < kHeadDim / kCutlassTileN,
+              "out_group_idx out of range");
+
+  float alpha = 1.0f;
+  auto qk_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      k_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      k_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kQRows,
+      kKvLen,
+      kHeadDim,
+      1);
+  CutlassGemm qk_gemm;
+  const size_t qk_workspace_size = qk_gemm.get_workspace_size(qk_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(qk_workspace_size),
+              "workspace too small for QK: need ", qk_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto qk_status = qk_gemm.initialize(
+      qk_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(qk_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS QK GEMM params");
+  auto qk_params = qk_gemm.params();
+
+  auto pv_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemmK128>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      v_pv_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      v_pv_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kCutlassTileM,
+      kHeadDim,
+      kKvLen,
+      1);
+  CutlassGemmK128 pv_gemm;
+  const size_t pv_workspace_size = pv_gemm.get_workspace_size(pv_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(pv_workspace_size),
+              "workspace too small for PV: need ", pv_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto pv_status = pv_gemm.initialize(
+      pv_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(pv_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS PV GEMM params");
+  auto pv_params = pv_gemm.params();
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(CutlassFusedTmaQkPv128Storage));
+  auto kernel = persistent_mainloop_owner_group_online_register_stage_kernel;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  kernel<<<dim3(1, 1, 1), CutlassGemmKernel::get_block_shape(), kSmemBytes,
+           at::cuda::getCurrentCUDAStream()>>>(
+      qk_params, pv_params, out_group.data_ptr<float>(),
+      static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
+      static_cast<int>(q_tile), static_cast<int>(kv_tile_start),
+      static_cast<int>(num_kv_tiles), static_cast<int>(out_group_idx));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void persistent_mainloop_owner_group_online_register_q_stage(
+    torch::Tensor q_packed,
+    torch::Tensor q_scales,
+    torch::Tensor k_packed,
+    torch::Tensor k_scales,
+    torch::Tensor v_pv_packed,
+    torch::Tensor v_pv_scales,
+    torch::Tensor out_group,
+    torch::Tensor workspace,
+    double qk_alpha,
+    double pv_alpha,
+    int64_t q_tile,
+    int64_t kv_tile_start,
+    int64_t num_kv_tiles,
+    int64_t out_group_idx) {
+  check_tensor(q_packed, "q_packed", torch::kUInt8);
+  check_tensor(q_scales, "q_scales", torch::kUInt8);
+  check_tensor(k_packed, "k_packed", torch::kUInt8);
+  check_tensor(k_scales, "k_scales", torch::kUInt8);
+  check_tensor(v_pv_packed, "v_pv_packed", torch::kUInt8);
+  check_tensor(v_pv_scales, "v_pv_scales", torch::kUInt8);
+  check_tensor(out_group, "out_group", torch::kFloat32);
+  check_tensor(workspace, "workspace", torch::kUInt8);
+  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
+              "q_packed must have shape [4096, 256]");
+  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
+              "q_scales must have shape [4096, 32]");
+  TORCH_CHECK(k_packed.sizes() == torch::IntArrayRef({kKvLen, kPackedHeadDim}),
+              "k_packed must have shape [32768, 256]");
+  TORCH_CHECK(k_scales.sizes() == torch::IntArrayRef({kKvLen, kScaleCols}),
+              "k_scales must have shape [32768, 32]");
+  TORCH_CHECK(v_pv_packed.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbPackedCols}),
+              "v_pv_packed must have shape [512, 16384]");
+  TORCH_CHECK(v_pv_scales.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbScaleCols}),
+              "v_pv_scales must have shape [512, 2048]");
+  TORCH_CHECK(out_group.sizes() ==
+                  torch::IntArrayRef({kCutlassTileM, kCutlassTileN}),
+              "out_group must have shape [128, 128]");
+  TORCH_CHECK(q_tile >= 0 && q_tile < kQRows / kCutlassTileM,
+              "q_tile out of range");
+  TORCH_CHECK(kv_tile_start >= 0 &&
+                  kv_tile_start < kKvLen / kCutlassTileN,
+              "kv_tile_start out of range");
+  TORCH_CHECK(num_kv_tiles > 0 &&
+                  kv_tile_start + num_kv_tiles <= kKvLen / kCutlassTileN,
+              "num_kv_tiles out of range");
+  TORCH_CHECK(out_group_idx >= 0 && out_group_idx < kHeadDim / kCutlassTileN,
+              "out_group_idx out of range");
+
+  float alpha = 1.0f;
+  auto qk_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      k_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      k_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kQRows,
+      kKvLen,
+      kHeadDim,
+      1);
+  CutlassGemm qk_gemm;
+  const size_t qk_workspace_size = qk_gemm.get_workspace_size(qk_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(qk_workspace_size),
+              "workspace too small for QK: need ", qk_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto qk_status = qk_gemm.initialize(
+      qk_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(qk_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS QK GEMM params");
+  auto qk_params = qk_gemm.params();
+
+  auto pv_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemmK128>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      v_pv_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      v_pv_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kCutlassTileM,
+      kHeadDim,
+      kKvLen,
+      1);
+  CutlassGemmK128 pv_gemm;
+  const size_t pv_workspace_size = pv_gemm.get_workspace_size(pv_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(pv_workspace_size),
+              "workspace too small for PV: need ", pv_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto pv_status = pv_gemm.initialize(
+      pv_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(pv_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS PV GEMM params");
+  auto pv_params = pv_gemm.params();
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(CutlassFusedTmaQkPv128Storage));
+  auto kernel = persistent_mainloop_owner_group_online_register_q_stage_kernel;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  kernel<<<dim3(1, 1, 1), CutlassGemmKernel::get_block_shape(), kSmemBytes,
+           at::cuda::getCurrentCUDAStream()>>>(
+      q_packed.data_ptr<uint8_t>(), q_scales.data_ptr<uint8_t>(),
+      qk_params, pv_params, out_group.data_ptr<float>(),
+      static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
+      static_cast<int>(q_tile), static_cast<int>(kv_tile_start),
+      static_cast<int>(num_kv_tiles), static_cast<int>(out_group_idx));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 RunnerConfig runner_config_from_tactic(int64_t tactic) {
   static std::vector<RunnerConfig> configs =
       flashinfer::gemm::CutlassFp4GemmRunner<
@@ -5383,6 +7804,21 @@ pybind11::dict cutlass_sm120_blockscaled_collective_metadata() {
       static_cast<int64_t>(sizeof(typename CutlassCollectiveMainloop::LayoutSFA));
   d["layout_sfb_bytes"] =
       static_cast<int64_t>(sizeof(typename CutlassCollectiveMainloop::LayoutSFB));
+  constexpr int64_t kSm120OptinSmemBytes = 99ll << 10;
+  const int64_t qk_shared_bytes =
+      static_cast<int64_t>(sizeof(typename CutlassCollectiveMainloop::SharedStorage));
+  const int64_t pv_k128_shared_bytes =
+      static_cast<int64_t>(
+          sizeof(typename CutlassCollectiveMainloopK128::SharedStorage));
+  const int64_t qk_pv_independent_shared_bytes =
+      qk_shared_bytes + pv_k128_shared_bytes;
+  d["sm120_optin_smem_bytes"] = kSm120OptinSmemBytes;
+  d["persistent_independent_qk_pv_shared_bytes"] =
+      qk_pv_independent_shared_bytes;
+  d["persistent_independent_qk_pv_fits_sm120"] =
+      qk_pv_independent_shared_bytes <= kSm120OptinSmemBytes;
+  d["persistent_independent_qk_pv_smem_margin_bytes"] =
+      kSm120OptinSmemBytes - qk_pv_independent_shared_bytes;
   pybind11::dict tile_variants;
   tile_variants["128x128x128"] =
       cutlass_tile_shape_metadata<Sm120Fp4Tile128x128x128>(
@@ -5576,6 +8012,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_cutlass_tma_qk_tma_pv_online_full_width_split_k128",
         &fused_cutlass_tma_qk_tma_pv_online_full_width_split_k128,
         "CUTLASS SM120 K128 split-KV fused online-softmax/TMA-QK/TMA-PV scaffold");
+  m.def("persistent_mainloop_owner_layout_smoke",
+        &persistent_mainloop_owner_layout_smoke,
+        "SM120 phased single-storage persistent-mainloop owner layout smoke");
+  m.def("persistent_mainloop_owner_qk_stage",
+        &persistent_mainloop_owner_qk_stage,
+        "SM120 phased single-storage persistent-mainloop owner QK stage smoke");
+  m.def("persistent_mainloop_owner_softmax_stage",
+        &persistent_mainloop_owner_softmax_stage,
+        "SM120 phased single-storage persistent-mainloop owner QK plus P-quant smoke");
+  m.def("persistent_mainloop_owner_pv_group_stage",
+        &persistent_mainloop_owner_pv_group_stage,
+        "SM120 phased single-storage persistent-mainloop owner QK/P-quant/PV one-group smoke");
+  m.def("persistent_mainloop_owner_full_tile_stage",
+        &persistent_mainloop_owner_full_tile_stage,
+        "SM120 phased single-storage persistent-mainloop owner QK/P-quant/PV full-tile smoke");
+  m.def("persistent_mainloop_owner_group_online_stage",
+        &persistent_mainloop_owner_group_online_stage,
+        "SM120 phased owner one-output-group online-softmax multi-KV smoke");
+  m.def("persistent_mainloop_owner_group_online_register_stage",
+        &persistent_mainloop_owner_group_online_register_stage,
+        "SM120 phased owner one-output-group online-softmax register-accum multi-KV smoke");
+  m.def("persistent_mainloop_owner_group_online_register_q_stage",
+        &persistent_mainloop_owner_group_online_register_q_stage,
+        "SM120 phased owner one-output-group online-softmax register-resident-Q smoke");
   m.def("cutlass_runner_fp4_gemm", &cutlass_runner_fp4_gemm,
         "FlashInfer SM120 CUTLASS FP4 GEMM runner smoke hook");
   m.def("cutlass_sm120_blockscaled_collective_metadata",
