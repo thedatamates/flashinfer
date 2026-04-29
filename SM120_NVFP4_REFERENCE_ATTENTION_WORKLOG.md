@@ -6620,3 +6620,59 @@ by subdividing the existing full BF16 score-tile store with more barriers.
 The next viable S/P lifetime change must remove or shrink the durable BF16
 score tile itself, not add finer publication points around the same tile.
 ```
+
+## Rejected: 4-Row Independent Score Mailbox
+
+2026-04-28T21:50:00-05:00
+
+Tried the first implementation that actually removed the BF16 score tile from
+the K/B shared-memory region:
+
+```text
+score mailbox:
+  2 roles x 4 rows x 128 columns x BF16 = 2048 bytes
+
+QK/MMA:
+  compute full QK tile
+  release both K shared-memory stages immediately
+  stream 4-row score strips to Softmax0/Softmax1 mailboxes
+
+Softmax0/1:
+  consume one 4-row strip per pipeline handoff
+  keep per-strip running max/sum state in registers
+  write compact P into the existing A/SFA double buffer
+```
+
+This compiled only by using the entire SM120 opt-in shared-memory budget:
+
+```text
+storage_bytes: 101376
+storage_margin_bytes: 0
+```
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.00364356, max_abs=0.0125221, cosine=0.988535
+
+full grid first tile:
+  finite, mean_abs=0.00111393, max_abs=0.00456910, cosine=0.992592
+
+full-grid min:
+  baseline after softmax-owned P scale precompute: 9.8332 ms
+  4-row score mailbox:                         66.1595 ms
+```
+
+Decision:
+
+```text
+Rejected and reverted. This does remove K/B score-tile lifetime, but it
+replaces one tile-level S handoff with 32 score-strip handoffs per tile
+(16 strips per softmax role). The handoff and barrier overhead dominate.
+
+Conclusion for the next pass: independent score storage must be coarse enough
+to amortize pipeline overhead. A tiny row mailbox is structurally wrong on
+SM120. If we revisit independent S/P storage, it should be via a smaller-M CTA
+or a larger independent S buffer, not 4-row strip streaming at M=128.
+```
