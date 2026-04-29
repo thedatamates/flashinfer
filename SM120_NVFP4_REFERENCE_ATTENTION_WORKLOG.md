@@ -7411,3 +7411,51 @@ Conclusion:
 Small but positive. Keep it. The accuracy shift is within the existing
 reference-kernel tolerance band and the timing is marginally better.
 ```
+
+## Win: Remove Redundant Softmax Group Barrier
+
+2026-04-29T01:59:00-05:00
+
+After fusing P production into the row-owner softmax pass, the explicit
+softmax-group `NamedBarrier` before `consumer_release` became redundant:
+
+```text
+before:
+  row owners write P/SFA
+  NamedBarrier::sync(softmax_group)
+  fence_view_async_shared
+  pipeline consumer_release
+
+after:
+  row owners write P/SFA
+  fence_view_async_shared
+  pipeline consumer_release
+```
+
+The pipeline release is already the cross-role completion signal, and every
+physical softmax thread owns one row in the 2-warp role layout.
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000659900, max_abs=0.00350227, cosine=0.988955
+
+full grid first tile:
+  finite, mean_abs=0.000158765, max_abs=0.000815836, cosine=0.992936
+```
+
+Timing:
+
+```text
+with softmax barrier repeat=20:    min_ms=4.4847, mean_ms=4.5149
+without barrier repeat=20:         min_ms=4.4768, mean_ms=4.5034
+```
+
+Conclusion:
+
+```text
+Small but real. Keep it. This is safe only after row-owned P production; the
+old helper path needed the group barrier because helper threads consumed
+row-owner-produced BF16 probabilities and SFA.
+```

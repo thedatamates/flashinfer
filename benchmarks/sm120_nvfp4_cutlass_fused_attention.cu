@@ -1562,9 +1562,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     const int row_end = row_begin + kRowsPerSoftmaxRole;
     const int owned_row = row_begin + softmax_group_thread_idx;
     const bool owns_row = softmax_group_thread_idx < kRowsPerSoftmaxRole;
-    const uint32_t online_barrier_id =
-        is_softmax1 ? kSm120Nvfp4BarrierSoftmax1OnlineReady
-                    : kSm120Nvfp4BarrierSoftmax0OnlineReady;
     float running_m = -INFINITY;
     float running_l = 0.0f;
 
@@ -1633,9 +1630,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           storage.global_l[owned_row] = running_l;
         }
       }
-      cutlass::arch::NamedBarrier::sync(
-          kSm120Nvfp4FmhaSoftmaxGroupThreadCount,
-          online_barrier_id);
       cutlass::arch::fence_view_async_shared();
       release_p_ready();
     }
