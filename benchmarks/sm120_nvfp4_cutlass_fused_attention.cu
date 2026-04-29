@@ -1795,33 +1795,46 @@ __global__ void sm120_nvfp4_splitkv_combine_kernel(
     const float* split_l,
     __nv_bfloat16* out,
     int num_splits) {
-  const int idx = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
-  const int total = kQRows * kHeadDim;
-  if (idx >= total) {
+  const int row = int(blockIdx.x);
+  if (row >= kQRows) {
     return;
   }
-  const int row = idx / kHeadDim;
-  const int col = idx - row * kHeadDim;
+  __shared__ float split_weights[kKvLen / kCutlassTileN];
 
-  float global_m = -INFINITY;
+  if (threadIdx.x == 0) {
+    float global_m = -INFINITY;
 #pragma unroll 1
-  for (int split = 0; split < num_splits; ++split) {
-    global_m = fmaxf(global_m, split_m[split * kQRows + row]);
+    for (int split = 0; split < num_splits; ++split) {
+      global_m = fmaxf(global_m, split_m[split * kQRows + row]);
+    }
+
+    float global_l = 0.0f;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      const int stats_idx = split * kQRows + row;
+      const float correction = __expf(split_m[stats_idx] - global_m);
+      split_weights[split] = correction;
+      global_l += correction * split_l[stats_idx];
+    }
+    const float inv_global_l = 1.0f / fmaxf(global_l, 1.0e-20f);
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      split_weights[split] *= inv_global_l;
+    }
   }
 
-  float global_l = 0.0f;
-  float acc = 0.0f;
-#pragma unroll 1
-  for (int split = 0; split < num_splits; ++split) {
-    const int stats_idx = split * kQRows + row;
-    const float correction = __expf(split_m[stats_idx] - global_m);
-    const float weight = correction * split_l[stats_idx];
-    const int partial_idx = split * kQRows * kHeadDim + row * kHeadDim + col;
-    acc += correction * __bfloat162float(partial[partial_idx]);
-    global_l += weight;
-  }
+  __syncthreads();
 
-  out[idx] = __float2bfloat16(acc / fmaxf(global_l, 1.0e-20f));
+  for (int col = int(threadIdx.x); col < kHeadDim; col += int(blockDim.x)) {
+    float acc = 0.0f;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      const int partial_idx =
+          split * kQRows * kHeadDim + row * kHeadDim + col;
+      acc += split_weights[split] * __bfloat162float(partial[partial_idx]);
+    }
+    out[row * kHeadDim + col] = __float2bfloat16(acc);
+  }
 }
 
 __global__ void qk_cutlass_smem_atom_tile_kernel(const uint8_t* q_packed,
@@ -2440,9 +2453,7 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   constexpr int kThreads = 256;
-  const int total = kQRows * kHeadDim;
-  sm120_nvfp4_splitkv_combine_kernel<<<(total + kThreads - 1) / kThreads,
-                                       kThreads, 0,
+  sm120_nvfp4_splitkv_combine_kernel<<<kQRows, kThreads, 0,
                                        at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const __nv_bfloat16*>(
           partial.data_ptr<at::BFloat16>()),

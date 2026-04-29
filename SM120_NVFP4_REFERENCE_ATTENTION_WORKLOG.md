@@ -8408,3 +8408,51 @@ The already-rejected naive K128 QK bridge remains rejected: it hung for minutes.
 Any K128/Q-tile reduction must be a proper atom-level port, not another cloned
 cooperative GEMM collective.
 ```
+
+## Small Win: Row-Owned Split-KV Combine
+
+2026-04-29T10:34:03-05:00
+
+Replaced the element-owned split-KV combine kernel with a row-owned combine
+kernel:
+
+```text
+old:
+  one thread per output element
+  recompute global_m/global_l for every row,col element
+
+new:
+  one CTA per row
+  thread 0 computes normalized split weights once for the row
+  CTA threads reuse those weights across output columns
+```
+
+Correctness is unchanged:
+
+```text
+reuse4, split_kv_len=6656:
+  finite=true, mean_abs=0.000158808, max_abs=0.000782972,
+  cosine=0.992929
+```
+
+Timing:
+
+```text
+reuse4, split_kv_len=6656:
+  before repeat50: min_ms=1.7811, mean_ms=1.8534
+  after  repeat50: min_ms=1.7764, mean_ms=1.8325
+
+reuse2, split_kv_len=4096:
+  before repeat50: min_ms=1.8245, mean_ms=1.8363
+  after  repeat50: min_ms=1.8316, mean_ms=1.8417
+```
+
+Decision:
+
+```text
+Keep the row-owned combine because it improves the current best reuse4 policy
+and removes obviously redundant row-stat work. This is not the main 2.8x lever:
+the gain is ~1.1% on reuse4 and neutral/slightly negative on reuse2. The core
+gap remains inside the stage kernel's residency, load pipeline, and PV
+accumulator pressure.
+```
