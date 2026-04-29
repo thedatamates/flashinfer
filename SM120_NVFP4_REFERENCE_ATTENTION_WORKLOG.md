@@ -6463,6 +6463,89 @@ into compact P, a smaller-M tile that can afford independent S/P storage, or a
 direct score-fragment-to-P handoff that preserves Softmax ownership.
 ```
 
+## Softmax-Owned P Scale Precompute
+
+2026-04-28T21:20:00-05:00
+
+Kept the active SM120 role decomposition intact and explicitly did not revive
+the rejected MMA-owned softmax path:
+
+```text
+MMA:
+  QK/PV tensor-core work only
+  writes BF16 score tile
+  waits for Softmax-owned compact P readiness
+
+Softmax0/1:
+  own online max/sum state
+  own P scale-sidecar production
+  own compact P staging
+
+Correction/Epilogue:
+  own final O normalization and global BF16 store
+```
+
+The port moved one more piece of the 88 softmax lifecycle into the softmax role:
+P scale-sidecar production now happens during the same row-state pass that
+computes `tile_l`, instead of making a separate scale pass over the BF16 score
+tile inside `softmax_role_stage_logits_bf16_p_to_pv_smem_stage2`.
+
+The active path now uses:
+
+```text
+pass 1: per-row tile_m
+pass 2: per-row tile_l + per-16-column P scale bytes
+barrier: P scales and row state visible to the softmax group
+pass 3: partitioned compact P write
+```
+
+Previous active path:
+
+```text
+pass 1: per-row tile_m
+pass 2: per-row tile_l
+pass 3: per-16-column P scale bytes
+barrier
+pass 4: partitioned compact P write
+```
+
+Correctness fix included in the same structural port:
+
+```text
+Compact P should be exp(logit - tile_m) * tile_scale.
+The helper therefore needs tile-local `tile_m`, not the running max `next_m`.
+`global_l` still tracks the online state for final output normalization.
+```
+
+Validation:
+
+```text
+git diff --check: pass
+online kv_tiles=16:
+  finite, mean_abs=0.000650689, max_abs=0.00309772, cosine=0.988923
+
+full grid first tile:
+  finite, mean_abs=0.000155332, max_abs=0.000899995, cosine=0.992945
+
+full-grid min:
+  before BF16-output checkpoint: 10.3441 ms
+  after softmax-owned scale precompute: 9.8332 ms
+```
+
+Conclusion:
+
+```text
+This is a valid forward structural step because it preserves role ownership and
+removes one full score-tile read/exp pass plus one softmax-internal barrier.
+Runtime improved about 4.9% (10.3441 ms -> 9.8332 ms).
+
+The kernel is still dominated by the durable BF16 score-tile lifetime: K/B
+shared memory cannot be reused until each score half has been converted to
+compact P. The next structural target remains S/P lifetime reduction:
+row-strip streaming, smaller-M independent S/P storage, or a direct
+score-fragment-to-P mailbox that preserves Softmax ownership.
+```
+
 ## BF16 Output Store
 
 Changed the active online/full-grid reference kernel output from float32 to
