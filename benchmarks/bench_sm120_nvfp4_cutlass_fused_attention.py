@@ -501,7 +501,7 @@ def main() -> None:
             tactic,
         ) = cutlass_qk_inputs()
         v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
-        out_group = torch.empty((128, 128), device=device, dtype=torch.float32)
+        out_group = torch.empty((128, 128), device=device, dtype=torch.bfloat16)
         out_group_idx = 0
         kv_tiles = args.online_kv_tiles
         pv_alpha = 1.0 / v_pv_cutlass_global
@@ -586,7 +586,7 @@ def main() -> None:
             tactic,
         ) = cutlass_qk_inputs()
         v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
-        out = torch.empty((Q_LEN * GROUP, HEAD_DIM), device=device, dtype=torch.float32)
+        out = torch.empty((Q_LEN * GROUP, HEAD_DIM), device=device, dtype=torch.bfloat16)
         pv_alpha = 1.0 / v_pv_cutlass_global
         ext.sm120_nvfp4_qkv_online_register_q_full_grid(
             q_cutlass,

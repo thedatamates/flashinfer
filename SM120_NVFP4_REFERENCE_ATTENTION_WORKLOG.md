@@ -6462,3 +6462,36 @@ score tile storage itself. Candidate directions are row-strip streaming of S
 into compact P, a smaller-M tile that can afford independent S/P storage, or a
 direct score-fragment-to-P handoff that preserves Softmax ownership.
 ```
+
+## BF16 Output Store
+
+Changed the active online/full-grid reference kernel output from float32 to
+BF16, matching the production target and removing a lab-only float global store.
+
+Implementation:
+
+```text
+- Active `sm120_nvfp4_qkv_online_register_q_stage_kernel` now takes
+  `__nv_bfloat16* out_group`.
+- The epilogue role copies normalized BF16 values from epilogue smem directly
+  to global output instead of converting to float.
+- The single-tile and full-grid Python harnesses now allocate BF16 output for
+  the active online kernel. Older rejected/debug kernels remain float output.
+```
+
+Validation:
+
+```text
+git diff --check: pass
+online kv_tiles=16: finite, mean_abs=0.000615264, max_abs=0.00324988, cosine=0.988328
+full grid first tile: finite, mean_abs=0.000155821, max_abs=0.000807697, cosine=0.992418
+full-grid min: 10.3441 ms
+```
+
+Conclusion:
+
+```text
+Runtime improved modestly: 10.4330 ms -> 10.3441 ms, about 0.85%. The output
+store was not the primary bottleneck, but BF16 output is the correct production
+contract and should stay.
+```
