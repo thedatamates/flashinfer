@@ -7738,3 +7738,41 @@ Rejected and reverted. Do not retry this as a simple tile-shape edit. A
 or a manual V/scale loader. The next live-range work should stay on the accepted
 128-wide CUTLASS collective path unless we intentionally port the scale layout.
 ```
+
+## Rejected: 64-Row Q Tile Probe
+
+2026-04-28T23:24:00-05:00
+
+Tried the smaller Q-tile alternative before committing to split-KV:
+
+```text
+probe:
+  QK tile = 64x128x256
+  PV tile = 64x128x128
+  output shape remains 128 columns
+
+goal:
+  double CTA count from 128 to 256 without changing the PV output shape
+  reduce PV/QK fragment live state by halving M
+```
+
+Compile failed before runtime validation:
+
+```text
+storage:
+  SM120 Q/K/V load collective storage no longer fit the 99 KiB opt-in limit
+
+CUTLASS TMA:
+  TMA requires CTA_Tile and SLayout top-level size equivalence
+  failures occurred in the block-scaled scale-side TMA layouts for 64-row tiles
+```
+
+Decision:
+
+```text
+Rejected and reverted. Like the 64-column probe, this is not a safe simple
+shape edit on the current SM120 block-scaled CUTLASS collective. Getting M=64
+requires explicit scale-layout/TMA-layout work. The next parallelism path is
+split-KV, which preserves the accepted 128x128 MMA shape and adds CTA
+parallelism across KV slices.
+```
