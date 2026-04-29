@@ -6203,3 +6203,101 @@ critical path, matching Example 77 more closely: softmax must consume the QK
 result into registers and write compact P without forcing the next QK tile to
 wait on a full score-tile lifetime in `smem_B`.
 ```
+
+Rejected follow-up:
+
+```text
+Tried an SM120 substitution where the MMA role owned softmax row stats,
+online correction state, compact P staging, and final epilogue commit. This
+kept kv_tiles=2 finite but regressed kv_tiles=16 correctness:
+
+MMA-owned softmax, 256 participating MMA threads:
+  finite, mean_abs=0.00146469, max_abs=0.0130523, cosine=0.856394
+
+MMA-owned softmax, first 128 MMA threads matching the old softmax group:
+  finite, mean_abs=0.00105781, max_abs=0.0128941, cosine=0.925142
+
+Adding an explicit shared-memory visibility fence after P staging did not fix
+the regression:
+
+  finite, mean_abs=0.00146297, max_abs=0.0131158, cosine=0.856958
+
+Conclusion: the MMA-owned path is the regression. It collapses the role
+decomposition, idles Softmax/Correction warps, and reintroduces active-path
+NamedBarrier synchronization around work that Examples 77/88 keep in the
+softmax/correction lifecycle. This path was reverted and should not be
+debugged further.
+```
+
+Reference fact from rereading 77/88:
+
+```text
+Softmax0/Softmax1 own softmax state and P production. MMA owns QK/PV tensor
+core work and waits for P readiness; it does not compute row stats. Correction
+owns output rescale/final normalization before the epilogue store. Any SM120
+substitution must preserve those ownership boundaries even though SM120 lacks
+TMEM and must use shared memory/register fragments instead.
+```
+
+## Correction-Owned Final Output Normalization
+
+Ported the final output ownership boundary back toward the SM100/Example 88
+structure:
+
+```text
+before:
+  MMA:
+    PV accum registers
+    divide by global_l
+    stage normalized BF16 O into epilogue smem
+    commit pipeline_mma_corr
+
+  Correction:
+    wait final O
+    immediately commit pipeline_corr_epi
+
+  Epilogue:
+    store normalized BF16 O
+
+after:
+  MMA:
+    PV accum registers
+    stage raw scaled BF16 O into epilogue smem
+    commit pipeline_mma_corr
+
+  Correction:
+    wait final O
+    divide epilogue smem by global_l
+    fence shared visibility
+    commit pipeline_corr_epi
+
+  Epilogue:
+    store normalized BF16 O
+```
+
+This mirrors the SM100 `correction_epilogue` ownership boundary: Correction
+materializes the final normalized output tile into epilogue storage, and
+Epilogue owns the global store. It is not a performance optimization by itself;
+it removes the previous MMA-owned normalization responsibility so subsequent
+ports do not build on the wrong role boundary.
+
+Validation:
+
+```text
+git diff --check: pass
+online kv_tiles=16: finite, mean_abs=0.000650689, max_abs=0.00309772, cosine=0.988923
+full grid first tile: finite, mean_abs=0.000155332, max_abs=0.000899995, cosine=0.992945
+full-grid min: 14.8333 ms
+```
+
+Conclusion:
+
+```text
+Correctness is preserved. Runtime is neutral/slightly worse versus the compact-P
+checkpoint (14.7649 ms -> 14.8333 ms), which is expected because this is an
+ownership-boundary correction, not the critical-path fix. The active bottleneck
+remains the durable BF16 score tile lifetime: QK cannot release K storage until
+Softmax converts the score tile into compact P. The next structural port must
+remove that full-score shared-memory lifetime or move to a direct
+score-fragment-to-P handoff that preserves Softmax ownership.
+```

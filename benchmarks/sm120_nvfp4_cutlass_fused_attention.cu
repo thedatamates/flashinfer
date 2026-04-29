@@ -1095,17 +1095,28 @@ __device__ __forceinline__ void sm120_stage_o_fragment_to_epilogue_smem(
     AccumTensor const& accum,
     CoordTensor const& coords,
     __nv_bfloat16* smem_o,
-    const float* global_l,
     float pv_base_scale) {
   for (int i = 0; i < int(cute::size(accum)); ++i) {
     auto coord = coords(i);
     const int row = int(cute::get<0>(coord));
     const int col = int(cute::get<1>(coord));
     if (row < kCutlassTileM && col < kCutlassTileN) {
-      const float normalized =
-          accum(i) * pv_base_scale / fmaxf(global_l[row], 1.0e-20f);
-      smem_o[row * kCutlassTileN + col] = __float2bfloat16(normalized);
+      smem_o[row * kCutlassTileN + col] =
+          __float2bfloat16(accum(i) * pv_base_scale);
     }
+  }
+}
+
+__device__ __forceinline__ void correction_role_normalize_epilogue_smem(
+    __nv_bfloat16* smem_o,
+    const float* global_l,
+    int correction_thread_idx) {
+  for (int idx = correction_thread_idx; idx < kCutlassTileM * kCutlassTileN;
+       idx += kSm120Nvfp4FmhaCorrectionThreadCount) {
+    const int row = idx / kCutlassTileN;
+    const float normalized =
+        __bfloat162float(smem_o[idx]) / fmaxf(global_l[row], 1.0e-20f);
+    smem_o[idx] = __float2bfloat16(normalized);
   }
 }
 
@@ -2957,8 +2968,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       if (final_tile) {
         const float pv_base_scale = pv_alpha / kProbGlobalScale;
         sm120_stage_o_fragment_to_epilogue_smem(
-            pv_accum, pv_tCcC, smem_epilogue_o, storage.global_l,
-            pv_base_scale);
+            pv_accum, pv_tCcC, smem_epilogue_o, pv_base_scale);
         commit_output_stage(true);
       }
     };
@@ -3071,6 +3081,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       if (final_tile) {
         pipeline_corr_epi.producer_acquire(pipeline_corr_epi_producer_state);
         pipeline_mma_corr.consumer_wait(pipeline_mma_corr_consumer_state);
+        correction_role_normalize_epilogue_smem(
+            smem_epilogue_o, storage.global_l, correction_thread_idx);
+        cutlass::arch::fence_view_async_shared();
         pipeline_mma_corr.consumer_release(pipeline_mma_corr_consumer_state);
         ++pipeline_mma_corr_consumer_state;
         pipeline_corr_epi.producer_commit(pipeline_corr_epi_producer_state);
