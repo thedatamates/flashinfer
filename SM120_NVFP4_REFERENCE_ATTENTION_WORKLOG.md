@@ -8743,3 +8743,140 @@ Shape A remains a separate small-KV/sliding-window policy question; existing
 FP8 FA2 is still a valid default unless a dedicated D256 NVFP4 path beats it
 with production semantics.
 ```
+
+## Paged Serving Matrix Expansion
+
+2026-04-29T12:05:00-05:00
+
+Expanded the paged workload benchmark to cover:
+
+```text
+global_few_long_decode
+global_high_concurrency_decode
+global_high_concurrency_mixed
+sliding_few_long_decode
+sliding_high_concurrency_decode
+sliding_high_concurrency_mixed
+```
+
+The script now also records per-target errors rather than aborting the whole
+scenario when a backend cannot instantiate a D512 FA2 configuration.
+
+Global D512/group8 decode:
+
+```text
+few long chats:
+  batch=4, q=1 each, kv=262144 each
+
+  NVFP4 XQA:        min_ms=0.540928
+  NVFP4 FA2 decode: min_ms=1.376288
+  FP8 FA2 decode:   min_ms=1.108256
+  BF16 FA2 decode:  invalid FlashInfer configuration
+
+  policy: NVFP4 XQA
+
+high-concurrency decode:
+  batch=96, q=1 each
+  kv distribution:
+    1024 x24, 8192 x24, 32768 x24, 131072 x16, 262144 x8
+
+  NVFP4 XQA:        min_ms=17.414783
+  NVFP4 FA2 decode: min_ms=7.755584
+  FP8 FA2 decode:   min_ms=5.912576
+  BF16 FA2 decode:  invalid FlashInfer configuration
+
+  policy: FP8 FA2 decode
+```
+
+Global D512/group8 mixed ragged prefill/decode:
+
+```text
+batch=96
+q_lens=(1 x92) + (512 x4), sum_q=2140
+kv distribution:
+  1024 x24, 8192 x24, 32768 x24, 131072 x16, 262144 x8
+
+NVFP4 FA2 prefill: min_ms=187.463623
+FP8 FA2 prefill:   min_ms=201.327072
+BF16 FA2 prefill:  invalid FlashInfer configuration
+
+policy: NVFP4 FA2
+```
+
+Sliding D256/group2 decode:
+
+```text
+few long chats, sliding layers:
+  batch=4, q=1 each, kv=1024 each
+
+  BF16 FA2 decode:  min_ms=0.022368
+  FP8 FA2 decode:   min_ms=0.026112
+  NVFP4 FA2 decode: min_ms=0.030752
+  NVFP4 XQA:        min_ms=0.032192
+
+  policy: BF16 FA2 decode if capacity permits, otherwise FP8 FA2
+
+high-concurrency sliding decode:
+  batch=96, q=1 each, kv=1024 each
+
+  FP8 FA2 decode:   min_ms=0.044000
+  BF16 FA2 decode:  min_ms=0.046080
+  NVFP4 XQA:        min_ms=0.057472
+  NVFP4 FA2 decode: min_ms=0.058176
+
+  policy: FP8 FA2 decode
+```
+
+Sliding D256/group2 mixed ragged prefill/decode:
+
+```text
+batch=96
+q_lens=(1 x92) + (512 x4), sum_q=2140
+kv=1024 for all sequences
+
+BF16 FA2 prefill:  min_ms=0.072288
+FP8 FA2 prefill:   min_ms=0.096736
+NVFP4 FA2 prefill: min_ms=0.108128
+
+policy: BF16 FA2 if capacity permits, otherwise FP8 FA2
+```
+
+Layer-weighted estimates:
+
+```text
+Gemma4 31B layer mix:
+  global Shape B:  10 layers
+  sliding Shape A: 50 layers
+
+few-long decode:
+  global policy:  NVFP4 XQA        0.540928 ms
+  sliding policy: BF16 FA2 decode  0.022368 ms
+  weighted: 10*0.540928 + 50*0.022368 = 6.527680 ms
+
+high-concurrency decode:
+  global policy:  FP8 FA2 decode   5.912576 ms
+  sliding policy: FP8 FA2 decode   0.044000 ms
+  weighted: 10*5.912576 + 50*0.044000 = 61.325760 ms
+
+high-concurrency mixed:
+  global policy:  NVFP4 FA2 prefill 187.463623 ms
+  sliding policy: BF16 FA2 prefill    0.072288 ms
+  weighted: 10*187.463623 + 50*0.072288 = 1878.250630 ms
+```
+
+Interpretation:
+
+```text
+There is no single Gemma4 attention backend policy. The right policy is
+workload- and layer-class-dependent:
+
+  global long-context decode with few requests -> NVFP4 XQA
+  global high-concurrency decode              -> FP8 FA2 decode
+  global high-concurrency mixed/prefill        -> NVFP4 FA2
+  sliding decode                               -> FP8/BF16 FA2
+  sliding mixed/prefill                        -> BF16/FP8 FA2
+
+The next production decision should be made against the live vLLM workload
+mix: fraction of time spent in decode-only vs mixed prefill/decode, and the
+batch-size/context distribution at the attention backend boundary.
+```
