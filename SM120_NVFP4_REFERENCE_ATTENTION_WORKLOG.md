@@ -6902,3 +6902,53 @@ increases pipeline transaction overhead and regresses wall time. Future work
 should target durable score/P/O storage lifetime or pipeline overlap, not this
 barrier substitution.
 ```
+
+## Cleanup: Remove Superseded Stage Kernels
+
+2026-04-28T23:10:00-05:00
+
+Removed the rejected/intermediate benchmark kernels and entry points from
+`benchmarks/sm120_nvfp4_cutlass_fused_attention.cu` and the matching harness
+flags from `benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py`.
+
+Deleted from the compiled extension:
+
+```text
+sm120_nvfp4_qk_load_collective_stage_kernel
+sm120_nvfp4_qkv_load_collective_stage_kernel
+sm120_nvfp4_qkv_role_handoff_stage_kernel
+old stage-only softmax/P helpers
+old stage-only QK/PV register helper bodies
+```
+
+Kept:
+
+```text
+active online register-Q owner/full-grid kernel
+role schedule smoke kernel
+QK/PV atom-level correctness gates
+FlashInfer CUTLASS FP4 runner hook
+metadata hook
+```
+
+Reason:
+
+```text
+The removed kernels are no longer the active structural path and were
+superseded by the role-owned online owner. Keeping them compiled slows rebuilds
+and creates editing ambiguity. The atom-level gates remain because they validate
+the SM120 block-scaled operand/copy layouts used by the active path.
+```
+
+Validation after cleanup:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000650689, max_abs=0.00309772, cosine=0.988923
+
+full grid first tile:
+  finite, mean_abs=0.000155332, max_abs=0.000899995, cosine=0.992945
+
+full-grid min:
+  8.3033 ms
+```
