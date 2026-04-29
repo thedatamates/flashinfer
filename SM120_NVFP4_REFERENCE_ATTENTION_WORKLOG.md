@@ -9208,3 +9208,29 @@ kernel. To test the actual D128 ceiling, we need one of:
 
 Until then, D128 remains FA2 territory in the dispatch policy.
 ```
+
+## D128/D256 Kernel File Split
+
+The D128 and D256 specialization work now has separate translation units instead
+of routing every head dimension through the D512 kernel file:
+
+```text
+benchmarks/sm120_nvfp4_cutlass_fused_attention.cu       D512 baseline
+benchmarks/sm120_nvfp4_cutlass_fused_attention_d256.cu  D256 specialization seed
+benchmarks/sm120_nvfp4_cutlass_fused_attention_d128.cu  D128 specialization seed
+```
+
+The Python benchmark loader now selects the source file and extension name from
+`--head-dim`, so the D128/D256 kernels can diverge without invalidating or
+destabilizing the D512 path.
+
+Initial smoke results after the split:
+
+```text
+D256 q512/group2/kv1024: finite, cosine 0.989832, min 0.17744 ms
+D128 q512/group2/kv1024: finite, cosine 0.991650, min 0.153792 ms
+```
+
+These files are copied scaffold seeds. They still report the D512-shaped
+`storage_bytes=96256` footprint. The next native-specialization work is to shrink
+the D256/D128 storage and role machinery inside the dedicated files.

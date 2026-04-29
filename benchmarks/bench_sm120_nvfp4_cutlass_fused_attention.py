@@ -85,7 +85,7 @@ def event_ms(fn, *, warmup: int, repeat: int) -> dict[str, float]:
     }
 
 
-def build_extension():
+def build_extension(head_dim: int = HEAD_DIM):
     root = Path(__file__).resolve().parents[1]
     os.environ.setdefault("CUDA_HOME", "/usr/local/cuda-13.2")
     extra_cuda_cflags = [
@@ -101,10 +101,21 @@ def build_extension():
     ]
     if maxrregcount := os.environ.get("SM120_NVFP4_MAXRREGCOUNT"):
         extra_cuda_cflags.append(f"-maxrregcount={maxrregcount}")
+    if head_dim == 128:
+        source_name = "sm120_nvfp4_cutlass_fused_attention_d128.cu"
+        extension_name = "sm120_nvfp4_cutlass_fused_attention_d128_ext"
+    elif head_dim == 256:
+        source_name = "sm120_nvfp4_cutlass_fused_attention_d256.cu"
+        extension_name = "sm120_nvfp4_cutlass_fused_attention_d256_ext"
+    elif head_dim == 512:
+        source_name = "sm120_nvfp4_cutlass_fused_attention.cu"
+        extension_name = "sm120_nvfp4_cutlass_fused_attention_ext"
+    else:
+        raise ValueError("head_dim must be one of {128, 256, 512}")
     return load(
-        name="sm120_nvfp4_cutlass_fused_attention_ext",
+        name=extension_name,
         sources=[
-            str(root / "benchmarks" / "sm120_nvfp4_cutlass_fused_attention.cu"),
+            str(root / "benchmarks" / source_name),
             str(root / "benchmarks" / "sm120_nvfp4_cutlass_runner_bf16_inst.cu"),
         ],
         extra_include_paths=[
@@ -167,7 +178,7 @@ def main() -> None:
             kv_len=args.kv_len,
             head_dim=args.head_dim,
         )
-    ext = build_extension()
+    ext = build_extension(args.head_dim)
     metadata = dict(ext.cutlass_sm120_blockscaled_collective_metadata())
 
     def compare(name: str, actual: torch.Tensor, ref: torch.Tensor) -> dict[str, object]:
