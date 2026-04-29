@@ -7459,3 +7459,35 @@ Small but real. Keep it. This is safe only after row-owned P production; the
 old helper path needed the group barrier because helper threads consumed
 row-owner-produced BF16 probabilities and SFA.
 ```
+
+## Neutral: Explicit exp2 Softmax Rewrite
+
+2026-04-29T02:05:00-05:00
+
+Tested replacing the row-owned softmax `__expf` calls with explicit
+`exp2f(x * log2(e))`, matching the style used by Example 88.
+
+Validation was unchanged:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000659900, max_abs=0.00350227, cosine=0.988955
+
+full grid first tile:
+  finite, mean_abs=0.000158765, max_abs=0.000815836, cosine=0.992936
+```
+
+Timing:
+
+```text
+current baseline repeat=20:       min_ms=4.4768, mean_ms=4.5034
+explicit exp2 repeat=20:          min_ms=4.4837, mean_ms=4.5023
+```
+
+Decision:
+
+```text
+Rejected and reverted as noise. The mean changed by ~0.001 ms and the min got
+slightly worse. CUDA fast math is already lowering the exponent path well
+enough; this is not a meaningful lever.
+```
