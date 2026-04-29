@@ -9339,3 +9339,86 @@ has less overlap to exploit. The next serious D256-native path should be either:
   - compact storage/aliasing that gets below the one-CTA/SM 96 KiB footprint, or
   - a D256 SWA one-tile/small-tile kernel with less role specialization overhead.
 ```
+
+## D256 Expanded Hillclimb Baseline
+
+Expanded the D256 hillclimb harness to include the wider GQA group surface:
+
+```text
+q_len:  {128, 256, 512, 1024, 2048, 4096}
+kv_len: {8192, 32768, 65536, 131072, 262144}
+group:  {2, 4, 6, 8, 12, 16}
+```
+
+Report files:
+
+```text
+reports/d256_hillclimb_baseline_20260429.jsonl
+reports/d256_hillclimb_baseline_20260429.csv
+reports/d256_hillclimb_baseline_20260429.summary.csv
+reports/d256_hillclimb_baseline_20260429.md
+```
+
+Matrix size:
+
+```text
+180 shape cells
+720 raw timing rows
+4 kernels per cell:
+  sm120_fused
+  nvfp4_fa2
+  fp8_fa2
+  bf16_fa2
+```
+
+Current result against the hillclimb target:
+
+```text
+cells beating nvfp4_fa2 by >=2x: 0 / 180
+cells where sm120_fused beats nvfp4_fa2: 13 / 180
+cells where sm120_fused beats fp8_fa2:   6 / 180
+cells where sm120_fused beats bf16_fa2:  0 / 180
+
+cosine range:
+  min 0.9884289503
+  avg 0.9913249615
+  max 0.9934706688
+```
+
+By group:
+
+```text
+group  pass2x  beat_nvfp4  median speedup  best speedup  worst speedup
+2      0/30    0/30        0.647           0.963         0.064
+4      0/30    0/30        0.693           0.968         0.079
+6      0/30    6/30        0.745           1.244         0.101
+8      0/30    0/30        0.762           0.972         0.124
+12     0/30    7/30        0.803           1.244         0.165
+16     0/30    0/30        0.775           0.974         0.206
+```
+
+Best current cells are long-context group 6 and group 12:
+
+```text
+group q_len kv_len  sm120_fused_ms  nvfp4_fa2_ms  speedup
+12    1024  262144  30.645          38.125        1.244
+6     2048  262144  30.830          38.355        1.244
+12    1024  131072  15.489          18.995        1.226
+6     2048  131072  15.580          19.009        1.220
+12    1024  65536   7.979           9.467         1.186
+6     2048  65536   8.021           9.467         1.180
+```
+
+Interpretation:
+
+```text
+The current D256 fused path is correct enough for hillclimb comparison but not
+yet structurally competitive with the 2x target. The only win pockets are
+long-context group 6 and group 12, and even those top out at ~1.24x over
+nvfp4_fa2. Group 16 does not create a win pocket in this baseline.
+
+The next optimization should be picked from the worst target gap under this
+expanded matrix, not from Gemma4 group2 alone. The baseline says the generic
+D256 scaffold still carries too much D512-era overhead across the broader
+group surface.
+```
