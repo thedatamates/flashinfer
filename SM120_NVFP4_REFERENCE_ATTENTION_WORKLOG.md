@@ -7936,3 +7936,44 @@ Decision:
 Keep unnormalized split partials. The win is small but consistent, and the
 7-way split remains the best measured point.
 ```
+
+## Rejected: Two-Thread Softmax Rows
+
+2026-04-28T23:52:00-05:00
+
+Tried increasing softmax roles from 2+2 warps to 4+4 warps and splitting each
+softmax row across two threads:
+
+```text
+before:
+  one thread owns one row and processes all 128 columns
+
+probe:
+  two threads own one row
+  each thread processes 64 columns / 4 scale groups
+  per-row max and l are merged through softmax_tmp plus intra-role NamedBarrier
+```
+
+Correctness was unchanged:
+
+```text
+split_kv_len=4736:
+  finite, mean_abs=0.000158847, max_abs=0.000777204, cosine=0.992912
+```
+
+Timing regressed badly:
+
+```text
+baseline unnormalized split partials: min_ms=3.0764, mean_ms=3.0867
+two-thread softmax rows:             min_ms=4.0369, mean_ms=4.0491
+```
+
+Decision:
+
+```text
+Rejected and reverted. The extra softmax warps, larger CTA, shared scratch, and
+two intra-role barriers per tile cost far more than halving each row's serial
+exp/quant work. Do not retry row-splitting with barriers. Any future softmax
+parallelism must avoid per-tile barrier expansion, likely by changing the role
+pipeline/ownership rather than splitting each row locally.
+```
