@@ -9115,3 +9115,96 @@ Current dispatch implication:
   - D256/D128: current fused path is correctness coverage only; do not dispatch
     it over NVFP4 FA2 without a real D256/D128 specialization proving a win.
 ```
+
+## Native D128/D256 Specialization Hypothesis
+
+The current D128/D256 measurements are scaffold measurements, not native
+D128/D256 ceilings. They reuse the D512-oriented fused kernel shape:
+
+```text
+- 96 KiB shared-storage allocation
+- two-stage QK cadence
+- D512 role/pipeline sizing
+- output-group reuse machinery sized for reuse4
+- one CTA/SM resource profile
+```
+
+A native head-dim specialization should have different constraints:
+
+```text
+choice                 D512 current        D256 native target   D128 native target
+smem footprint         ~96 KiB             ~64 KiB              ~48 KiB
+CTAs/SM                1                   1-2                  2
+K pipeline depth       2                   2-3                  3
+V pipeline depth       2                   2-3                  3
+K cadence              two-stage natural   single-stage native  single-stage native
+output reuse span      4                   2                    1
+epilogue smem          32 KiB              16 KiB               8 KiB
+register budget        168 capped          lower target         lower target
+```
+
+The likely D128 win mechanism is not output-group reuse. D128 has only one
+128-column output group, so the win has to come from lower fixed overhead,
+compact shared storage, deeper pipelines, higher split-KV parallelism, and
+possibly 2 CTAs/SM.
+
+Structural prediction:
+
+```text
+Current D128 scaffold at q512/kv32K-131K is ~0.75 ms and loses to NVFP4 FA2.
+A native D128 kernel that reaches 2 CTAs/SM and removes the D512 scaffolding
+could plausibly land around 0.35-0.40 ms, which would be competitive at long KV.
+
+This is a hypothesis, not a result. It requires a real D128-native kernel:
+  - compact D128 shared storage
+  - D128-native load cadence
+  - D128-native reuse1 path, not reuse4 dispatch degraded at runtime
+  - measured resource profile showing 2 CTAs/SM or a concrete reason it cannot
+    happen
+```
+
+Decision boundary:
+
+```text
+The current scaffold result answers only "does the D512-shaped kernel win at
+D128?" The answer is no.
+
+The production/ceiling question remains open until a D128-native kernel is
+measured against NVFP4 FA2.
+```
+
+Resource finding from the active CUTLASS collectives:
+
+```text
+SM120 opt-in shared memory:                   101376 bytes
+Current QKV fused storage:                     96256 bytes
+Current QK-only load collective storage:       74752 bytes
+CUTLASS 128x128x128 tensor storage:            73728 bytes
+CUTLASS 128x128x128 shared storage:            74752 bytes
+Current PV K128 stage-2 tensor storage:        36864 bytes
+Current PV K128 stage-2 shared storage:        37888 bytes
+```
+
+This blocks one of the hoped-for native-D128 levers:
+
+```text
+2 CTAs/SM requires dynamic smem <= 101376 / 2 = 50688 bytes.
+
+The current CUTLASS QK mainloop storage alone is 74752 bytes, before any
+softmax, P staging, V staging, row stats, or role-pipeline storage. Therefore a
+"native D128" kernel built by only specializing the existing CUTLASS collective
+cannot reach 2 CTAs/SM.
+```
+
+Implication:
+
+```text
+The D128-native path is not just a smaller template instantiation of the current
+kernel. To test the actual D128 ceiling, we need one of:
+  - a custom compact Q/K/V smem layout around the SM120 block-scaled MMA atom,
+    not the full CUTLASS TMA TensorStorage; or
+  - a smaller CUTLASS tile shape whose TensorStorage lands under ~50 KiB; or
+  - a different D128 strategy that wins without 2 CTAs/SM.
+
+Until then, D128 remains FA2 territory in the dispatch policy.
+```
