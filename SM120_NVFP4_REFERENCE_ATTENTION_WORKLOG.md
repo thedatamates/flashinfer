@@ -7491,3 +7491,59 @@ Rejected and reverted as noise. The mean changed by ~0.001 ms and the min got
 slightly worse. CUDA fast math is already lowering the exponent path well
 enough; this is not a meaningful lever.
 ```
+
+## Win: V-First Steady-State Load Timing
+
+2026-04-28T22:55:21-05:00
+
+Ported the first piece of the Example 77/88 temporal load-order pattern into
+the active SM120 owner kernel. The prologue already had the useful shape:
+
+```text
+Q0, K0, Q1, V0, K1
+```
+
+The steady-state load loop was still issuing the next tile as:
+
+```text
+K(n+1, chunk0), K(n+1, chunk1), V(n+1)
+```
+
+Because K and V use independent producer states, placing V behind K meant the V
+TMA could be delayed by the K pipeline's score-buffer lifetime. The patch
+changes the steady-state issue order to:
+
+```text
+V(n+1), K(n+1, chunk0), K(n+1, chunk1)
+```
+
+This does not by itself implement the full 77/88 temporal anchor, but it stops a
+K-side acquire stall from delaying the next V load. That is the key distinction
+from the earlier rejected static `K0,V,K1` probe: this variant puts V before any
+next-tile K acquire in the steady loop.
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000659900, max_abs=0.00350227, cosine=0.988955
+
+full grid first tile:
+  finite, mean_abs=0.000158765, max_abs=0.000815836, cosine=0.992936
+```
+
+Timing:
+
+```text
+previous best repeat=20:          min_ms=4.4768, mean_ms=4.5034
+V-first steady repeat=20:         min_ms=4.3854, mean_ms=4.4270
+```
+
+Conclusion:
+
+```text
+Keep it. The remaining canonical load-order gap is temporal anchoring: V(n+1)
+should be issued while QK(n) is executing and be ready by PV(n+1), not merely
+permuted in the producer loop. This change is still useful because it removes
+one avoidable producer-side serialization point before the next row-state port.
+```

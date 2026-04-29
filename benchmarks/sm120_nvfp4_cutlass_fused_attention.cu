@@ -1225,9 +1225,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     for (int tile = 0; tile < num_kv_tiles; ++tile) {
       if (tile + 1 < num_kv_tiles) {
         const int next_kv_tile = kv_tile_start + tile + 1;
+        load_v_chunk(next_kv_tile);
         load_k_chunk(next_kv_tile, 0);
         load_k_chunk(next_kv_tile, 1);
-        load_v_chunk(next_kv_tile);
       }
     }
 
