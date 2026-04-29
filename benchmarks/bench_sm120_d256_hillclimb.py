@@ -22,7 +22,7 @@ class Cell:
 
 DEFAULT_Q_LENS = (128, 256, 512, 1024, 2048, 4096)
 DEFAULT_KV_LENS = (8192, 32768, 65536, 131072, 262144)
-DEFAULT_GROUPS = (2, 4, 6, 8)
+DEFAULT_GROUPS = (2, 4, 6, 8, 12, 16)
 
 KERNELS = ("sm120_fused", "nvfp4_fa2", "fp8_fa2", "bf16_fa2")
 
