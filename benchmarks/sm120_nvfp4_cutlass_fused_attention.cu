@@ -1589,12 +1589,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           p_vals[i] = p_scaled;
         }
 
-        const uint8_t scale_byte = fp32_to_e4m3_byte(
-            fmaxf(kProbGlobalScale * vec_max / 6.0f, 1.0e-8f));
+        const float scale_value =
+            fmaxf(kProbGlobalScale * vec_max / 6.0f, 1.0e-8f);
+        const uint8_t scale_byte = fp32_to_e4m3_byte(scale_value);
         p_sSFA(row, local_col, cute::Int<0>{}) = make_ue4m3_raw(scale_byte);
-        const float output_scale =
-            kProbGlobalScale /
-            fmaxf(e4m3_byte_to_fp32(scale_byte), 1.0e-8f);
+        const float output_scale = kProbGlobalScale / scale_value;
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
           p_sA(row, local_col + i, cute::Int<0>{}) =

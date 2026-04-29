@@ -7367,3 +7367,47 @@ phase. The P producer is still on the critical score-buffer lifetime, but it no
 longer round-trips probabilities through BF16 SMEM or burns a second group-wide
 producer pass.
 ```
+
+## Win: Avoid P Scale Decode In Row Producer
+
+2026-04-29T01:52:00-05:00
+
+In the fused row-owned P producer, removed the immediate decode of the
+just-quantized E4M3 scale when selecting E2M1 P codes:
+
+```text
+before:
+  scale_byte = fp32_to_e4m3_byte(scale_value)
+  output_scale = kProbGlobalScale / e4m3_byte_to_fp32(scale_byte)
+
+after:
+  scale_byte = fp32_to_e4m3_byte(scale_value)
+  output_scale = kProbGlobalScale / scale_value
+```
+
+The MMA still consumes the quantized E4M3 scale sidecar; this change only avoids
+the local decode instruction sequence in the P-code selection path.
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000659900, max_abs=0.00350227, cosine=0.988955
+
+full grid first tile:
+  finite, mean_abs=0.000158765, max_abs=0.000815836, cosine=0.992936
+```
+
+Timing:
+
+```text
+row-owned P baseline repeat=20:   min_ms=4.4943, mean_ms=4.5196
+no scale decode repeat=20:        min_ms=4.4847, mean_ms=4.5149
+```
+
+Conclusion:
+
+```text
+Small but positive. Keep it. The accuracy shift is within the existing
+reference-kernel tolerance band and the timing is marginally better.
+```
