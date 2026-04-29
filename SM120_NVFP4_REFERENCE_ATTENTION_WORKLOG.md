@@ -7977,3 +7977,434 @@ exp/quant work. Do not retry row-splitting with barriers. Any future softmax
 parallelism must avoid per-tile barrier expansion, likely by changing the role
 pipeline/ownership rather than splitting each row locally.
 ```
+
+## Win: Span-2 Output-Group Reuse
+
+2026-04-29T00:01:24-05:00
+
+The split-KV kernel was still launching one CTA per 128-column output group,
+which meant each output group recomputed the same QK logits, online softmax
+state, and P tile:
+
+```text
+old per output span:
+  grid_y = 4
+  each CTA computes QK + softmax + one PV output group
+
+new reuse2 span:
+  grid_y = 2
+  each CTA computes QK + softmax once, then consumes two V/output groups
+```
+
+Implementation details:
+
+```text
+- Added templated stage kernel parameter kOutputGroupSpan in {1, 2}.
+- Existing public split-KV path instantiates span 1.
+- Added sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid for span 2.
+- For span 2, load order is K-before-next-V to avoid deadlock:
+    prefill K0.0, Q, K0.1, then V0 groups
+    next tile loads K(n+1) before V(n+1) groups
+  This is necessary because the V pipeline has two stages; preloading two V
+  groups fills it before the next K tile could otherwise be issued.
+- Changed the final output pipeline to depth 1 because the epilogue smem tile is
+  single-buffered. Span 2 commits two output groups sequentially through the same
+  smem tile.
+```
+
+Correctness is unchanged:
+
+```text
+split_kv_len=4736, reuse2:
+  finite, mean_abs=0.000158847, max_abs=0.000777204,
+  cosine=0.992912
+```
+
+Initial timing:
+
+```text
+span 1 split-KV, split_kv_len=4736:
+  min_ms=3.0783, mean_ms=3.1000
+
+span 2 reuse, split_kv_len=4736:
+  min_ms=2.2694, mean_ms=2.2939
+```
+
+Reuse2 changes the optimal split point. Short sweep:
+
+```text
+split_kv_len=2048   splits=16  min_ms=2.3129
+split_kv_len=3328   splits=10  min_ms=2.2478
+split_kv_len=4096   splits=8   min_ms=2.1566
+split_kv_len=4736   splits=7   min_ms=2.2903
+split_kv_len=5504   splits=6   min_ms=2.5251
+split_kv_len=6656   splits=5   min_ms=2.1307
+split_kv_len=8192   splits=4   min_ms=2.4877
+split_kv_len=11008  splits=3   min_ms=3.0788
+```
+
+Repeat-20 checkpoint:
+
+```text
+reuse2, split_kv_len=6656:
+  finite, mean_abs=0.000158808, max_abs=0.000782972,
+  cosine=0.992929
+  min_ms=2.1204, mean_ms=2.1422
+
+reuse2, split_kv_len=4096:
+  finite, mean_abs=0.000159100, max_abs=0.000798231,
+  cosine=0.992921
+  min_ms=2.1337, mean_ms=2.1591
+```
+
+Profile of the 448-thread reuse2 variant:
+
+```text
+report:                         reports/sm120_nvfp4_splitkv_reuse2_6656_stage.ncu-rep
+grid size:                      320 CTAs
+block size:                     448
+duration under NCU:             2.19 ms
+registers/thread:               128
+local memory spilling requests: 59.57 MB
+issue slots busy:               12.27%
+SM busy:                        12.56%
+L2 throughput:                  71.34%
+eligible warps/scheduler:       0.18
+active warps/scheduler:         3.48
+```
+
+Conclusion:
+
+```text
+Span-2 output reuse is a real structural win because it removes duplicated
+QK/softmax/P work across output groups. It also reintroduces local spill traffic
+because two PV accumulators are live across the KV loop. The next lever is
+reducing CTA thread-count/register pressure while preserving the reuse.
+```
+
+## Win: 384-Thread Softmax Ownership
+
+2026-04-29T00:01:24-05:00
+
+Changed the softmax roles from two warps per half to one warp per half:
+
+```text
+before:
+  softmax0 = 2 warps, softmax1 = 2 warps
+  CTA threads = 448
+  one softmax thread owns one row
+
+after:
+  softmax0 = 1 warp, softmax1 = 1 warp
+  CTA threads = 384
+  each softmax thread owns two rows in its half
+```
+
+This keeps the two-role Softmax0/Softmax1 pipeline structure but reduces total
+CTA threads, raising the register budget available to the heavy MMA/PV
+accumulator path.
+
+Results:
+
+```text
+reuse2, split_kv_len=6656:
+  finite, mean_abs=0.000158808, max_abs=0.000782972,
+  cosine=0.992929
+  min_ms=1.8552, mean_ms=1.8694
+
+span 1 split-KV, split_kv_len=4736:
+  finite, mean_abs=0.000158847, max_abs=0.000777204,
+  cosine=0.992912
+  min_ms=2.7461, mean_ms=2.7534
+```
+
+Profile of the 384-thread reuse2 variant:
+
+```text
+report:                         reports/sm120_nvfp4_splitkv_reuse2_6656_384t_stage.ncu-rep
+grid size:                      320 CTAs
+block size:                     384
+duration under NCU:             1.92 ms
+registers/thread:               168
+local memory spilling requests: 46.46 MB
+issue slots busy:               13.28%
+SM busy:                        13.86%
+L2 throughput:                  63.05%
+eligible warps/scheduler:       0.19
+active warps/scheduler:         2.99
+```
+
+Conclusion:
+
+```text
+Reducing softmax ownership from 4 warps to 2 warps is accepted. It both improves
+the span-2 path and improves the span-1 path. The profile confirms the register
+budget moved in the intended direction: registers/thread rose from 128 to 168
+and local spill dropped from 59.57 MB to 46.46 MB. There is still significant
+spill, so further wins must either reduce live PV accumulator state or reduce
+CTA thread count again without breaking the CUTLASS MMA role.
+```
+
+## Rejected: Reuse Load Warp As Epilogue Consumer
+
+2026-04-29T00:01:24-05:00
+
+Tried removing the dedicated epilogue warp and reusing the load warp as the
+output-pipeline consumer after Q/K/V TMA issue completes:
+
+```text
+before:
+  softmax0 = 1 warp
+  softmax1 = 1 warp
+  MMA      = 8 warps
+  load     = 1 warp
+  epilogue = 1 warp
+  total    = 384 threads
+
+probe:
+  softmax0 = 1 warp
+  softmax1 = 1 warp
+  MMA      = 8 warps
+  load     = 1 warp, then output consumer
+  epilogue = 0 warps
+  total    = 352 threads
+```
+
+This compiled but deadlocked at runtime before producing output. The likely
+cause is that the load role can remain blocked in the TMA producer/tail path
+while the MMA role reaches the final output pipeline commit. With
+`PipelineE<1>`, the second span-2 output commit waits for the output consumer,
+but the load warp has not safely transitioned into the consumer role yet.
+
+Decision:
+
+```text
+Rejected and reverted. Do not retry the load-as-epilogue role merge without
+first redesigning the V-load tail and output pipeline lifetime. The accepted
+384-thread variant with a dedicated epilogue warp remains the baseline.
+```
+
+## Split Sweep After 384-Thread Change
+
+2026-04-29T00:01:24-05:00
+
+Re-swept reuse2 split length after reducing the softmax roles to one warp per
+half:
+
+```text
+split_kv_len=2048   splits=16  min_ms=2.0376
+split_kv_len=3328   splits=10  min_ms=2.0093
+split_kv_len=4096   splits=8   min_ms=1.8675
+split_kv_len=4736   splits=7   min_ms=2.0396
+split_kv_len=5504   splits=6   min_ms=2.2946
+split_kv_len=6656   splits=5   min_ms=1.8758
+split_kv_len=8192   splits=4   min_ms=2.2330
+```
+
+Repeat-20 checkpoint for the best short-sweep point:
+
+```text
+reuse2, split_kv_len=4096:
+  finite, mean_abs=0.000159100, max_abs=0.000798231,
+  cosine=0.992921
+  min_ms=1.8562, mean_ms=1.8691
+```
+
+Conclusion:
+
+```text
+After the 384-thread change, 4096 and 6656 are effectively tied. Keep 4096 as
+the working split because it has slightly better measured min and more CTAs
+(512 vs 320), which should make subsequent per-CTA improvements easier to
+observe.
+```
+
+## Win: Span-4 Output-Group Reuse
+
+2026-04-29T00:01:24-05:00
+
+Extended output-group reuse from two output groups to all four 128-column output
+groups:
+
+```text
+reuse4:
+  grid_y = 1
+  each CTA computes QK + online softmax once
+  then consumes V groups 0, 1, 2, 3 and emits the full 512-column output tile
+```
+
+The V pipeline has only two stages, so the producer cannot simply prefill all
+four V groups before loading the next K tile. That deadlocks by filling the V
+pipeline before K(n+1) is available. The accepted load sequence is staggered:
+
+```text
+prefill:
+  Q, K0.0, Q, K0.1, V0.g0, V0.g1
+
+loop tile n:
+  K(n+1).0, K(n+1).1     if n+1 exists
+  Vn.g2, Vn.g3
+  V(n+1).g0, V(n+1).g1   if n+1 exists
+```
+
+This preserves the consumer order:
+
+```text
+PV consumes Vn.g0, Vn.g1, Vn.g2, Vn.g3
+```
+
+Correctness is unchanged:
+
+```text
+reuse4, split_kv_len=6656:
+  finite, mean_abs=0.000158808, max_abs=0.000782972,
+  cosine=0.992929
+```
+
+Split sweep:
+
+```text
+split_kv_len=1024   splits=32  min_ms=2.1287
+split_kv_len=2048   splits=16  min_ms=1.8878
+split_kv_len=3328   splits=10  min_ms=1.8465
+split_kv_len=4096   splits=8   min_ms=2.1189
+split_kv_len=4736   splits=7   min_ms=2.3077
+split_kv_len=5120   splits=7   min_ms=2.4157
+split_kv_len=5504   splits=6   min_ms=2.4733
+split_kv_len=6144   splits=6   min_ms=1.8397
+split_kv_len=6656   splits=5   min_ms=1.8042
+```
+
+Repeat-20 checkpoints:
+
+```text
+reuse4, split_kv_len=6656:
+  min_ms=1.7825, mean_ms=1.8485
+
+reuse4, split_kv_len=3328:
+  min_ms=1.8406, mean_ms=1.8547
+```
+
+Profile:
+
+```text
+report:                         reports/sm120_nvfp4_splitkv_reuse4_6656_384t_stage.ncu-rep
+grid size:                      160 CTAs
+block size:                     384
+duration under NCU:             1.80 ms
+registers/thread:               168
+local memory spilling requests: 45.26 MB
+issue slots busy:               11.07%
+SM busy:                        11.07%
+L2 throughput:                  68.44%
+DRAM throughput:                28.49%
+eligible warps/scheduler:       0.16
+active warps/scheduler:         2.96
+```
+
+Conclusion:
+
+```text
+Span-4 reuse is accepted as the current fastest Shape-B q512/kv32k reference
+path. It underfills the GPU at the 5-way split (160 CTAs for 188 SMs), but the
+work removal from eliminating all output-group QK/softmax recompute still wins.
+The remaining bottleneck is not duplicated output-group work; it is per-CTA
+efficiency: local spills remain ~45 MB, eligible warps/scheduler is only 0.16,
+and issue slots busy is ~11%.
+```
+
+## Neutral: Narrow Fragment Live Ranges
+
+2026-04-29T00:01:24-05:00
+
+Moved Q fragments, V fragments, and PV accumulator fragments into the MMA role
+branch instead of declaring them before the role branch. The goal was to shorten
+the lifetime of the heaviest CUTE objects and reduce register pressure.
+
+Result:
+
+```text
+reuse4, split_kv_len=6656:
+  before: min_ms=1.7825, mean_ms=1.8485
+  after:  min_ms=1.7920, mean_ms=1.8481
+```
+
+Conclusion:
+
+```text
+Keep the narrower scopes because they are cleaner and do not regress mean time,
+but this does not materially reduce the remaining gap. The spill source is
+inside CUTE copy/fragment movement and PV accumulator pressure, not accidental
+top-level object lifetime.
+```
+
+## Resource Triage: Remaining 2.8x Levers
+
+2026-04-29T10:24:28-05:00
+
+Re-checked the three plausible sources for the remaining gap:
+
+```text
+active dense NVFP4 MMA atom:       m16n8k64_mxf4nvf4_ue4m3
+QK CUTLASS mainloop stages:        2
+PV K128 CUTLASS mainloop stages:   2
+active role launch:                384 threads / 12 warps
+QKV shared storage:                96256 bytes
+SM120 opt-in shared memory:        101376 bytes
+shared-memory margin:              5120 bytes
+```
+
+Reuse/occupancy:
+
+```text
+reuse2, split_kv_len=4096:
+  splits=8,  more CTA-level parallelism than reuse4
+  repeat20: mean_ms=1.8387, min_ms=1.8252, cosine=0.992921
+  repeat50: mean_ms=1.8363, min_ms=1.8245, cosine=0.992921
+
+reuse4, split_kv_len=6656:
+  splits=5,  CTAs=160
+  repeat20: mean_ms=1.8589, min_ms=1.7882, cosine=0.992929
+  repeat50: mean_ms=1.8534, min_ms=1.7811, cosine=0.992929
+```
+
+Interpretation:
+
+```text
+Reuse2 raises issue-slot activity in profile (13.28% vs 11.07%) and slightly
+wins this serial repeat-20 mean, but it does not reach 2 CTAs/SM. The kernel is
+still capped at one resident CTA by both shared memory and registers. Reuse2 is
+a valid policy candidate, not a structural 2.8x lever.
+```
+
+Pipeline depth:
+
+```text
+QK and PV are both already two-stage. A third stage cannot fit as a local bump:
+the active QKV storage has only 5120 bytes of shared-memory headroom. The
+compact V-only K128 stage is much larger than that, and QK's full CUTLASS
+storage also cannot add another operand stage in the current layout.
+```
+
+MMA atom:
+
+```text
+CUTLASS selects m16n8k64 for dense NVFP4/e4m3 through
+rr_blockscaled_op_selector_sm120(). The m16n8k32 atom in this tree is selected
+for MXF8/F6/F4-family scale paths, not the dense NVFP4/e4m3 path used here. No
+dense NVFP4 m16n8k128 atom is exposed in this CUTLASS tree.
+```
+
+Decision:
+
+```text
+The next real lever is not atom selection or a one-line stage bump. It is
+storage-footprint reduction or tile-shape reduction sufficient to either:
+  1. allow deeper K/V load staging, or
+  2. allow more resident CTAs/SM, or
+  3. reduce PV accumulator/register pressure enough to lift eligible warps.
+
+The already-rejected naive K128 QK bridge remains rejected: it hung for minutes.
+Any K128/Q-tile reduction must be a proper atom-level port, not another cloned
+cooperative GEMM collective.
+```

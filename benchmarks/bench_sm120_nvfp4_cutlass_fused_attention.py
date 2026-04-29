@@ -105,6 +105,8 @@ def main() -> None:
     parser.add_argument("--sm120-qkv-online-check-only", action="store_true")
     parser.add_argument("--sm120-qkv-online-full-grid-bench", action="store_true")
     parser.add_argument("--sm120-qkv-online-splitkv-full-grid-bench", action="store_true")
+    parser.add_argument("--sm120-qkv-online-splitkv-reuse2-full-grid-bench", action="store_true")
+    parser.add_argument("--sm120-qkv-online-splitkv-reuse4-full-grid-bench", action="store_true")
     parser.add_argument("--sm120-role-schedule-check-only", action="store_true")
     parser.add_argument("--online-kv-tiles", type=int, default=2)
     parser.add_argument("--split-kv-len", type=int, default=1024)
@@ -415,7 +417,11 @@ def main() -> None:
         print(result)
         return
 
-    if args.sm120_qkv_online_splitkv_full_grid_bench:
+    if (
+        args.sm120_qkv_online_splitkv_full_grid_bench
+        or args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
+        or args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
+    ):
         (
             q_cutlass,
             q_cutlass_scales,
@@ -437,7 +443,25 @@ def main() -> None:
         split_m = torch.empty((num_splits, Q_LEN * GROUP), device=device, dtype=torch.float32)
         split_l = torch.empty((num_splits, Q_LEN * GROUP), device=device, dtype=torch.float32)
         pv_alpha = 1.0 / v_pv_cutlass_global
-        ext.sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
+        splitkv_fn = (
+            ext.sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid
+            if args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
+            else (
+                ext.sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid
+                if args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
+                else ext.sm120_nvfp4_qkv_online_register_q_splitkv_full_grid
+            )
+        )
+        splitkv_name = (
+            "sm120_qkv_online_register_q_splitkv_reuse4_full_grid"
+            if args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
+            else (
+                "sm120_qkv_online_register_q_splitkv_reuse2_full_grid"
+                if args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
+                else "sm120_qkv_online_register_q_splitkv_full_grid"
+            )
+        )
+        splitkv_fn(
             q_cutlass,
             q_cutlass_scales,
             k_cutlass,
@@ -468,7 +492,7 @@ def main() -> None:
         probs = torch.softmax(qk_ref.float() / (HEAD_DIM**0.5), dim=-1)
         exact_ref = torch.matmul(probs.float(), v_ref_f32[:, :128].float())
         result = {
-            "sm120_qkv_online_register_q_splitkv_full_grid": True,
+            splitkv_name: True,
             "output_shape": tuple(out.shape),
             "partial_shape": tuple(partial.shape),
             "splits": num_splits,
@@ -479,8 +503,8 @@ def main() -> None:
             ],
         }
         result.update(compare("splitkv_full_grid_first_tile_vs_exact", out[:128, :128], exact_ref))
-        result["bench_sm120_qkv_online_register_q_splitkv_full_grid"] = event_ms(
-            lambda: ext.sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
+        result[f"bench_{splitkv_name}"] = event_ms(
+            lambda: splitkv_fn(
                 q_cutlass,
                 q_cutlass_scales,
                 k_cutlass,

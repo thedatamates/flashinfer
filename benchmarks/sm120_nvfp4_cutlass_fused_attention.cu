@@ -64,8 +64,8 @@ enum class Sm120Nvfp4FmhaRole : int {
   Count = 7,
 };
 
-constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 = 2;
-constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 = 2;
+constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 = 1;
+constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 = 1;
 constexpr int kSm120Nvfp4FmhaNumWarpsCorrection = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsMma = 8;
 constexpr int kSm120Nvfp4FmhaNumWarpsLoad = 1;
@@ -85,6 +85,11 @@ constexpr int kSm120Nvfp4FmhaNumWarps =
     kSm120Nvfp4FmhaWarpEpilogue + kSm120Nvfp4FmhaNumWarpsEpilogue;
 constexpr int kSm120Nvfp4FmhaThreadCount =
     kSm120Nvfp4FmhaNumWarps * cutlass::NumThreadsPerWarp;
+constexpr int kSm120Nvfp4FmhaOutputThreadCount =
+    (kSm120Nvfp4FmhaNumWarpsEpilogue > 0
+         ? kSm120Nvfp4FmhaNumWarpsEpilogue
+         : kSm120Nvfp4FmhaNumWarpsLoad) *
+    cutlass::NumThreadsPerWarp;
 constexpr int kSm120Nvfp4FmhaSoftmaxThreadCount =
     (kSm120Nvfp4FmhaNumWarpsSoftmax0 +
      kSm120Nvfp4FmhaNumWarpsSoftmax1) *
@@ -304,7 +309,7 @@ using RunnerClusterShape = flashinfer::gemm::ClusterShape;
 using RunnerFp4Type = flashinfer::gemm::FP4GemmType;
 
 using Sm120Nvfp4PipelineS = cutlass::PipelineAsync<1>;
-using Sm120Nvfp4PipelineE = cutlass::PipelineAsync<2>;
+using Sm120Nvfp4PipelineE = cutlass::PipelineAsync<1>;
 using Sm120Nvfp4OrderBarrierSoftmax =
     cutlass::OrderedSequenceBarrier<1, 2>;
 
@@ -871,6 +876,7 @@ __device__ __forceinline__ void sm120_epilogue_store_bf16_tile(
   }
 }
 
+template <int kOutputGroupSpan>
 __global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount, 1)
 void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
@@ -889,6 +895,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     int split_output_stride_elems) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
   using cute::_;
+  static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
+                    kOutputGroupSpan == 4,
+                "SM120 reference kernel currently supports one, two, or four output groups per CTA");
 
   extern __shared__ __align__(128) char smem[];
   auto& storage = *reinterpret_cast<Sm120Nvfp4QkvLoadCollectiveStorage*>(smem);
@@ -903,12 +912,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   if (effective_num_kv_tiles <= 0) {
     return;
   }
-  const int effective_out_group_idx = out_group_idx + int(blockIdx.y);
+  const int effective_out_group_base =
+      out_group_idx + int(blockIdx.y) * kOutputGroupSpan;
   __nv_bfloat16* out_split_base =
       out_group + effective_split_idx * split_output_stride_elems;
   __nv_bfloat16* out_tile =
       out_split_base + int(blockIdx.x) * kCutlassTileM * out_stride_cols +
-      int(blockIdx.y) * kCutlassTileN;
+      int(blockIdx.y) * kOutputGroupSpan * kCutlassTileN;
 
   const int thread_idx = int(threadIdx.x);
   const int warp_idx = thread_idx / cutlass::NumThreadsPerWarp;
@@ -932,6 +942,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       is_epilogue
           ? thread_idx - kSm120Nvfp4FmhaWarpEpilogue * cutlass::NumThreadsPerWarp
           : 0;
+  const int output_thread_idx = is_epilogue ? epilogue_thread_idx : lane_idx;
 
   typename Sm120Nvfp4PipelineS::Params pipeline_mma_s0_params{};
   typename Sm120Nvfp4PipelineS::Params pipeline_mma_s1_params{};
@@ -966,7 +977,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
   pipeline_corr_epi_params.producer_arv_count = 1;
   pipeline_corr_epi_params.consumer_arv_count =
-      kSm120Nvfp4FmhaNumWarpsEpilogue * cutlass::NumThreadsPerWarp;
+      kSm120Nvfp4FmhaOutputThreadCount;
   pipeline_mma_s0_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
   pipeline_mma_s1_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
   pipeline_corr_epi_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
@@ -1090,15 +1101,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       cute::make_smem_ptr(storage.qk_tensors.smem_SFB.begin()),
       typename CutlassCollectiveMainloop::SmemLayoutSFB{});
 
-  auto q_frag0 = qk_thread_mma.partition_fragment_A(qk_sA(_, _, cute::Int<0>{}));
-  auto q_frag1 = qk_thread_mma.partition_fragment_A(qk_sA(_, _, cute::Int<0>{}));
-  auto q_scale_frag0 =
-      qk_collective.partition_fragment_SFA(qk_sSFA(_, _, cute::Int<0>{}),
-                                           qk_thread_mma);
-  auto q_scale_frag1 =
-      qk_collective.partition_fragment_SFA(qk_sSFA(_, _, cute::Int<0>{}),
-                                           qk_thread_mma);
-
   CutlassCollectiveMainloopK128Stage2 pv_collective;
   auto pv_tiled_mma = typename CutlassCollectiveMainloopK128Stage2::TiledMma{};
   auto pv_thread_mma = pv_tiled_mma.get_thread_slice(pv_mma_thread_idx);
@@ -1108,12 +1110,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto pv_sSFB = cute::make_tensor(
       cute::make_smem_ptr(storage.v_smem_SFB.begin()),
       typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFB{});
-  auto v_frag = pv_thread_mma.partition_fragment_B(pv_sB(_, _, cute::Int<0>{}));
-  auto v_scale_frag =
-      pv_collective.partition_fragment_SFB(pv_sSFB(_, _, cute::Int<0>{}),
-                                           pv_thread_mma);
-  auto pv_accum = cute::partition_fragment_C(
-      pv_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
 
   auto qk_problem_shape_mnkl =
       cute::append<4>(qk_params.problem_shape, cute::Int<1>{});
@@ -1187,8 +1183,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     }
   };
 
-  auto load_v_chunk = [&](int kv_tile) {
+  auto load_v_chunk = [&](int kv_tile, int group_offset) {
     if (is_load && lane_predicate) {
+      const int effective_out_group_idx =
+          effective_out_group_base + group_offset;
       auto gB = pv_gB_nkl(_, _, effective_out_group_idx, _, 0);
       auto gSFB = pv_gSFB_nkl(_, _, effective_out_group_idx, _, 0);
       auto tBgB = pv_block_tma_b.partition_S(gB);
@@ -1208,6 +1206,23 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                  tBgSFB(_, _, _, *k_tile_iter),
                  pv_tBsSFB(_, _, _, write_stage));
       ++v_pipe_write;
+    }
+  };
+
+  auto load_v_group_span = [&](int kv_tile) {
+#pragma unroll
+    for (int group_offset = 0; group_offset < kOutputGroupSpan;
+         ++group_offset) {
+      load_v_chunk(kv_tile, group_offset);
+    }
+  };
+
+  auto load_v_group_range = [&](int kv_tile, int group_begin,
+                                int group_end) {
+#pragma unroll
+    for (int group_offset = group_begin; group_offset < group_end;
+         ++group_offset) {
+      load_v_chunk(kv_tile, group_offset);
     }
   };
 
@@ -1232,33 +1247,111 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       cute::make_smem_ptr(p_smem_sfa + kSm120Nvfp4PvScaleStageElems),
       typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFA{});
 
+  auto consume_and_store_output_span = [&](int store_thread_idx) {
+#pragma unroll
+    for (int group_offset = 0; group_offset < kOutputGroupSpan;
+         ++group_offset) {
+      pipeline_corr_epi.consumer_wait(pipeline_corr_epi_consumer_state);
+      sm120_epilogue_store_bf16_tile(
+          smem_epilogue_o, out_tile + group_offset * kCutlassTileN,
+          out_stride_cols, store_thread_idx);
+      if (group_offset == 0 && split_m != nullptr && split_l != nullptr) {
+        for (int row = store_thread_idx; row < kCutlassTileM;
+             row += kSm120Nvfp4FmhaOutputThreadCount) {
+          const int global_row = effective_q_tile * kCutlassTileM + row;
+          const int stats_idx =
+              effective_split_idx * split_stats_stride_rows + global_row;
+          split_m[stats_idx] = storage.global_m[row];
+          split_l[stats_idx] = storage.global_l[row];
+        }
+      }
+      pipeline_corr_epi.consumer_release(pipeline_corr_epi_consumer_state);
+      ++pipeline_corr_epi_consumer_state;
+    }
+  };
+
   if (is_load) {
     load_q_chunk(0);
     load_k_chunk(effective_kv_tile_start, 0);
     load_q_chunk(1);
-    load_v_chunk(effective_kv_tile_start);
-    load_k_chunk(effective_kv_tile_start, 1);
+    if constexpr (kOutputGroupSpan == 1) {
+      load_v_group_span(effective_kv_tile_start);
+      load_k_chunk(effective_kv_tile_start, 1);
+    } else if constexpr (kOutputGroupSpan == 2) {
+      load_k_chunk(effective_kv_tile_start, 1);
+      load_v_group_span(effective_kv_tile_start);
+    } else {
+      load_k_chunk(effective_kv_tile_start, 1);
+      load_v_group_range(effective_kv_tile_start, 0, 2);
+    }
     qk_collective.load_tail(q_pipeline, q_pipe_write);
 
     for (int tile = 0; tile < effective_num_kv_tiles; ++tile) {
-      if (tile + 1 < effective_num_kv_tiles) {
+      if constexpr (kOutputGroupSpan == 4) {
+        if (tile + 1 < effective_num_kv_tiles) {
+          const int next_kv_tile = effective_kv_tile_start + tile + 1;
+          load_k_chunk(next_kv_tile, 0);
+          load_k_chunk(next_kv_tile, 1);
+        }
+        load_v_group_range(effective_kv_tile_start + tile, 2, 4);
+        if (tile + 1 < effective_num_kv_tiles) {
+          const int next_kv_tile = effective_kv_tile_start + tile + 1;
+          load_v_group_range(next_kv_tile, 0, 2);
+        }
+      } else if (tile + 1 < effective_num_kv_tiles) {
         const int next_kv_tile = effective_kv_tile_start + tile + 1;
-        load_v_chunk(next_kv_tile);
-        load_k_chunk(next_kv_tile, 0);
-        load_k_chunk(next_kv_tile, 1);
+        if constexpr (kOutputGroupSpan == 1) {
+          load_v_group_span(next_kv_tile);
+          load_k_chunk(next_kv_tile, 0);
+          load_k_chunk(next_kv_tile, 1);
+        } else {
+          load_k_chunk(next_kv_tile, 0);
+          load_k_chunk(next_kv_tile, 1);
+          load_v_group_span(next_kv_tile);
+        }
       }
     }
 
     qk_collective.load_tail(k_pipeline, k_pipe_write);
     pv_collective.load_tail(v_pipeline, v_pipe_write);
   } else if (is_mma) {
+    auto q_frag0 =
+        qk_thread_mma.partition_fragment_A(qk_sA(_, _, cute::Int<0>{}));
+    auto q_frag1 =
+        qk_thread_mma.partition_fragment_A(qk_sA(_, _, cute::Int<0>{}));
+    auto q_scale_frag0 =
+        qk_collective.partition_fragment_SFA(qk_sSFA(_, _, cute::Int<0>{}),
+                                             qk_thread_mma);
+    auto q_scale_frag1 =
+        qk_collective.partition_fragment_SFA(qk_sSFA(_, _, cute::Int<0>{}),
+                                             qk_thread_mma);
+    auto v_frag =
+        pv_thread_mma.partition_fragment_B(pv_sB(_, _, cute::Int<0>{}));
+    auto v_scale_frag =
+        pv_collective.partition_fragment_SFB(pv_sSFB(_, _, cute::Int<0>{}),
+                                             pv_thread_mma);
+    auto pv_accum0 = cute::partition_fragment_C(
+        pv_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+    auto pv_accum1 = cute::partition_fragment_C(
+        pv_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+    auto pv_accum2 = cute::partition_fragment_C(
+        pv_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+    auto pv_accum3 = cute::partition_fragment_C(
+        pv_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
     cutlass_qk_tma_q_register_stage(
         q_pipeline, q_pipe_read, q_frag0, q_scale_frag0, qk_mma_thread_idx,
         storage.qk_tensors);
     cutlass_qk_tma_q_register_stage(
         q_pipeline, q_pipe_read, q_frag1, q_scale_frag1, qk_mma_thread_idx,
         storage.qk_tensors);
-    cute::clear(pv_accum);
+    cute::clear(pv_accum0);
+    if constexpr (kOutputGroupSpan >= 2) {
+      cute::clear(pv_accum1);
+    }
+    if constexpr (kOutputGroupSpan == 4) {
+      cute::clear(pv_accum2);
+      cute::clear(pv_accum3);
+    }
     k_pipe_release = k_pipe_read;
 
     auto qk_tCrB =
@@ -1517,7 +1610,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       commit_score_stages();
     };
 
-    auto run_pv_tile = [&](int tile, bool final_tile) {
+    auto run_pv_tile = [&](int tile, bool final_tile, auto& pv_accum) {
       if (final_tile) {
         acquire_output_stage();
       }
@@ -1551,11 +1644,25 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       acquire_score_stages();
       run_qk_tile(tile);
       if (tile > 0) {
-        run_pv_tile(tile - 1, false);
+        run_pv_tile(tile - 1, false, pv_accum0);
+        if constexpr (kOutputGroupSpan >= 2) {
+          run_pv_tile(tile - 1, false, pv_accum1);
+        }
+        if constexpr (kOutputGroupSpan == 4) {
+          run_pv_tile(tile - 1, false, pv_accum2);
+          run_pv_tile(tile - 1, false, pv_accum3);
+        }
       }
       wait_p_ready_and_release_k();
     }
-    run_pv_tile(effective_num_kv_tiles - 1, true);
+    run_pv_tile(effective_num_kv_tiles - 1, true, pv_accum0);
+    if constexpr (kOutputGroupSpan >= 2) {
+      run_pv_tile(effective_num_kv_tiles - 1, true, pv_accum1);
+    }
+    if constexpr (kOutputGroupSpan == 4) {
+      run_pv_tile(effective_num_kv_tiles - 1, true, pv_accum2);
+      run_pv_tile(effective_num_kv_tiles - 1, true, pv_accum3);
+    }
   } else if (is_softmax) {
     auto wait_score_stage = [&]() {
       if (is_softmax0) {
@@ -1578,10 +1685,18 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     constexpr int kRowsPerSoftmaxRole = kCutlassTileM / 2;
     const int row_begin = is_softmax1 ? kRowsPerSoftmaxRole : 0;
     const int row_end = row_begin + kRowsPerSoftmaxRole;
-    const int owned_row = row_begin + softmax_group_thread_idx;
-    const bool owns_row = softmax_group_thread_idx < kRowsPerSoftmaxRole;
-    float running_m = -INFINITY;
-    float running_l = 0.0f;
+    float running_m[kRowsPerSoftmaxRole /
+                    kSm120Nvfp4FmhaSoftmaxGroupThreadCount];
+    float running_l[kRowsPerSoftmaxRole /
+                    kSm120Nvfp4FmhaSoftmaxGroupThreadCount];
+#pragma unroll
+    for (int row_slot = 0;
+         row_slot < kRowsPerSoftmaxRole /
+                        kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
+         ++row_slot) {
+      running_m[row_slot] = -INFINITY;
+      running_l[row_slot] = 0.0f;
+    }
 
     auto stage_probability_row = [&](auto& p_sA, auto& p_sSFA,
                                      const __nv_bfloat16* smem_logits_stage,
@@ -1625,7 +1740,14 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       wait_score_stage();
       const __nv_bfloat16* smem_logits_stage =
           (tile & 1) == 0 ? smem_logits0 : smem_logits1;
-      if (owns_row) {
+#pragma unroll
+      for (int row_slot = 0;
+           row_slot < kRowsPerSoftmaxRole /
+                          kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
+           ++row_slot) {
+        const int owned_row =
+            row_begin + softmax_group_thread_idx +
+            row_slot * kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
         float tile_m = -INFINITY;
 #pragma unroll
         for (int col = 0; col < kCutlassTileN; ++col) {
@@ -1633,9 +1755,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
               smem_logits_stage[owned_row * kCutlassTileN + col]);
           tile_m = fmaxf(tile_m, logit);
         }
-        const float next_m = fmaxf(running_m, tile_m);
+        const float next_m = fmaxf(running_m[row_slot], tile_m);
         const float old_scale =
-            running_l == 0.0f ? 0.0f : __expf(running_m - next_m);
+            running_l[row_slot] == 0.0f
+                ? 0.0f
+                : __expf(running_m[row_slot] - next_m);
         const float tile_scale = __expf(tile_m - next_m);
         const float tile_l_scaled =
             (tile & 1) == 0
@@ -1643,35 +1767,20 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                                         owned_row, tile_m, tile_scale)
                 : stage_probability_row(p_sA1, p_sSFA1, smem_logits1,
                                         owned_row, tile_m, tile_scale);
-        running_l = running_l * old_scale + tile_l_scaled;
-        running_m = next_m;
+        running_l[row_slot] =
+            running_l[row_slot] * old_scale + tile_l_scaled;
+        running_m[row_slot] = next_m;
         storage.old_scale_stage[tile & 1][owned_row] = old_scale;
         if (tile == effective_num_kv_tiles - 1) {
-          storage.global_m[owned_row] = running_m;
-          storage.global_l[owned_row] = running_l;
+          storage.global_m[owned_row] = running_m[row_slot];
+          storage.global_l[owned_row] = running_l[row_slot];
         }
       }
       cutlass::arch::fence_view_async_shared();
       release_p_ready();
     }
   } else if (is_epilogue) {
-    pipeline_corr_epi.consumer_wait(pipeline_corr_epi_consumer_state);
-    sm120_epilogue_store_bf16_tile(
-        smem_epilogue_o, out_tile, out_stride_cols, epilogue_thread_idx);
-    if (split_m != nullptr && split_l != nullptr) {
-      const int epilogue_threads =
-          kSm120Nvfp4FmhaNumWarpsEpilogue * cutlass::NumThreadsPerWarp;
-      for (int row = epilogue_thread_idx; row < kCutlassTileM;
-           row += epilogue_threads) {
-        const int global_row = effective_q_tile * kCutlassTileM + row;
-        const int stats_idx =
-            effective_split_idx * split_stats_stride_rows + global_row;
-        split_m[stats_idx] = storage.global_m[row];
-        split_l[stats_idx] = storage.global_l[row];
-      }
-    }
-    pipeline_corr_epi.consumer_release(pipeline_corr_epi_consumer_state);
-    ++pipeline_corr_epi_consumer_state;
+    consume_and_store_output_span(output_thread_idx);
   }
 #else
   if (threadIdx.x == 0) {
@@ -2090,7 +2199,7 @@ void sm120_nvfp4_qkv_online_register_q_stage(torch::Tensor q_packed,
 
   constexpr int kSmemBytes =
       static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
-  auto kernel = sm120_nvfp4_qkv_online_register_q_stage_kernel;
+  auto kernel = sm120_nvfp4_qkv_online_register_q_stage_kernel<1>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
   kernel<<<dim3(1, 1, 1), kSm120Nvfp4FmhaThreadCount, kSmemBytes,
@@ -2190,7 +2299,7 @@ void sm120_nvfp4_qkv_online_register_q_full_grid(torch::Tensor q_packed,
 
   constexpr int kSmemBytes =
       static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
-  auto kernel = sm120_nvfp4_qkv_online_register_q_stage_kernel;
+  auto kernel = sm120_nvfp4_qkv_online_register_q_stage_kernel<1>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
   kernel<<<dim3(kQRows / kCutlassTileM, kHeadDim / kCutlassTileN, 1),
@@ -2203,7 +2312,8 @@ void sm120_nvfp4_qkv_online_register_q_full_grid(torch::Tensor q_packed,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
+template <int kOutputGroupSpan>
+void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
     torch::Tensor q_packed,
     torch::Tensor q_scales,
     torch::Tensor k_packed,
@@ -2218,6 +2328,9 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
     double qk_alpha,
     double pv_alpha,
     int64_t split_kv_tiles) {
+  static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
+                    kOutputGroupSpan == 4,
+                "SM120 split-KV wrapper currently supports span 1, 2, or 4");
   check_tensor(q_packed, "q_packed", torch::kUInt8);
   check_tensor(q_scales, "q_scales", torch::kUInt8);
   check_tensor(k_packed, "k_packed", torch::kUInt8);
@@ -2256,6 +2369,8 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
               "split_l must have shape [num_splits, 4096]");
   TORCH_CHECK(out.sizes() == torch::IntArrayRef({kQRows, kHeadDim}),
               "out must have shape [4096, 512]");
+  TORCH_CHECK(kHeadDim % (kOutputGroupSpan * kCutlassTileN) == 0,
+              "head dimension must be divisible by output-group span");
 
   float alpha = 1.0f;
   auto qk_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
@@ -2308,10 +2423,12 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
 
   constexpr int kSmemBytes =
       static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
-  auto stage_kernel = sm120_nvfp4_qkv_online_register_q_stage_kernel;
+  auto stage_kernel =
+      sm120_nvfp4_qkv_online_register_q_stage_kernel<kOutputGroupSpan>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-  stage_kernel<<<dim3(kQRows / kCutlassTileM, kHeadDim / kCutlassTileN,
+  stage_kernel<<<dim3(kQRows / kCutlassTileM,
+                      kHeadDim / (kOutputGroupSpan * kCutlassTileN),
                       num_splits),
                  kSm120Nvfp4FmhaThreadCount, kSmemBytes,
                  at::cuda::getCurrentCUDAStream()>>>(
@@ -2333,6 +2450,69 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
       num_splits);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
+    torch::Tensor q_packed,
+    torch::Tensor q_scales,
+    torch::Tensor k_packed,
+    torch::Tensor k_scales,
+    torch::Tensor v_pv_packed,
+    torch::Tensor v_pv_scales,
+    torch::Tensor partial,
+    torch::Tensor split_m,
+    torch::Tensor split_l,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    double qk_alpha,
+    double pv_alpha,
+    int64_t split_kv_tiles) {
+  sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<1>(
+      q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
+      partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
+      split_kv_tiles);
+}
+
+void sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid(
+    torch::Tensor q_packed,
+    torch::Tensor q_scales,
+    torch::Tensor k_packed,
+    torch::Tensor k_scales,
+    torch::Tensor v_pv_packed,
+    torch::Tensor v_pv_scales,
+    torch::Tensor partial,
+    torch::Tensor split_m,
+    torch::Tensor split_l,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    double qk_alpha,
+    double pv_alpha,
+    int64_t split_kv_tiles) {
+  sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<2>(
+      q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
+      partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
+      split_kv_tiles);
+}
+
+void sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid(
+    torch::Tensor q_packed,
+    torch::Tensor q_scales,
+    torch::Tensor k_packed,
+    torch::Tensor k_scales,
+    torch::Tensor v_pv_packed,
+    torch::Tensor v_pv_scales,
+    torch::Tensor partial,
+    torch::Tensor split_m,
+    torch::Tensor split_l,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    double qk_alpha,
+    double pv_alpha,
+    int64_t split_kv_tiles) {
+  sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<4>(
+      q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
+      partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
+      split_kv_tiles);
 }
 
 RunnerConfig runner_config_from_tactic(int64_t tactic) {
@@ -2447,6 +2627,11 @@ pybind11::dict cutlass_sm120_blockscaled_collective_metadata() {
   d["tile_n"] = 128;
   d["tile_k"] = 256;
   d["scale_vec_size"] = CutlassCollectiveMainloop::TiledMma::SFVecSize;
+  d["active_blockscaled_mma_atom"] = "m16n8k64_mxf4nvf4_ue4m3";
+  d["qk_mainloop_stages"] =
+      static_cast<int64_t>(CutlassCollectiveMainloop::DispatchPolicy::Stages);
+  d["pv_k128_stage2_mainloop_stages"] = static_cast<int64_t>(
+      CutlassCollectiveMainloopK128Stage2::DispatchPolicy::Stages);
   d["thread_count"] = CutlassCollectiveMainloop::ThreadCount;
   d["gemm_kernel_block_threads"] =
       static_cast<int64_t>(CutlassGemmKernel::get_block_shape().x);
@@ -2704,6 +2889,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sm120_nvfp4_qkv_online_register_q_splitkv_full_grid",
         &sm120_nvfp4_qkv_online_register_q_splitkv_full_grid,
         "SM120 NVFP4 split-KV online-softmax full Shape-B tile grid");
+  m.def("sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid",
+        &sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid,
+        "SM120 NVFP4 split-KV online-softmax full Shape-B tile grid reusing P across two output groups");
+  m.def("sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid",
+        &sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid,
+        "SM120 NVFP4 split-KV online-softmax full Shape-B tile grid reusing P across four output groups");
   m.def("cutlass_runner_fp4_gemm", &cutlass_runner_fp4_gemm,
         "FlashInfer SM120 CUTLASS FP4 GEMM runner smoke hook");
   m.def("cutlass_sm120_blockscaled_collective_metadata",
