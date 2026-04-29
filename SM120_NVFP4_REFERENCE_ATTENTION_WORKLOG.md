@@ -6301,3 +6301,89 @@ Softmax converts the score tile into compact P. The next structural port must
 remove that full-score shared-memory lifetime or move to a direct
 score-fragment-to-P handoff that preserves Softmax ownership.
 ```
+
+## Softmax-Owned Online State Port
+
+Ported online max/sum ownership from the per-tile Correction role into the
+Softmax roles, matching the 88/SM100 softmax lifecycle more closely.
+
+Previous active structure:
+
+```text
+MMA:
+  write full BF16 score tile
+
+Softmax0 or Softmax1, alternating by tile parity:
+  compute tile row_m / row_l
+  signal Correction
+  wait Correction
+  stage compact P using tile_scale from Correction
+
+Correction, every tile:
+  update global_m/global_l
+  write old_scale/tile_scale
+
+MMA:
+  wait compact P
+  rescale PV accumulator by old_scale
+  run PV
+```
+
+New active structure:
+
+```text
+MMA:
+  write full BF16 score tile
+
+Softmax0 and Softmax1, both active on every tile:
+  Softmax0 owns rows [0, 64)
+  Softmax1 owns rows [64, 128)
+  keep running_m/running_l in registers for owned rows
+  compute old_scale/tile_scale directly
+  stage compact P for owned rows
+  write final global_l for Correction/Epilogue normalization
+
+Correction:
+  removed from the per-tile online-state path
+  only waits final O and normalizes epilogue smem by final global_l
+```
+
+Implementation notes:
+
+```text
+- `pipeline_mma_s0` and `pipeline_mma_s1` now have both softmax roles as
+  consumers, so consumer arrival count is 256 threads.
+- Both softmax roles must be configured as consumers of both S pipelines. The
+  first attempt left Softmax0 consuming only S0 and Softmax1 consuming only S1;
+  kv_tiles=1 deadlocked until the role setup was corrected.
+- The softmax row-state barrier and the P-scale-ready barrier use distinct
+  named-barrier IDs. Reusing one barrier ID for back-to-back 256-thread phases
+  is unsafe because one group can enter the next phase while the other is still
+  draining the previous phase.
+- The now-dead `s0_corr` / `s1_corr` pipelines and row-stat helper code were
+  removed from the active kernel.
+```
+
+Validation:
+
+```text
+git diff --check: pass
+online kv_tiles=1:  finite, mean_abs=0.00253812, max_abs=0.0139102, cosine=0.989603
+online kv_tiles=16: finite, mean_abs=0.000615264, max_abs=0.00324988, cosine=0.988328
+full grid first tile: finite, mean_abs=0.000155821, max_abs=0.000807697, cosine=0.992418
+full-grid min: 11.2681 ms
+```
+
+Conclusion:
+
+```text
+This is the first structural port in this phase that materially moves runtime:
+14.8333 ms -> 11.2681 ms, about a 24% reduction. The win comes from removing
+the per-tile Correction round trip and making Softmax own the online state.
+
+The kernel is still far from the two-stage CUTLASS ceiling. The remaining
+dominant structural problem is unchanged: the full BF16 score tile still lives
+in the K/B shared-memory region until compact P is produced, so K release and
+next-tile QK remain blocked by score-tile consumption. The next port must target
+the S/P lifetime itself, not the online-state math.
+```

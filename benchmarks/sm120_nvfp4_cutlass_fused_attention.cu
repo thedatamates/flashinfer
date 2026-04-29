@@ -109,6 +109,7 @@ constexpr uint32_t kSm120Nvfp4BarrierMmaSoftmax = 1;
 constexpr uint32_t kSm120Nvfp4BarrierSoftmaxMma = 2;
 constexpr uint32_t kSm120Nvfp4BarrierSoftmaxCorrection = 3;
 constexpr uint32_t kSm120Nvfp4BarrierCorrectionSoftmax = 4;
+constexpr uint32_t kSm120Nvfp4BarrierSoftmaxOnlineReady = 5;
 
 __host__ __device__ constexpr Sm120Nvfp4FmhaRole
 sm120_nvfp4_fmha_role_for_warp(int warp_idx) {
@@ -318,8 +319,6 @@ using Sm120Nvfp4OrderBarrierSoftmax =
 struct Sm120Nvfp4MainloopPipelineStorage {
   alignas(16) typename Sm120Nvfp4PipelineS::SharedStorage mma_s0;
   alignas(16) typename Sm120Nvfp4PipelineS::SharedStorage mma_s1;
-  alignas(16) typename Sm120Nvfp4PipelineC::SharedStorage s0_corr;
-  alignas(16) typename Sm120Nvfp4PipelineC::SharedStorage s1_corr;
   alignas(16) typename Sm120Nvfp4PipelineO::SharedStorage mma_corr;
   alignas(16) typename Sm120Nvfp4PipelineE::SharedStorage corr_epi;
   alignas(16) typename Sm120Nvfp4OrderBarrierSoftmax::SharedStorage order_s01;
@@ -1033,63 +1032,6 @@ softmax_role_quant_logits_bf16_to_pv_smem_stage2(
   });
 }
 
-__device__ __forceinline__ void softmax_role_compute_logits_bf16_row_m_l(
-    const __nv_bfloat16* logits,
-    float* row_m_out,
-    float* row_l_out,
-    int softmax_thread_idx,
-    int softmax_thread_count) {
-  for (int row = softmax_thread_idx; row < kCutlassTileM;
-       row += softmax_thread_count) {
-    float row_m = -INFINITY;
-#pragma unroll
-    for (int col = 0; col < kCutlassTileN; ++col) {
-      const float logit =
-          __bfloat162float(logits[row * kCutlassTileN + col]);
-      row_m = fmaxf(row_m, logit);
-    }
-    float row_l = 0.0f;
-#pragma unroll
-    for (int col = 0; col < kCutlassTileN; ++col) {
-      const float logit =
-          __bfloat162float(logits[row * kCutlassTileN + col]);
-      row_l += __expf(logit - row_m);
-    }
-    row_m_out[row] = row_m;
-    row_l_out[row] = row_l;
-  }
-}
-
-__device__ __forceinline__ void correction_role_update_online_state(
-    const float* row_m,
-    const float* row_l,
-    float* global_m,
-    float* global_l,
-    float* old_scale,
-    float* tile_scale,
-    int tile,
-    int correction_thread_idx) {
-  for (int row = correction_thread_idx; row < kCutlassTileM;
-       row += kSm120Nvfp4FmhaCorrectionThreadCount) {
-    if (tile == 0) {
-      global_m[row] = row_m[row];
-      global_l[row] = row_l[row];
-      old_scale[row] = 0.0f;
-      tile_scale[row] = 1.0f;
-    } else {
-      const float prev_m = global_m[row];
-      const float curr_m = row_m[row];
-      const float next_m = fmaxf(prev_m, curr_m);
-      const float prev_scale = __expf(prev_m - next_m);
-      const float curr_scale = __expf(curr_m - next_m);
-      global_m[row] = next_m;
-      global_l[row] = global_l[row] * prev_scale + row_l[row] * curr_scale;
-      old_scale[row] = prev_scale;
-      tile_scale[row] = curr_scale;
-    }
-  }
-}
-
 template <class AccumTensor, class CoordTensor>
 __device__ __forceinline__ void sm120_stage_o_fragment_to_epilogue_smem(
     AccumTensor const& accum,
@@ -1141,14 +1083,20 @@ softmax_role_stage_logits_bf16_p_to_pv_smem_stage2(
     TensorSFA& p_sSFA,
     const float* row_m,
     const float* row_scale,
+    int row_begin,
+    int row_end,
     int softmax_thread_idx,
-    int softmax_thread_count) {
+    int softmax_thread_count,
+    int barrier_thread_count) {
   using cute::_;
 
   for (int idx = softmax_thread_idx;
        idx < kCutlassTileM * (kCutlassTileN / 16);
        idx += softmax_thread_count) {
     const int row = idx / (kCutlassTileN / 16);
+    if (row < row_begin || row >= row_end) {
+      continue;
+    }
     const int scale_group = idx - row * (kCutlassTileN / 16);
     const int local_col = scale_group * 16;
     const float p_row_scale = row_scale == nullptr ? 1.0f : row_scale[row];
@@ -1165,7 +1113,7 @@ softmax_role_stage_logits_bf16_p_to_pv_smem_stage2(
     p_sSFA(row, local_col, cute::Int<0>{}) = make_ue4m3_raw(scale_byte);
   }
   cutlass::arch::NamedBarrier::sync(
-      softmax_thread_count,
+      barrier_thread_count,
       kSm120Nvfp4BarrierSoftmaxInternal);
 
   CutlassCollectiveMainloopK128Stage2 collective;
@@ -1185,6 +1133,9 @@ softmax_role_stage_logits_bf16_p_to_pv_smem_stage2(
     for (int i = 0; i < int(cute::size(tDst)); ++i) {
       auto coord = tCoord(i);
       const int row = int(cute::get<0>(coord));
+      if (row < row_begin || row >= row_end) {
+        continue;
+      }
       const int k = int(cute::get<1>(coord));
       const int scale_group = k >> 4;
       const int local_col = scale_group * 16;
@@ -2299,8 +2250,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 
   typename Sm120Nvfp4PipelineS::Params pipeline_mma_s0_params{};
   typename Sm120Nvfp4PipelineS::Params pipeline_mma_s1_params{};
-  typename Sm120Nvfp4PipelineC::Params pipeline_s0_corr_params{};
-  typename Sm120Nvfp4PipelineC::Params pipeline_s1_corr_params{};
   typename Sm120Nvfp4PipelineO::Params pipeline_mma_corr_params{};
   typename Sm120Nvfp4PipelineE::Params pipeline_corr_epi_params{};
   if (is_mma) {
@@ -2311,23 +2260,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     pipeline_mma_corr_params.role =
         Sm120Nvfp4PipelineO::ThreadCategory::Producer;
   }
-  if (is_softmax0) {
+  if (is_softmax) {
     pipeline_mma_s0_params.role =
         Sm120Nvfp4PipelineS::ThreadCategory::Consumer;
-    pipeline_s0_corr_params.role =
-        Sm120Nvfp4PipelineC::ThreadCategory::Producer;
-  }
-  if (is_softmax1) {
     pipeline_mma_s1_params.role =
         Sm120Nvfp4PipelineS::ThreadCategory::Consumer;
-    pipeline_s1_corr_params.role =
-        Sm120Nvfp4PipelineC::ThreadCategory::Producer;
   }
   if (is_correction) {
-    pipeline_s0_corr_params.role =
-        Sm120Nvfp4PipelineC::ThreadCategory::Consumer;
-    pipeline_s1_corr_params.role =
-        Sm120Nvfp4PipelineC::ThreadCategory::Consumer;
     pipeline_mma_corr_params.role =
         Sm120Nvfp4PipelineO::ThreadCategory::Consumer;
     pipeline_corr_epi_params.role =
@@ -2340,17 +2279,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   pipeline_mma_s0_params.producer_arv_count = 1;
   pipeline_mma_s1_params.producer_arv_count = 1;
   pipeline_mma_s0_params.consumer_arv_count =
-      kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
+      kSm120Nvfp4FmhaSoftmaxThreadCount;
   pipeline_mma_s1_params.consumer_arv_count =
-      kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
-  pipeline_s0_corr_params.producer_arv_count =
-      kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
-  pipeline_s1_corr_params.producer_arv_count =
-      kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
-  pipeline_s0_corr_params.consumer_arv_count =
-      kSm120Nvfp4FmhaCorrectionThreadCount;
-  pipeline_s1_corr_params.consumer_arv_count =
-      kSm120Nvfp4FmhaCorrectionThreadCount;
+      kSm120Nvfp4FmhaSoftmaxThreadCount;
   pipeline_mma_corr_params.producer_arv_count = 1;
   pipeline_mma_corr_params.consumer_arv_count =
       kSm120Nvfp4FmhaCorrectionThreadCount;
@@ -2360,8 +2291,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       kSm120Nvfp4FmhaNumWarpsEpilogue * cutlass::NumThreadsPerWarp;
   pipeline_mma_s0_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
   pipeline_mma_s1_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
-  pipeline_s0_corr_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
-  pipeline_s1_corr_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
   pipeline_mma_corr_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
   pipeline_corr_epi_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
   Sm120Nvfp4PipelineS pipeline_mma_s0(
@@ -2369,12 +2298,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       cute::true_type{});
   Sm120Nvfp4PipelineS pipeline_mma_s1(
       storage.role_pipeline_storage.mma_s1, pipeline_mma_s1_params,
-      cute::true_type{});
-  Sm120Nvfp4PipelineC pipeline_s0_corr(
-      storage.role_pipeline_storage.s0_corr, pipeline_s0_corr_params,
-      cute::true_type{});
-  Sm120Nvfp4PipelineC pipeline_s1_corr(
-      storage.role_pipeline_storage.s1_corr, pipeline_s1_corr_params,
       cute::true_type{});
   Sm120Nvfp4PipelineO pipeline_mma_corr(
       storage.role_pipeline_storage.mma_corr, pipeline_mma_corr_params,
@@ -2397,12 +2320,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   typename Sm120Nvfp4PipelineS::PipelineState pipeline_mma_s1_producer_state =
       cutlass::make_producer_start_state<Sm120Nvfp4PipelineS>();
   typename Sm120Nvfp4PipelineS::PipelineState pipeline_mma_s1_consumer_state;
-  typename Sm120Nvfp4PipelineC::PipelineState pipeline_s0_corr_producer_state =
-      cutlass::make_producer_start_state<Sm120Nvfp4PipelineC>();
-  typename Sm120Nvfp4PipelineC::PipelineState pipeline_s0_corr_consumer_state;
-  typename Sm120Nvfp4PipelineC::PipelineState pipeline_s1_corr_producer_state =
-      cutlass::make_producer_start_state<Sm120Nvfp4PipelineC>();
-  typename Sm120Nvfp4PipelineC::PipelineState pipeline_s1_corr_consumer_state;
   typename Sm120Nvfp4PipelineO::PipelineState pipeline_mma_corr_producer_state =
       cutlass::make_producer_start_state<Sm120Nvfp4PipelineO>();
   typename Sm120Nvfp4PipelineO::PipelineState pipeline_mma_corr_consumer_state;
@@ -2411,8 +2328,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   typename Sm120Nvfp4PipelineE::PipelineState pipeline_corr_epi_consumer_state;
   bool pipeline_mma_s0_acquired = false;
   bool pipeline_mma_s1_acquired = false;
-  bool pipeline_s0_corr_acquired = false;
-  bool pipeline_s1_corr_acquired = false;
 
   if (is_load && lane_predicate) {
     CutlassCollectiveMainloop::prefetch_tma_descriptors(qk_params.mainloop);
@@ -2990,37 +2905,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
     };
 
-    auto commit_row_stats = [&](int tile) {
-      cutlass::arch::NamedBarrier::sync(
-          kSm120Nvfp4FmhaSoftmaxGroupThreadCount,
-          kSm120Nvfp4BarrierSoftmaxInternal);
-      if ((tile & 1) == 0) {
-        if (!pipeline_s0_corr_acquired) {
-          pipeline_s0_corr.producer_acquire(pipeline_s0_corr_producer_state);
-        }
-        pipeline_s0_corr_acquired = false;
-        pipeline_s0_corr.producer_commit(pipeline_s0_corr_producer_state);
-        ++pipeline_s0_corr_producer_state;
-      } else {
-        if (!pipeline_s1_corr_acquired) {
-          pipeline_s1_corr.producer_acquire(pipeline_s1_corr_producer_state);
-        }
-        pipeline_s1_corr_acquired = false;
-        pipeline_s1_corr.producer_commit(pipeline_s1_corr_producer_state);
-        ++pipeline_s1_corr_producer_state;
-      }
-    };
-
-    auto wait_correction = [&](int tile) {
-      if ((tile & 1) == 0) {
-        pipeline_s0_corr.producer_acquire(pipeline_s0_corr_producer_state);
-        pipeline_s0_corr_acquired = true;
-      } else {
-        pipeline_s1_corr.producer_acquire(pipeline_s1_corr_producer_state);
-        pipeline_s1_corr_acquired = true;
-      }
-    };
-
     auto release_p_ready = [&](int tile) {
       if ((tile & 1) == 0) {
         pipeline_mma_s0.consumer_release(pipeline_mma_s0_consumer_state);
@@ -3031,65 +2915,77 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
     };
 
-    const int softmax_stage = is_softmax1 ? 1 : 0;
+    constexpr int kRowsPerSoftmaxRole = kCutlassTileM / 2;
+    const int row_begin = is_softmax1 ? kRowsPerSoftmaxRole : 0;
+    const int row_end = row_begin + kRowsPerSoftmaxRole;
+    const int owned_row = row_begin + softmax_group_thread_idx;
+    const bool owns_row = softmax_group_thread_idx < kRowsPerSoftmaxRole;
+    float running_m = -INFINITY;
+    float running_l = 0.0f;
+
     for (int tile = 0; tile < num_kv_tiles; ++tile) {
-      if ((tile & 1) != softmax_stage) {
-        continue;
-      }
       wait_score_stage(tile);
       const __nv_bfloat16* smem_logits_stage =
           (tile & 1) == 0 ? smem_logits0 : smem_logits1;
-      softmax_role_compute_logits_bf16_row_m_l(
-          smem_logits_stage, storage.row_m_stage[tile & 1],
-          storage.row_l_stage[tile & 1], softmax_group_thread_idx,
-          kSm120Nvfp4FmhaSoftmaxGroupThreadCount);
-      commit_row_stats(tile);
-      wait_correction(tile);
+      if (owns_row) {
+        float tile_m = -INFINITY;
+#pragma unroll
+        for (int col = 0; col < kCutlassTileN; ++col) {
+          const float logit = __bfloat162float(
+              smem_logits_stage[owned_row * kCutlassTileN + col]);
+          tile_m = fmaxf(tile_m, logit);
+        }
+        float tile_l = 0.0f;
+#pragma unroll
+        for (int col = 0; col < kCutlassTileN; ++col) {
+          const float logit = __bfloat162float(
+              smem_logits_stage[owned_row * kCutlassTileN + col]);
+          tile_l += __expf(logit - tile_m);
+        }
+        const float next_m = fmaxf(running_m, tile_m);
+        const float old_scale =
+            running_l == 0.0f ? 0.0f : __expf(running_m - next_m);
+        const float tile_scale = __expf(tile_m - next_m);
+        running_l = running_l * old_scale + tile_l * tile_scale;
+        running_m = next_m;
+        storage.row_m_stage[tile & 1][owned_row] = running_m;
+        storage.row_l_stage[tile & 1][owned_row] = running_l;
+        storage.old_scale_stage[tile & 1][owned_row] = old_scale;
+        storage.tile_scale_stage[tile & 1][owned_row] = tile_scale;
+        if (tile == num_kv_tiles - 1) {
+          storage.global_m[owned_row] = running_m;
+          storage.global_l[owned_row] = running_l;
+        }
+      }
+      cutlass::arch::NamedBarrier::sync(
+          kSm120Nvfp4FmhaSoftmaxThreadCount,
+          kSm120Nvfp4BarrierSoftmaxOnlineReady);
       if ((tile & 1) == 0) {
         softmax_role_stage_logits_bf16_p_to_pv_smem_stage2(
             smem_logits0, p_sA0, p_sSFA0, storage.row_m_stage[0],
-            storage.tile_scale_stage[0],
-            softmax_group_thread_idx, kSm120Nvfp4FmhaSoftmaxGroupThreadCount);
+            storage.tile_scale_stage[0], row_begin, row_end,
+            softmax_group_thread_idx, kSm120Nvfp4FmhaSoftmaxGroupThreadCount,
+            kSm120Nvfp4FmhaSoftmaxThreadCount);
       } else {
         softmax_role_stage_logits_bf16_p_to_pv_smem_stage2(
             smem_logits1, p_sA1, p_sSFA1, storage.row_m_stage[1],
-            storage.tile_scale_stage[1],
-            softmax_group_thread_idx, kSm120Nvfp4FmhaSoftmaxGroupThreadCount);
+            storage.tile_scale_stage[1], row_begin, row_end,
+            softmax_group_thread_idx, kSm120Nvfp4FmhaSoftmaxGroupThreadCount,
+            kSm120Nvfp4FmhaSoftmaxThreadCount);
       }
+      cutlass::arch::fence_view_async_shared();
       release_p_ready(tile);
     }
   } else if (is_correction) {
-    for (int tile = 0; tile < num_kv_tiles; ++tile) {
-      if ((tile & 1) == 0) {
-        pipeline_s0_corr.consumer_wait(pipeline_s0_corr_consumer_state);
-      } else {
-        pipeline_s1_corr.consumer_wait(pipeline_s1_corr_consumer_state);
-      }
-      correction_role_update_online_state(
-          storage.row_m_stage[tile & 1], storage.row_l_stage[tile & 1],
-          storage.global_m, storage.global_l, storage.old_scale_stage[tile & 1],
-          storage.tile_scale_stage[tile & 1], tile, correction_thread_idx);
-      if ((tile & 1) == 0) {
-        pipeline_s0_corr.consumer_release(pipeline_s0_corr_consumer_state);
-        ++pipeline_s0_corr_consumer_state;
-      } else {
-        pipeline_s1_corr.consumer_release(pipeline_s1_corr_consumer_state);
-        ++pipeline_s1_corr_consumer_state;
-      }
-
-      const bool final_tile = tile == num_kv_tiles - 1;
-      if (final_tile) {
-        pipeline_corr_epi.producer_acquire(pipeline_corr_epi_producer_state);
-        pipeline_mma_corr.consumer_wait(pipeline_mma_corr_consumer_state);
-        correction_role_normalize_epilogue_smem(
-            smem_epilogue_o, storage.global_l, correction_thread_idx);
-        cutlass::arch::fence_view_async_shared();
-        pipeline_mma_corr.consumer_release(pipeline_mma_corr_consumer_state);
-        ++pipeline_mma_corr_consumer_state;
-        pipeline_corr_epi.producer_commit(pipeline_corr_epi_producer_state);
-        ++pipeline_corr_epi_producer_state;
-      }
-    }
+    pipeline_corr_epi.producer_acquire(pipeline_corr_epi_producer_state);
+    pipeline_mma_corr.consumer_wait(pipeline_mma_corr_consumer_state);
+    correction_role_normalize_epilogue_smem(
+        smem_epilogue_o, storage.global_l, correction_thread_idx);
+    cutlass::arch::fence_view_async_shared();
+    pipeline_mma_corr.consumer_release(pipeline_mma_corr_consumer_state);
+    ++pipeline_mma_corr_consumer_state;
+    pipeline_corr_epi.producer_commit(pipeline_corr_epi_producer_state);
+    ++pipeline_corr_epi_producer_state;
   } else if (is_epilogue) {
     pipeline_corr_epi.consumer_wait(pipeline_corr_epi_consumer_state);
     sm120_epilogue_store_bf16_tile_to_float(
