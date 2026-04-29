@@ -104,12 +104,17 @@ constexpr int kSm120Nvfp4FmhaMmaSoftmaxLoadThreadCount =
 constexpr int kSm120Nvfp4FmhaSoftmaxCorrectionThreadCount =
     kSm120Nvfp4FmhaSoftmaxThreadCount +
     kSm120Nvfp4FmhaCorrectionThreadCount;
-constexpr uint32_t kSm120Nvfp4BarrierSoftmaxInternal = 0;
-constexpr uint32_t kSm120Nvfp4BarrierMmaSoftmax = 1;
+constexpr uint32_t kSm120Nvfp4BarrierSoftmax0Internal = 0;
+constexpr uint32_t kSm120Nvfp4BarrierSoftmax1Internal = 1;
+constexpr uint32_t kSm120Nvfp4BarrierSoftmaxInternal =
+    kSm120Nvfp4BarrierSoftmax0Internal;
+constexpr uint32_t kSm120Nvfp4BarrierMmaSoftmax =
+    kSm120Nvfp4BarrierSoftmax1Internal;
 constexpr uint32_t kSm120Nvfp4BarrierSoftmaxMma = 2;
 constexpr uint32_t kSm120Nvfp4BarrierSoftmaxCorrection = 3;
 constexpr uint32_t kSm120Nvfp4BarrierCorrectionSoftmax = 4;
-constexpr uint32_t kSm120Nvfp4BarrierSoftmaxOnlineReady = 5;
+constexpr uint32_t kSm120Nvfp4BarrierSoftmax0OnlineReady = 5;
+constexpr uint32_t kSm120Nvfp4BarrierSoftmax1OnlineReady = 6;
 
 __host__ __device__ constexpr Sm120Nvfp4FmhaRole
 sm120_nvfp4_fmha_role_for_warp(int warp_idx) {
@@ -1087,7 +1092,8 @@ softmax_role_stage_logits_bf16_p_to_pv_smem_stage2(
     int row_end,
     int softmax_thread_idx,
     int softmax_thread_count,
-    int barrier_thread_count) {
+    int barrier_thread_count,
+    uint32_t barrier_id) {
   using cute::_;
 
   for (int idx = softmax_thread_idx;
@@ -1114,7 +1120,7 @@ softmax_role_stage_logits_bf16_p_to_pv_smem_stage2(
   }
   cutlass::arch::NamedBarrier::sync(
       barrier_thread_count,
-      kSm120Nvfp4BarrierSoftmaxInternal);
+      barrier_id);
 
   CutlassCollectiveMainloopK128Stage2 collective;
   auto tiled_mma = typename CutlassCollectiveMainloopK128Stage2::TiledMma{};
@@ -2260,9 +2266,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     pipeline_mma_corr_params.role =
         Sm120Nvfp4PipelineO::ThreadCategory::Producer;
   }
-  if (is_softmax) {
+  if (is_softmax0) {
     pipeline_mma_s0_params.role =
         Sm120Nvfp4PipelineS::ThreadCategory::Consumer;
+  }
+  if (is_softmax1) {
     pipeline_mma_s1_params.role =
         Sm120Nvfp4PipelineS::ThreadCategory::Consumer;
   }
@@ -2279,9 +2287,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   pipeline_mma_s0_params.producer_arv_count = 1;
   pipeline_mma_s1_params.producer_arv_count = 1;
   pipeline_mma_s0_params.consumer_arv_count =
-      kSm120Nvfp4FmhaSoftmaxThreadCount;
+      kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
   pipeline_mma_s1_params.consumer_arv_count =
-      kSm120Nvfp4FmhaSoftmaxThreadCount;
+      kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
   pipeline_mma_corr_params.producer_arv_count = 1;
   pipeline_mma_corr_params.consumer_arv_count =
       kSm120Nvfp4FmhaCorrectionThreadCount;
@@ -2766,52 +2774,41 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
     auto pv_tCcC = pv_thread_mma.partition_C(pv_cC);
 
-    auto acquire_score_stage = [&](int tile) {
-      if ((tile & 1) == 0) {
-        if (!pipeline_mma_s0_acquired) {
-          pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
-        }
-        pipeline_mma_s0_acquired = false;
-      } else {
-        if (!pipeline_mma_s1_acquired) {
-          pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
-        }
-        pipeline_mma_s1_acquired = false;
+    auto acquire_score_stages = [&]() {
+      if (!pipeline_mma_s0_acquired) {
+        pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
       }
+      if (!pipeline_mma_s1_acquired) {
+        pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
+      }
+      pipeline_mma_s0_acquired = false;
+      pipeline_mma_s1_acquired = false;
     };
 
-    auto commit_score_stage = [&](int tile) {
+    auto commit_score_stages = [&]() {
       cutlass::arch::NamedBarrier::sync(
           CutlassCollectiveMainloop::ThreadCount,
           cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-      if ((tile & 1) == 0) {
-        if (qk_mma_thread_idx == 0) {
-          pipeline_mma_s0.producer_commit(pipeline_mma_s0_producer_state);
-        }
-        ++pipeline_mma_s0_producer_state;
-      } else {
-        if (qk_mma_thread_idx == 0) {
-          pipeline_mma_s1.producer_commit(pipeline_mma_s1_producer_state);
-        }
-        ++pipeline_mma_s1_producer_state;
+      if (qk_mma_thread_idx == 0) {
+        pipeline_mma_s0.producer_commit(pipeline_mma_s0_producer_state);
+        pipeline_mma_s1.producer_commit(pipeline_mma_s1_producer_state);
       }
+      ++pipeline_mma_s0_producer_state;
+      ++pipeline_mma_s1_producer_state;
     };
 
-    auto release_k_tile = [&]() {
-      k_pipeline.consumer_release(k_pipe_release);
-      ++k_pipe_release;
+    auto release_k_chunk = [&]() {
       k_pipeline.consumer_release(k_pipe_release);
       ++k_pipe_release;
     };
 
-    auto wait_p_ready = [&](int tile) {
-      if ((tile & 1) == 0) {
-        pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
-        pipeline_mma_s0_acquired = true;
-      } else {
-        pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
-        pipeline_mma_s1_acquired = true;
-      }
+    auto wait_p_ready_and_release_k = [&]() {
+      pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
+      pipeline_mma_s0_acquired = true;
+      release_k_chunk();
+      pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
+      pipeline_mma_s1_acquired = true;
+      release_k_chunk();
     };
 
     auto acquire_output_stage = [&]() {
@@ -2854,9 +2851,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         }
       }
 
-      commit_score_stage(tile);
-      wait_p_ready(tile);
-      release_k_tile();
+      commit_score_stages();
+      wait_p_ready_and_release_k();
     };
 
     auto run_pv_tile = [&](int tile, bool final_tile) {
@@ -2889,7 +2885,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     };
 
     for (int tile = 0; tile < num_kv_tiles; ++tile) {
-      acquire_score_stage(tile);
+      acquire_score_stages();
       run_qk_tile(tile);
       if (tile > 0) {
         run_pv_tile(tile - 1, false);
@@ -2897,16 +2893,16 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     }
     run_pv_tile(num_kv_tiles - 1, true);
   } else if (is_softmax) {
-    auto wait_score_stage = [&](int tile) {
-      if ((tile & 1) == 0) {
+    auto wait_score_stage = [&]() {
+      if (is_softmax0) {
         pipeline_mma_s0.consumer_wait(pipeline_mma_s0_consumer_state);
       } else {
         pipeline_mma_s1.consumer_wait(pipeline_mma_s1_consumer_state);
       }
     };
 
-    auto release_p_ready = [&](int tile) {
-      if ((tile & 1) == 0) {
+    auto release_p_ready = [&]() {
+      if (is_softmax0) {
         pipeline_mma_s0.consumer_release(pipeline_mma_s0_consumer_state);
         ++pipeline_mma_s0_consumer_state;
       } else {
@@ -2920,11 +2916,17 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     const int row_end = row_begin + kRowsPerSoftmaxRole;
     const int owned_row = row_begin + softmax_group_thread_idx;
     const bool owns_row = softmax_group_thread_idx < kRowsPerSoftmaxRole;
+    const uint32_t online_barrier_id =
+        is_softmax1 ? kSm120Nvfp4BarrierSoftmax1OnlineReady
+                    : kSm120Nvfp4BarrierSoftmax0OnlineReady;
+    const uint32_t scale_barrier_id =
+        is_softmax1 ? kSm120Nvfp4BarrierSoftmax1Internal
+                    : kSm120Nvfp4BarrierSoftmax0Internal;
     float running_m = -INFINITY;
     float running_l = 0.0f;
 
     for (int tile = 0; tile < num_kv_tiles; ++tile) {
-      wait_score_stage(tile);
+      wait_score_stage();
       const __nv_bfloat16* smem_logits_stage =
           (tile & 1) == 0 ? smem_logits0 : smem_logits1;
       if (owns_row) {
@@ -2958,23 +2960,23 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         }
       }
       cutlass::arch::NamedBarrier::sync(
-          kSm120Nvfp4FmhaSoftmaxThreadCount,
-          kSm120Nvfp4BarrierSoftmaxOnlineReady);
+          kSm120Nvfp4FmhaSoftmaxGroupThreadCount,
+          online_barrier_id);
       if ((tile & 1) == 0) {
         softmax_role_stage_logits_bf16_p_to_pv_smem_stage2(
             smem_logits0, p_sA0, p_sSFA0, storage.row_m_stage[0],
             storage.tile_scale_stage[0], row_begin, row_end,
             softmax_group_thread_idx, kSm120Nvfp4FmhaSoftmaxGroupThreadCount,
-            kSm120Nvfp4FmhaSoftmaxThreadCount);
+            kSm120Nvfp4FmhaSoftmaxGroupThreadCount, scale_barrier_id);
       } else {
         softmax_role_stage_logits_bf16_p_to_pv_smem_stage2(
             smem_logits1, p_sA1, p_sSFA1, storage.row_m_stage[1],
             storage.tile_scale_stage[1], row_begin, row_end,
             softmax_group_thread_idx, kSm120Nvfp4FmhaSoftmaxGroupThreadCount,
-            kSm120Nvfp4FmhaSoftmaxThreadCount);
+            kSm120Nvfp4FmhaSoftmaxGroupThreadCount, scale_barrier_id);
       }
       cutlass::arch::fence_view_async_shared();
-      release_p_ready(tile);
+      release_p_ready();
     }
   } else if (is_correction) {
     pipeline_corr_epi.producer_acquire(pipeline_corr_epi_producer_state);

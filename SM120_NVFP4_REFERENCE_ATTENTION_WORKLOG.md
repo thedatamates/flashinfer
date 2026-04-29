@@ -6387,3 +6387,78 @@ in the K/B shared-memory region until compact P is produced, so K release and
 next-tile QK remain blocked by score-tile consumption. The next port must target
 the S/P lifetime itself, not the online-state math.
 ```
+
+## Row-Half S Pipeline Ownership And Early K-Half Release
+
+Changed `pipeline_mma_s0` / `pipeline_mma_s1` from tile-parity score ownership
+to row-half score ownership, closer to the SM100 meaning of S0/S1.
+
+Previous active structure:
+
+```text
+even tile:
+  MMA commits pipeline_mma_s0 for the whole 128x128 score tile
+  both softmax roles consume S0
+  MMA waits P-ready
+  MMA releases both K shared-memory stages
+
+odd tile:
+  same pattern through pipeline_mma_s1
+```
+
+New active structure:
+
+```text
+every tile:
+  MMA commits pipeline_mma_s0 for rows [0, 64)
+  MMA commits pipeline_mma_s1 for rows [64, 128)
+
+  Softmax0 consumes S0 and stages compact P rows [0, 64)
+  Softmax1 consumes S1 and stages compact P rows [64, 128)
+
+  MMA reacquires S0 and releases K shared-memory half/stage 0
+  MMA reacquires S1 and releases K shared-memory half/stage 1
+```
+
+This preserves the softmax-owned online state from the previous checkpoint, but
+lets the loader begin the next tile's first K half as soon as Softmax0 has
+finished converting the first score half into compact P. It does not eliminate
+the BF16 score tile, but it narrows the lifetime fence from one full-tile K
+release to two half-tile releases.
+
+Implementation notes:
+
+```text
+- `pipeline_mma_s0` is consumed only by Softmax0 and has 128 consumer arrivals.
+- `pipeline_mma_s1` is consumed only by Softmax1 and has 128 consumer arrivals.
+- Softmax0 and Softmax1 use distinct named-barrier IDs for their internal
+  row-state and P-scale phases, so the two row halves can run concurrently
+  without sharing a named barrier.
+- The P storage remains double-buffered by tile parity in `smem_A`/`smem_SFA`;
+  S0/S1 only control readiness and K-half release.
+```
+
+Validation:
+
+```text
+git diff --check: pass
+online kv_tiles=1:  finite, mean_abs=0.00253812, max_abs=0.0139102, cosine=0.989603
+online kv_tiles=16: finite, mean_abs=0.000615264, max_abs=0.00324988, cosine=0.988328
+full grid first tile: finite, mean_abs=0.000155821, max_abs=0.000807697, cosine=0.992418
+full-grid min: 10.4330 ms
+```
+
+Conclusion:
+
+```text
+Runtime improved again: 11.2681 ms -> 10.4330 ms, about a 7.4% reduction.
+The win is from releasing the two K shared-memory halves independently and
+allowing the load role to overlap the next K0 load earlier. This confirms that
+the remaining S/P lifetime is still on the critical path.
+
+The score tile still occupies the K/B shared-memory region until each row half
+is consumed, so the next structural target is reducing or eliminating the BF16
+score tile storage itself. Candidate directions are row-strip streaming of S
+into compact P, a smaller-M tile that can afford independent S/P storage, or a
+direct score-fragment-to-P handoff that preserves Softmax ownership.
+```
