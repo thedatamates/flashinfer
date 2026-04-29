@@ -6744,3 +6744,161 @@ score tile alone; the schedule also failed to spend the softmax window on useful
 MMA work. The remaining gap should be profiled again from this checkpoint
 before attempting more S/P storage rewrites.
 ```
+
+## Post-Interleave NCU Comparison
+
+2026-04-28T22:18:00-05:00
+
+Nsight Compute was rerun on the active full-grid role owner after the QK /
+softmax / PV interleave fix.
+
+```text
+metric                                      before interleave   after interleave
+gpu__time_duration.sum                      10.008 ms           8.428 ms
+smsp__inst_executed.sum                     3.237B              3.237B
+registers/thread                            80                  80
+dynamic shared memory                       99,328 B            99,328 B
+tensor pipe active                          5.92%               6.96%
+issue active                                28.38%              33.44%
+eligible warps/cycle                        0.33                0.40
+active warps/cycle                          5.50                5.50
+avg warp latency / issued inst              19.38               16.46
+sleeping stall / issued inst                12.07               8.96
+long scoreboard / issued inst               2.40                2.39
+wait stall / issued inst                    2.40                2.42
+barrier stall / issued inst                 0.37                0.41
+memory throughput                           33.07%              39.22%
+DRAM throughput                             5.987 GB/s          7.405 GB/s
+```
+
+Conclusion:
+
+```text
+The interleave fix improved overlap without reducing instruction count or
+resource footprint. The gain came from spending the softmax/P-staging window on
+useful PV work, not from less work. Remaining bottleneck is still low issue
+eligibility and low tensor-pipe utilization; the next structural win has to
+increase overlap or reduce the durable score/P/O handoff cost, not tune scalar
+epilogue loops.
+```
+
+## Rejected: Naive M64 CTA Variant
+
+2026-04-28T22:20:00-05:00
+
+Tried a direct M64 CTA variant by changing the SM120 block-scaled CUTLASS tile
+shape from `128x128x256` to `64x128x256` and adjusting the Python full-grid
+check to accept a 64-row output tile.
+
+Failure mode:
+
+```text
+static_assert failed:
+  SM120 Q/K/V load collective storage must fit SM120 opt-in shared memory
+
+CUTLASS TMA layout assertion failed:
+  TMA requires CTA_Tile and SLayout top-level size equivalence.
+```
+
+Decision:
+
+```text
+Rejected and reverted. The SM120 block-scaled SFA/SFB TMA sidecar layouts are
+not shape-generic under a simple `TileShape` swap. If M64 is revisited, it needs
+a real SM120 collective/layout port for the scale sidecars, not a global tile
+constant edit.
+```
+
+## Rejected: Split Correction-to-Epilogue PipelineE
+
+2026-04-28T22:32:00-05:00
+
+Tried porting the SM100 epilogue shape more closely by using both stages of
+`pipeline_corr_epi`:
+
+```text
+Correction:
+  wait final O from MMA
+  normalize first 64 rows in epilogue smem
+  commit pipeline_corr_epi stage 0
+  normalize second 64 rows in epilogue smem
+  commit pipeline_corr_epi stage 1
+
+Epilogue:
+  wait/store first half
+  wait/store second half
+```
+
+This preserved the role boundary: Correction owned final normalization, and
+Epilogue owned global output stores. It did not collapse softmax/correction work
+back into the MMA role and did not add a new active-path `NamedBarrier`.
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000650689, max_abs=0.00309772, cosine=0.988923
+
+full grid first tile:
+  finite, mean_abs=0.000155332, max_abs=0.000899995, cosine=0.992945
+
+full-grid min:
+  baseline after interleave fix:        8.2618 ms
+  split correction->epilogue PipelineE: 8.2809 ms
+```
+
+Decision:
+
+```text
+Rejected and reverted. With SM120 shared-memory O storage, splitting the final
+epilogue handoff adds pipeline transactions but does not expose enough work to
+hide. The SM100 two-stage epilogue pattern is useful when backed by TMEM/TMA
+store overlap; the SM120 no-TMEM substitution needs a larger structural change
+than half-tile epilogue staging.
+```
+
+## Rejected: All-MMA-Thread PipelineAsync Score/O Commit
+
+2026-04-28T22:44:00-05:00
+
+Tried replacing two active-path `NamedBarrier` handoffs with PipelineAsync
+arrival counts:
+
+```text
+before:
+  producer_arv_count = 1
+  all MMA threads NamedBarrier::sync()
+  qk_mma_thread_idx == 0 commits pipeline_mma_s0/s1 or pipeline_mma_corr
+
+experiment:
+  producer_arv_count = all MMA threads
+  all MMA threads fence_view_async_shared()
+  all MMA threads producer_commit(...)
+```
+
+This preserved role ownership and removed the score/final-O named barriers from
+the active path. It did not change score math, P production, or PV accumulation.
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000650689, max_abs=0.00309772, cosine=0.988923
+
+full grid first tile:
+  finite, mean_abs=0.000155332, max_abs=0.000899995, cosine=0.992945
+
+full-grid min:
+  baseline after interleave fix:        8.2618 ms
+  all-thread PipelineAsync commit path: 8.3570 ms
+```
+
+Decision:
+
+```text
+Rejected and reverted. The named barrier at score/final-O publication is not
+the dominant remaining handoff cost. Replacing it with 256 producer arrivals
+increases pipeline transaction overhead and regresses wall time. Future work
+should target durable score/P/O storage lifetime or pipeline overlap, not this
+barrier substitution.
+```
