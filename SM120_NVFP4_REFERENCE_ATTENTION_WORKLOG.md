@@ -6578,3 +6578,45 @@ Runtime improved modestly: 10.4330 ms -> 10.3441 ms, about 0.85%. The output
 store was not the primary bottleneck, but BF16 output is the correct production
 contract and should stay.
 ```
+
+## Rejected: Early S0 Score Publication
+
+2026-04-28T21:35:00-05:00
+
+Tried splitting MMA score publication by row half:
+
+```text
+write rows [0, 64)
+commit pipeline_mma_s0
+write rows [64, 128)
+commit pipeline_mma_s1
+```
+
+The intent was to let Softmax0 begin P staging while MMA wrote the second row
+half, preserving the Softmax-owned role boundary and creating overlap without
+collapsing softmax back into MMA.
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000650689, max_abs=0.00309772, cosine=0.988923
+
+full grid first tile:
+  finite, mean_abs=0.000155332, max_abs=0.000899995, cosine=0.992945
+
+full-grid min:
+  baseline after softmax-owned P scale precompute: 9.8332 ms
+  early S0 score publication:                   9.8373 ms
+```
+
+Decision:
+
+```text
+Rejected and reverted. The extra MMA-side barrier cancels the small overlap
+created by publishing S0 earlier. This confirms the remaining gap is not solved
+by subdividing the existing full BF16 score-tile store with more barriers.
+
+The next viable S/P lifetime change must remove or shrink the durable BF16
+score tile itself, not add finer publication points around the same tile.
+```
