@@ -201,3 +201,6 @@ cython_debug/
 .cursor/
 docs/tutorials/generated/
 docs/sg_execution_times.rst
+
+# Local profiling/benchmark outputs. Keep the compressed archive in git/LFS.
+reports/
