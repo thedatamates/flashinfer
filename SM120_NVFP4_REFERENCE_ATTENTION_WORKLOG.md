@@ -9301,3 +9301,41 @@ This is a real D256 improvement, but not enough to beat the existing Shape A
 paths. The remaining gap is still structural: the D256 kernel retains the
 D512-shaped 96 KiB shared-memory footprint and 384-thread role structure.
 ```
+
+NCU spot profile for the best q512 fused cell:
+
+```text
+shape: D256/group2/q512/kv1024/split_kv_len=128/span1
+
+stage kernel:
+  duration:                    46.592 us
+  registers/thread:            168
+  dynamic smem/block:          96256 bytes
+  issue active:                8.87%
+  eligible warps/cycle:        0.10
+  active warps/cycle:          2.84
+  tensor pipe active:          5.04%
+  avg warp latency/inst:       31.97 cycles
+  long scoreboard stall:       3.56 cycles/issue-active
+  sleeping stall:              16.27 cycles/issue-active
+
+combine kernel:
+  duration:                    11.616 us
+  issue active:                7.93%
+  eligible warps/cycle:        0.10
+  avg warp latency/inst:       133.86 cycles
+  long scoreboard stall:       49.35 cycles/issue-active
+```
+
+Interpretation:
+
+```text
+The combine kernel is visible but not the primary 2x gap. The stage kernel is
+still the dominant cost, and it is under-utilized: low issue-active, low tensor
+activity, and high sleeping stalls from the role-specialized D512-era structure.
+
+For D256 SWA with one or a few KV tiles per split, the FA3-style role pipeline
+has less overlap to exploit. The next serious D256-native path should be either:
+  - compact storage/aliasing that gets below the one-CTA/SM 96 KiB footprint, or
+  - a D256 SWA one-tile/small-tile kernel with less role specialization overhead.
+```
