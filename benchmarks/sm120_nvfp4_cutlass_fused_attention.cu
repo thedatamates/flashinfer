@@ -1592,9 +1592,12 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         p_sSFA(row, local_col, cute::Int<0>{}) = make_ue4m3_raw(scale_byte);
         const float output_scale = kProbGlobalScale / scale_value;
 #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-          p_sA(row, local_col + i, cute::Int<0>{}) =
-              cute::uint4_t(fp32_to_e2m1_code_hw(p_vals[i] * output_scale));
+        for (int pair = 0; pair < 8; ++pair) {
+          auto first_ref = p_sA(row, local_col + 2 * pair, cute::Int<0>{});
+          uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&first_ref);
+          *dst_byte = fp32_pair_to_e2m1_byte(
+              p_vals[2 * pair] * output_scale,
+              p_vals[2 * pair + 1] * output_scale);
         }
       }
       return tile_l_scaled;

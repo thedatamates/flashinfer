@@ -7547,3 +7547,70 @@ should be issued while QK(n) is executing and be ready by PV(n+1), not merely
 permuted in the producer loop. This change is still useful because it removes
 one avoidable producer-side serialization point before the next row-state port.
 ```
+
+## Win: Packed-Byte P Producer Stores
+
+2026-04-28T23:08:00-05:00
+
+The fresh V-first profile showed the active kernel had moved into a memory and
+spill dominated regime:
+
+```text
+duration under ncu:                ~4.5 ms
+registers/thread:                  128
+stack size:                        2512 bytes
+local memory spilling requests:    72.59 MB
+shared load conflicts:             6.5-way average
+shared store conflicts:            5.3-way average
+eligible warps/scheduler:          0.13
+tensor pipe active:                ~14.6% active
+```
+
+The row-owned P producer was still writing compact P one nibble at a time:
+
+```text
+p_sA(row, col, 0) = cute::uint4_t(fp32_to_e2m1_code_hw(...))
+```
+
+CuTe subbyte assignment performs a read-modify-write of the underlying byte for
+each 4-bit element. That doubles the conversion count and creates pathological
+shared-store behavior for the P sidecar.
+
+Changed the P producer to write one packed byte per FP4 pair:
+
+```text
+auto first_ref = p_sA(row, local_col + 2 * pair, 0)
+uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&first_ref)
+*dst_byte = fp32_pair_to_e2m1_byte(p0, p1)
+```
+
+This preserves the CuTe swizzled destination by taking the address of the
+subbyte reference at the even nibble, then recasting that iterator to a byte
+pointer. It also uses the SM120 pair conversion instruction directly instead of
+calling the one-value wrapper twice.
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000659900, max_abs=0.00350227, cosine=0.988955
+
+full grid first tile:
+  finite, mean_abs=0.000158765, max_abs=0.000815836, cosine=0.992936
+```
+
+Timing:
+
+```text
+V-first baseline repeat=20:        min_ms=4.3854, mean_ms=4.4270
+packed P stores repeat=20:         min_ms=3.8795, mean_ms=3.9161
+```
+
+Conclusion:
+
+```text
+Keep it. The P producer's compact sidecar store was a structural bottleneck.
+The direct byte-store path removes subbyte RMW traffic and halves P conversion
+instructions. Next profile should verify how much of the local spill/shared
+wavefront excess remains before attempting the next row-state handoff change.
+```
