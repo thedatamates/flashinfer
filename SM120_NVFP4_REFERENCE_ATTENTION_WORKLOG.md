@@ -7308,3 +7308,62 @@ was blocked less by the SMEM old-scale handoff and more by per-element software
 FP4 quantization in the P producer. The next profile should be taken from this
 new 5.53 ms checkpoint before further structural changes.
 ```
+
+## Win: Fused Row-Owned P Producer
+
+2026-04-29T01:43:00-05:00
+
+Ported the next P-lifetime slice: the Softmax row owner now computes scaled
+probabilities, emits the P scale sidecar, and writes the compact NVFP4 P tile in
+the same row pass. The old second phase:
+
+```text
+row owner writes BF16 probabilities to score SMEM
+group barrier
+partition_D helper rereads BF16 probabilities
+partition_D helper writes compact NVFP4 P
+```
+
+is gone from the active path. With the helper removed, each softmax role can run
+with 2 warps instead of 4 because all 64 physical threads own one row.
+
+Implementation details:
+
+```text
+softmax0=2, softmax1=2, correction=0, mma=8, load=1, epilogue=1
+total_warps=14, total_threads=448
+
+P conversion:
+  fp32_to_e2m1_code_hw via cvt.rn.satfinite.e2m1x2.f32
+
+Deleted:
+  softmax_role_write_probs_bf16_p_to_pv_smem_stage2
+```
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000650521, max_abs=0.00309772, cosine=0.988925
+
+full grid first tile:
+  finite, mean_abs=0.000155273, max_abs=0.000907625, cosine=0.992944
+```
+
+Timing:
+
+```text
+previous hardware-E2M1 helper path:  min_ms=5.5294, mean_ms=5.5467
+fused row-owned P, repeat=5:         min_ms=4.5179, mean_ms=4.5368
+fused row-owned P, repeat=20:        min_ms=4.4943, mean_ms=4.5196
+```
+
+Conclusion:
+
+```text
+This fixes the failure mode from the earlier 2-warp softmax rejection. Reducing
+softmax warps was only profitable after removing the second partitioned P-helper
+phase. The P producer is still on the critical score-buffer lifetime, but it no
+longer round-trips probabilities through BF16 SMEM or burns a second group-wide
+producer pass.
+```

@@ -64,8 +64,8 @@ enum class Sm120Nvfp4FmhaRole : int {
   Count = 7,
 };
 
-constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 = 4;
-constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 = 4;
+constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 = 2;
+constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 = 2;
 constexpr int kSm120Nvfp4FmhaNumWarpsCorrection = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsMma = 8;
 constexpr int kSm120Nvfp4FmhaNumWarpsLoad = 1;
@@ -869,59 +869,6 @@ __device__ __forceinline__ void sm120_epilogue_store_bf16_tile(
   }
 }
 
-template <class TensorA, class TensorSFA>
-__device__ __forceinline__ void
-softmax_role_write_probs_bf16_p_to_pv_smem_stage2(
-    const __nv_bfloat16* probs,
-    TensorA& p_sA,
-    TensorSFA& p_sSFA,
-    int row_begin,
-    int row_end,
-    int softmax_thread_idx,
-    int softmax_thread_count) {
-  using cute::_;
-
-  CutlassCollectiveMainloopK128Stage2 collective;
-  auto tiled_mma = typename CutlassCollectiveMainloopK128Stage2::TiledMma{};
-  auto smem_tiled_copy_A = cute::make_tiled_copy_A(
-      typename CutlassCollectiveMainloopK128Stage2::SmemCopyAtomA{},
-      tiled_mma);
-  auto smem_thr_copy_A =
-      smem_tiled_copy_A.get_thread_slice(softmax_thread_idx);
-  auto cA = cute::make_identity_tensor(
-      cute::make_shape(cute::Int<kCutlassTileM>{},
-                       cute::Int<kCutlassTileK128>{}, cute::Int<1>{}));
-  auto tAsA_prod = smem_thr_copy_A.partition_D(p_sA);
-  auto tAcA_prod = smem_thr_copy_A.partition_D(cA);
-
-  auto write_partitioned_p = [&](auto tDst, auto tCoord) {
-    for (int i = 0; i < int(cute::size(tDst)); ++i) {
-      auto coord = tCoord(i);
-      const int row = int(cute::get<0>(coord));
-      if (row < row_begin || row >= row_end) {
-        continue;
-      }
-      const int k = int(cute::get<1>(coord));
-      const int scale_group = k >> 4;
-      const int local_col = scale_group * 16;
-      const float scale =
-          fmaxf(e4m3_byte_to_fp32(
-                    p_sSFA(row, local_col, cute::Int<0>{}).storage),
-                1.0e-8f);
-      const float output_scale = kProbGlobalScale / scale;
-      const float p = __bfloat162float(probs[row * kCutlassTileN + k]);
-      tDst(i) = cute::uint4_t(fp32_to_e2m1_code_hw(p * output_scale));
-    }
-  };
-
-  auto K_BLOCK_MAX_PROD = cute::size<2>(tAsA_prod);
-  cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
-                 [&](auto k_block) {
-    write_partitioned_p(tAsA_prod(_, _, k_block, cute::Int<0>{}),
-                        tAcA_prod(_, _, k_block, cute::Int<0>{}));
-  });
-}
-
 __global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount, 1)
 void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
@@ -1621,8 +1568,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     float running_m = -INFINITY;
     float running_l = 0.0f;
 
-    auto stage_probability_row = [&](auto& p_sSFA,
-                                     __nv_bfloat16* smem_logits_stage,
+    auto stage_probability_row = [&](auto& p_sA, auto& p_sSFA,
+                                     const __nv_bfloat16* smem_logits_stage,
                                      int row, float tile_m,
                                      float tile_scale) {
       float tile_l_scaled = 0.0f;
@@ -1631,6 +1578,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
            ++scale_group) {
         const int local_col = scale_group * 16;
         float vec_max = 0.0f;
+        float p_vals[16];
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
           const float logit = __bfloat162float(
@@ -1638,13 +1586,20 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           const float p_scaled = __expf(logit - tile_m) * tile_scale;
           tile_l_scaled += p_scaled;
           vec_max = fmaxf(vec_max, p_scaled);
-          smem_logits_stage[row * kCutlassTileN + local_col + i] =
-              __float2bfloat16(p_scaled);
+          p_vals[i] = p_scaled;
         }
 
         const uint8_t scale_byte = fp32_to_e4m3_byte(
             fmaxf(kProbGlobalScale * vec_max / 6.0f, 1.0e-8f));
         p_sSFA(row, local_col, cute::Int<0>{}) = make_ue4m3_raw(scale_byte);
+        const float output_scale =
+            kProbGlobalScale /
+            fmaxf(e4m3_byte_to_fp32(scale_byte), 1.0e-8f);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+          p_sA(row, local_col + i, cute::Int<0>{}) =
+              cute::uint4_t(fp32_to_e2m1_code_hw(p_vals[i] * output_scale));
+        }
       }
       return tile_l_scaled;
     };
@@ -1667,10 +1622,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const float tile_scale = __expf(tile_m - next_m);
         const float tile_l_scaled =
             (tile & 1) == 0
-                ? stage_probability_row(p_sSFA0, smem_logits0, owned_row,
-                                        tile_m, tile_scale)
-                : stage_probability_row(p_sSFA1, smem_logits1, owned_row,
-                                        tile_m, tile_scale);
+                ? stage_probability_row(p_sA0, p_sSFA0, smem_logits0,
+                                        owned_row, tile_m, tile_scale)
+                : stage_probability_row(p_sA1, p_sSFA1, smem_logits1,
+                                        owned_row, tile_m, tile_scale);
         running_l = running_l * old_scale + tile_l_scaled;
         running_m = next_m;
         storage.old_scale_stage[tile & 1][owned_row] = old_scale;
@@ -1682,15 +1637,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       cutlass::arch::NamedBarrier::sync(
           kSm120Nvfp4FmhaSoftmaxGroupThreadCount,
           online_barrier_id);
-      if ((tile & 1) == 0) {
-        softmax_role_write_probs_bf16_p_to_pv_smem_stage2(
-            smem_logits0, p_sA0, p_sSFA0, row_begin, row_end,
-            softmax_group_thread_idx, kSm120Nvfp4FmhaSoftmaxGroupThreadCount);
-      } else {
-        softmax_role_write_probs_bf16_p_to_pv_smem_stage2(
-            smem_logits1, p_sA1, p_sSFA1, row_begin, row_end,
-            softmax_group_thread_idx, kSm120Nvfp4FmhaSoftmaxGroupThreadCount);
-      }
       cutlass::arch::fence_view_async_shared();
       release_p_ready();
     }
