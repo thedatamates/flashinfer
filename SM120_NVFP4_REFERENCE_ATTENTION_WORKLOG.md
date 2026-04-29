@@ -7776,3 +7776,55 @@ requires explicit scale-layout/TMA-layout work. The next parallelism path is
 split-KV, which preserves the accepted 128x128 MMA shape and adds CTA
 parallelism across KV slices.
 ```
+
+## Win: Split-KV Full-Grid Path
+
+2026-04-28T23:31:00-05:00
+
+Implemented a split-KV benchmark path that preserves the accepted SM120
+block-scaled CUTLASS tile shapes:
+
+```text
+QK tile: 128x128x256
+PV tile: 128x128x128
+split axis: KV tiles
+per-split output: local normalized BF16 O tile
+per-split stats: row max m and row sum l
+combine: O = sum_s exp(m_s - m_global) * l_s * O_s / l_global
+```
+
+This avoids the rejected `N=64` and `M=64` shape edits and adds CTA
+parallelism without changing the MMA layouts.
+
+Split-size sweep:
+
+```text
+split_kv_len=1024   splits=32   min_ms=3.7724
+split_kv_len=2048   splits=16   min_ms=3.3121
+split_kv_len=4096   splits=8    min_ms=3.2352
+split_kv_len=8192   splits=4    min_ms=3.1238
+split_kv_len=16384  splits=2    min_ms=3.9165
+```
+
+Checkpoint rerun with repeat=20:
+
+```text
+packed full-grid baseline:
+  finite, mean_abs=0.000158765, max_abs=0.000815836, cosine=0.992936
+  min_ms=3.8818, mean_ms=3.9103
+
+split-KV full-grid, split_kv_len=8192:
+  finite, mean_abs=0.000159051, max_abs=0.000798231, cosine=0.992921
+  min_ms=3.1171, mean_ms=3.1351
+```
+
+Conclusion:
+
+```text
+Split-KV is the first parallelism lever that survives the SM120 block-scaled
+layout constraints. The best tested split is 4-way at 8192 tokens, improving
+full-grid wall time by ~19.7% versus the packed-store baseline. The result is
+still far from the two-stage CUTLASS ceiling, so the next profile should focus
+on remaining per-CTA load stalls, tensor-pipe utilization, and whether local
+spill traffic drops with shorter KV loops.
+```

@@ -880,16 +880,25 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     int kv_tile_start,
     int num_kv_tiles,
     int out_group_idx,
-    int out_stride_cols) {
+    int out_stride_cols,
+    float* split_m,
+    float* split_l,
+    int split_stats_stride_rows,
+    int split_output_stride_elems) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
   using cute::_;
 
   extern __shared__ __align__(128) char smem[];
   auto& storage = *reinterpret_cast<Sm120Nvfp4QkvLoadCollectiveStorage*>(smem);
   const int effective_q_tile = q_tile + int(blockIdx.x);
+  const int effective_split_idx = int(blockIdx.z);
+  const int effective_kv_tile_start =
+      kv_tile_start + effective_split_idx * num_kv_tiles;
   const int effective_out_group_idx = out_group_idx + int(blockIdx.y);
+  __nv_bfloat16* out_split_base =
+      out_group + effective_split_idx * split_output_stride_elems;
   __nv_bfloat16* out_tile =
-      out_group + int(blockIdx.x) * kCutlassTileM * out_stride_cols +
+      out_split_base + int(blockIdx.x) * kCutlassTileM * out_stride_cols +
       int(blockIdx.y) * kCutlassTileN;
 
   const int thread_idx = int(threadIdx.x);
@@ -1216,15 +1225,15 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 
   if (is_load) {
     load_q_chunk(0);
-    load_k_chunk(kv_tile_start, 0);
+    load_k_chunk(effective_kv_tile_start, 0);
     load_q_chunk(1);
-    load_v_chunk(kv_tile_start);
-    load_k_chunk(kv_tile_start, 1);
+    load_v_chunk(effective_kv_tile_start);
+    load_k_chunk(effective_kv_tile_start, 1);
     qk_collective.load_tail(q_pipeline, q_pipe_write);
 
     for (int tile = 0; tile < num_kv_tiles; ++tile) {
       if (tile + 1 < num_kv_tiles) {
-        const int next_kv_tile = kv_tile_start + tile + 1;
+        const int next_kv_tile = effective_kv_tile_start + tile + 1;
         load_v_chunk(next_kv_tile);
         load_k_chunk(next_kv_tile, 0);
         load_k_chunk(next_kv_tile, 1);
@@ -1640,6 +1649,18 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     pipeline_corr_epi.consumer_wait(pipeline_corr_epi_consumer_state);
     sm120_epilogue_store_bf16_tile(
         smem_epilogue_o, out_tile, out_stride_cols, epilogue_thread_idx);
+    if (split_m != nullptr && split_l != nullptr) {
+      const int epilogue_threads =
+          kSm120Nvfp4FmhaNumWarpsEpilogue * cutlass::NumThreadsPerWarp;
+      for (int row = epilogue_thread_idx; row < kCutlassTileM;
+           row += epilogue_threads) {
+        const int global_row = effective_q_tile * kCutlassTileM + row;
+        const int stats_idx =
+            effective_split_idx * split_stats_stride_rows + global_row;
+        split_m[stats_idx] = storage.global_m[row];
+        split_l[stats_idx] = storage.global_l[row];
+      }
+    }
     pipeline_corr_epi.consumer_release(pipeline_corr_epi_consumer_state);
     ++pipeline_corr_epi_consumer_state;
   }
@@ -1648,6 +1669,41 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     out_group[0] = __float2bfloat16(-1.0f);
   }
 #endif
+}
+
+__global__ void sm120_nvfp4_splitkv_combine_kernel(
+    const __nv_bfloat16* partial,
+    const float* split_m,
+    const float* split_l,
+    __nv_bfloat16* out,
+    int num_splits) {
+  const int idx = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+  const int total = kQRows * kHeadDim;
+  if (idx >= total) {
+    return;
+  }
+  const int row = idx / kHeadDim;
+  const int col = idx - row * kHeadDim;
+
+  float global_m = -INFINITY;
+#pragma unroll 1
+  for (int split = 0; split < num_splits; ++split) {
+    global_m = fmaxf(global_m, split_m[split * kQRows + row]);
+  }
+
+  float global_l = 0.0f;
+  float acc = 0.0f;
+#pragma unroll 1
+  for (int split = 0; split < num_splits; ++split) {
+    const int stats_idx = split * kQRows + row;
+    const float weight = __expf(split_m[stats_idx] - global_m) *
+                         split_l[stats_idx];
+    const int partial_idx = split * kQRows * kHeadDim + row * kHeadDim + col;
+    acc += weight * __bfloat162float(partial[partial_idx]);
+    global_l += weight;
+  }
+
+  out[idx] = __float2bfloat16(acc / fmaxf(global_l, 1.0e-20f));
 }
 
 __global__ void qk_cutlass_smem_atom_tile_kernel(const uint8_t* q_packed,
@@ -2035,7 +2091,7 @@ void sm120_nvfp4_qkv_online_register_q_stage(torch::Tensor q_packed,
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
       static_cast<int>(q_tile), static_cast<int>(kv_tile_start),
       static_cast<int>(num_kv_tiles), static_cast<int>(out_group_idx),
-      kCutlassTileN);
+      kCutlassTileN, nullptr, nullptr, 0, 0);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2134,7 +2190,140 @@ void sm120_nvfp4_qkv_online_register_q_full_grid(torch::Tensor q_packed,
       qk_params, pv_params,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha), 0, 0,
-      kKvLen / kCutlassTileN, 0, kHeadDim);
+      kKvLen / kCutlassTileN, 0, kHeadDim, nullptr, nullptr, 0, 0);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
+    torch::Tensor q_packed,
+    torch::Tensor q_scales,
+    torch::Tensor k_packed,
+    torch::Tensor k_scales,
+    torch::Tensor v_pv_packed,
+    torch::Tensor v_pv_scales,
+    torch::Tensor partial,
+    torch::Tensor split_m,
+    torch::Tensor split_l,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    double qk_alpha,
+    double pv_alpha,
+    int64_t split_kv_tiles) {
+  check_tensor(q_packed, "q_packed", torch::kUInt8);
+  check_tensor(q_scales, "q_scales", torch::kUInt8);
+  check_tensor(k_packed, "k_packed", torch::kUInt8);
+  check_tensor(k_scales, "k_scales", torch::kUInt8);
+  check_tensor(v_pv_packed, "v_pv_packed", torch::kUInt8);
+  check_tensor(v_pv_scales, "v_pv_scales", torch::kUInt8);
+  check_tensor(partial, "partial", torch::kBFloat16);
+  check_tensor(split_m, "split_m", torch::kFloat32);
+  check_tensor(split_l, "split_l", torch::kFloat32);
+  check_tensor(out, "out", torch::kBFloat16);
+  check_tensor(workspace, "workspace", torch::kUInt8);
+  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
+              "q_packed must have shape [4096, 256]");
+  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
+              "q_scales must have shape [4096, 32]");
+  TORCH_CHECK(k_packed.sizes() == torch::IntArrayRef({kKvLen, kPackedHeadDim}),
+              "k_packed must have shape [32768, 256]");
+  TORCH_CHECK(k_scales.sizes() == torch::IntArrayRef({kKvLen, kScaleCols}),
+              "k_scales must have shape [32768, 32]");
+  TORCH_CHECK(v_pv_packed.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbPackedCols}),
+              "v_pv_packed must have shape [512, 16384]");
+  TORCH_CHECK(v_pv_scales.sizes() ==
+                  torch::IntArrayRef({kHeadDim, kProbScaleCols}),
+              "v_pv_scales must have shape [512, 2048]");
+  TORCH_CHECK(split_kv_tiles > 0, "split_kv_tiles must be positive");
+  TORCH_CHECK((kKvLen / kCutlassTileN) % split_kv_tiles == 0,
+              "split_kv_tiles must divide the total KV tile count");
+  const int num_splits =
+      static_cast<int>((kKvLen / kCutlassTileN) / split_kv_tiles);
+  TORCH_CHECK(partial.sizes() ==
+                  torch::IntArrayRef({num_splits, kQRows, kHeadDim}),
+              "partial must have shape [num_splits, 4096, 512]");
+  TORCH_CHECK(split_m.sizes() == torch::IntArrayRef({num_splits, kQRows}),
+              "split_m must have shape [num_splits, 4096]");
+  TORCH_CHECK(split_l.sizes() == torch::IntArrayRef({num_splits, kQRows}),
+              "split_l must have shape [num_splits, 4096]");
+  TORCH_CHECK(out.sizes() == torch::IntArrayRef({kQRows, kHeadDim}),
+              "out must have shape [4096, 512]");
+
+  float alpha = 1.0f;
+  auto qk_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      k_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      k_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kQRows,
+      kKvLen,
+      kHeadDim,
+      1);
+  CutlassGemm qk_gemm;
+  const size_t qk_workspace_size = qk_gemm.get_workspace_size(qk_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(qk_workspace_size),
+              "workspace too small for QK: need ", qk_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto qk_status = qk_gemm.initialize(
+      qk_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(qk_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS QK GEMM params");
+  auto qk_params = qk_gemm.params();
+
+  auto pv_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemmK128Stage2>(
+      nullptr,
+      q_packed.data_ptr<uint8_t>(),
+      v_pv_packed.data_ptr<uint8_t>(),
+      q_scales.data_ptr<uint8_t>(),
+      v_pv_scales.data_ptr<uint8_t>(),
+      &alpha,
+      kCutlassTileM,
+      kHeadDim,
+      kKvLen,
+      1);
+  CutlassGemmK128Stage2 pv_gemm;
+  const size_t pv_workspace_size = pv_gemm.get_workspace_size(pv_args);
+  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(pv_workspace_size),
+              "workspace too small for PV: need ", pv_workspace_size,
+              " bytes, got ", workspace.numel());
+  auto pv_status = pv_gemm.initialize(
+      pv_args,
+      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
+      at::cuda::getCurrentCUDAStream());
+  TORCH_CHECK(pv_status == cutlass::Status::kSuccess,
+              "failed to initialize CUTLASS stage-2 PV GEMM params");
+  auto pv_params = pv_gemm.params();
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
+  auto stage_kernel = sm120_nvfp4_qkv_online_register_q_stage_kernel;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  stage_kernel<<<dim3(kQRows / kCutlassTileM, kHeadDim / kCutlassTileN,
+                      num_splits),
+                 kSm120Nvfp4FmhaThreadCount, kSmemBytes,
+                 at::cuda::getCurrentCUDAStream()>>>(
+      qk_params, pv_params,
+      reinterpret_cast<__nv_bfloat16*>(partial.data_ptr<at::BFloat16>()),
+      static_cast<float>(qk_alpha), static_cast<float>(pv_alpha), 0, 0,
+      static_cast<int>(split_kv_tiles), 0, kHeadDim, split_m.data_ptr<float>(),
+      split_l.data_ptr<float>(), kQRows, kQRows * kHeadDim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  constexpr int kThreads = 256;
+  const int total = kQRows * kHeadDim;
+  sm120_nvfp4_splitkv_combine_kernel<<<(total + kThreads - 1) / kThreads,
+                                       kThreads, 0,
+                                       at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __nv_bfloat16*>(
+          partial.data_ptr<at::BFloat16>()),
+      split_m.data_ptr<float>(), split_l.data_ptr<float>(),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
+      num_splits);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2504,6 +2693,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sm120_nvfp4_qkv_online_register_q_full_grid",
         &sm120_nvfp4_qkv_online_register_q_full_grid,
         "SM120 NVFP4 online-softmax register-Q full Shape-B tile grid");
+  m.def("sm120_nvfp4_qkv_online_register_q_splitkv_full_grid",
+        &sm120_nvfp4_qkv_online_register_q_splitkv_full_grid,
+        "SM120 NVFP4 split-KV online-softmax full Shape-B tile grid");
   m.def("cutlass_runner_fp4_gemm", &cutlass_runner_fp4_gemm,
         "FlashInfer SM120 CUTLASS FP4 GEMM runner smoke hook");
   m.def("cutlass_sm120_blockscaled_collective_metadata",

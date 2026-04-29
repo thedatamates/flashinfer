@@ -104,8 +104,10 @@ def main() -> None:
     parser.add_argument("--pv-smem-atom-tile-check-only", action="store_true")
     parser.add_argument("--sm120-qkv-online-check-only", action="store_true")
     parser.add_argument("--sm120-qkv-online-full-grid-bench", action="store_true")
+    parser.add_argument("--sm120-qkv-online-splitkv-full-grid-bench", action="store_true")
     parser.add_argument("--sm120-role-schedule-check-only", action="store_true")
     parser.add_argument("--online-kv-tiles", type=int, default=2)
+    parser.add_argument("--split-kv-len", type=int, default=1024)
     parser.add_argument("--smem-atom-data-mode", type=int, default=0)
     parser.add_argument("--smem-atom-scale-mode", type=int, default=0)
     parser.add_argument("--smem-atom-ones", action="store_true")
@@ -406,6 +408,93 @@ def main() -> None:
                 workspace,
                 float(qk_alpha.item()),
                 float(pv_alpha.item()),
+            ),
+            warmup=args.warmup,
+            repeat=args.repeat,
+        )
+        print(result)
+        return
+
+    if args.sm120_qkv_online_splitkv_full_grid_bench:
+        (
+            q_cutlass,
+            q_cutlass_scales,
+            _,
+            k_cutlass,
+            k_cutlass_scales,
+            _,
+            qk_alpha,
+            workspace,
+            tactic,
+        ) = cutlass_qk_inputs()
+        v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
+        if 32768 % args.split_kv_len != 0 or args.split_kv_len % 128 != 0:
+            raise ValueError("--split-kv-len must be a multiple of 128 and divide 32768")
+        num_splits = 32768 // args.split_kv_len
+        split_kv_tiles = args.split_kv_len // 128
+        out = torch.empty((Q_LEN * GROUP, HEAD_DIM), device=device, dtype=torch.bfloat16)
+        partial = torch.empty((num_splits, Q_LEN * GROUP, HEAD_DIM), device=device, dtype=torch.bfloat16)
+        split_m = torch.empty((num_splits, Q_LEN * GROUP), device=device, dtype=torch.float32)
+        split_l = torch.empty((num_splits, Q_LEN * GROUP), device=device, dtype=torch.float32)
+        pv_alpha = 1.0 / v_pv_cutlass_global
+        ext.sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            partial,
+            split_m,
+            split_l,
+            out,
+            workspace,
+            float(qk_alpha.item()),
+            float(pv_alpha.item()),
+            split_kv_tiles,
+        )
+        torch.cuda.synchronize()
+        qk_ref = qk_runner_ref(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            qk_alpha,
+            workspace,
+            tactic,
+            q_rows=128,
+            kv_rows=k_cutlass.shape[0],
+        )
+        probs = torch.softmax(qk_ref.float() / (HEAD_DIM**0.5), dim=-1)
+        exact_ref = torch.matmul(probs.float(), v_ref_f32[:, :128].float())
+        result = {
+            "sm120_qkv_online_register_q_splitkv_full_grid": True,
+            "output_shape": tuple(out.shape),
+            "partial_shape": tuple(partial.shape),
+            "splits": num_splits,
+            "split_kv_len": args.split_kv_len,
+            "storage_bytes": metadata["sm120_qkv_load_collective_storage_bytes"],
+            "storage_margin_bytes": metadata[
+                "sm120_qkv_load_collective_storage_margin_bytes"
+            ],
+        }
+        result.update(compare("splitkv_full_grid_first_tile_vs_exact", out[:128, :128], exact_ref))
+        result["bench_sm120_qkv_online_register_q_splitkv_full_grid"] = event_ms(
+            lambda: ext.sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
+                q_cutlass,
+                q_cutlass_scales,
+                k_cutlass,
+                k_cutlass_scales,
+                v_pv_cutlass,
+                v_pv_cutlass_scales,
+                partial,
+                split_m,
+                split_l,
+                out,
+                workspace,
+                float(qk_alpha.item()),
+                float(pv_alpha.item()),
+                split_kv_tiles,
             ),
             warmup=args.warmup,
             repeat=args.repeat,
