@@ -8614,17 +8614,132 @@ q=2048, kv=262144:
   best among completed candidates: SM120 fused split-KV
 ```
 
-Decision:
+Correction:
 
 ```text
-For coverage, the current shipping candidate is a cell-level dispatch table:
-  A q=512             -> FP8 FA2
-  A q=2048            -> CUTLASS two-stage NVFP4
-  B except 2048/256K  -> CUTLASS two-stage NVFP4
-  B q=2048/256K       -> SM120 fused split-KV
+The CUTLASS two-stage benchmark is not a production attention kernel. It is a
+raw math-throughput reference for:
+  FP4 GEMM -> dense softmax -> FP4 quantize -> FP4 GEMM
 
-For kernel development, the fused D512 path remains valuable because it is the
-only completed candidate that covers B q=2048/kv=262144 without materializing
-the full logits/probability tensors. It still does not justify replacing
-CUTLASS two-stage on the other Shape B cells.
+It does not implement:
+  causal masking
+  paged KV
+  variable-length sequences
+  sliding window
+  production GQA head/page mapping
+  multi-head attention semantics
+
+Therefore it must not be used as a production dispatch candidate. It remains a
+useful ceiling/reference for block-scaled FP4 GEMM throughput only.
+```
+
+Revised decision:
+
+```text
+For production attention, compare against production-capable attention paths:
+  existing FP8/FP4 FA2/XQA/BF16 paths
+  SM120 fused NVFP4 paths with attention semantics
+
+Do not compare production dispatch against the two-stage dense GEMM benchmark
+unless/until it is upgraded into a real attention kernel with causal masking,
+paged KV, var-len handling, and GQA semantics.
+```
+
+## Paged Serving Workload Check
+
+2026-04-29T11:39:00-05:00
+
+The single-sequence Gemma4 grid is not the same shape as a vLLM serving call.
+Serving uses paged KV and grouped GQA over all in-flight sequences. The relevant
+validation is therefore a paged/ragged workload benchmark, not just the
+contiguous single-sequence grid.
+
+Added:
+
+```text
+benchmarks/bench_gemma4_paged_workload_scenarios.py
+```
+
+Scenario 1: few long chats, decode-only
+
+```text
+batch=4
+q_lens=[1,1,1,1]
+kv_lens=[262144,262144,262144,262144]
+D=512, group=8, page_size=16
+
+NVFP4 XQA decode:
+  min_ms=0.539104
+  mean_ms=0.557062
+
+FP8 FA2 tensor-core decode:
+  min_ms=1.104256
+  mean_ms=1.112941
+```
+
+Result:
+
+```text
+NVFP4 XQA is ~2.05x faster than FP8 FA2 decode on the few-long-chats
+long-context decode scenario.
+```
+
+Scenario 2: high-concurrency mixed ragged prefill/decode
+
+```text
+batch=96
+q_lens=(1 x 92) + (512 x 4)
+sum_q=2140
+kv_lens=(1024 x 24) + (8192 x 24) + (32768 x 24) +
+        (131072 x 16) + (262144 x 8)
+sum_kv=5201920
+D=512, group=8, page_size=16
+
+NVFP4 FA2 paged prefill:
+  min_ms=187.463623
+  mean_ms=187.484421
+
+FP8 FA2 paged prefill:
+  min_ms=201.327072
+  mean_ms=201.370997
+```
+
+Result:
+
+```text
+NVFP4 FA2 is ~1.07x faster than FP8 FA2 on the high-concurrency mixed
+ragged-paged scenario.
+```
+
+Important interpretation:
+
+```text
+The prior contiguous single-sequence dispatch table is not a final vLLM serving
+dispatch policy. It is an offline/contiguous reference table, and its
+two-stage rows are math-throughput references rather than shippable attention
+kernels.
+
+For actual paged serving shapes measured so far:
+  few long decode      -> NVFP4 XQA
+  high-concurrency mix -> NVFP4 FA2
+
+CUTLASS two-stage is not a production attention path. The current SM120 fused
+reference kernel is structurally closer to production Shape B attention, but it
+is still a contiguous/reference implementation until paged-KV integration is
+completed.
+```
+
+Updated production interpretation:
+
+```text
+Shape B should be evaluated against FP8 FA2/XQA and other production attention
+paths, not against the two-stage dense GEMM benchmark. On the measured Shape B
+single-sequence cells, the SM120 fused NVFP4 reference path is much faster than
+FP8 FA2, and on paged serving scenarios NVFP4 also beats FP8:
+  few-long decode:      NVFP4 XQA ~2.05x faster than FP8 FA2 decode
+  high-concurrency mix: NVFP4 FA2 ~1.07x faster than FP8 FA2 prefill
+
+Shape A remains a separate small-KV/sliding-window policy question; existing
+FP8 FA2 is still a valid default unless a dedicated D256 NVFP4 path beats it
+with production semantics.
 ```
