@@ -426,6 +426,10 @@ __device__ __forceinline__ uint8_t fp32_pair_to_e2m1_byte(float x, float y) {
 #endif
 }
 
+__device__ __forceinline__ uint8_t fp32_to_e2m1_code_hw(float x) {
+  return static_cast<uint8_t>(fp32_pair_to_e2m1_byte(x, x) & 0x0Fu);
+}
+
 __device__ __forceinline__ cutlass::float_ue4m3_t make_ue4m3_raw(uint8_t raw) {
   cutlass::float_ue4m3_t value;
   value.storage = raw;
@@ -906,7 +910,7 @@ softmax_role_write_probs_bf16_p_to_pv_smem_stage2(
                 1.0e-8f);
       const float output_scale = kProbGlobalScale / scale;
       const float p = __bfloat162float(probs[row * kCutlassTileN + k]);
-      tDst(i) = cute::uint4_t(nearest_e2m1_code(p * output_scale));
+      tDst(i) = cute::uint4_t(fp32_to_e2m1_code_hw(p * output_scale));
     }
   };
 

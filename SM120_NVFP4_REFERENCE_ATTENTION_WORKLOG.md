@@ -7258,3 +7258,53 @@ physical threads doubles per-thread P producer work and dominates any benefit
 from fewer parked warps. The 4+4 softmax roles are not the next bottleneck to
 compact in this implementation.
 ```
+
+## Win: Hardware E2M1 Conversion For P Producer
+
+2026-04-29T01:28:00-05:00
+
+Replaced the softmax/P producer's scalar software E2M1 quantization loop:
+
+```text
+nearest_e2m1_code(x):
+  compare against 16 FP4 grid values
+  choose nearest nibble in scalar ALU
+```
+
+with the SM120 hardware FP32-to-E2M1 conversion already available in this file:
+
+```text
+fp32_to_e2m1_code_hw(x):
+  cvt.rn.satfinite.e2m1x2.f32
+```
+
+The helper passes `x` twice and takes the low nibble, avoiding pair-order
+ambiguity while replacing the 16-entry scalar search with the hardware
+conversion instruction.
+
+Validation:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000649069, max_abs=0.00317944, cosine=0.988839
+
+full grid first tile:
+  finite, mean_abs=0.000155417, max_abs=0.000869478, cosine=0.992919
+```
+
+Timing:
+
+```text
+baseline compacted schedule:      min_ms=7.6561
+hardware E2M1, repeat=5:          min_ms=5.5254, mean_ms=5.5489
+hardware E2M1, repeat=20:         min_ms=5.5294, mean_ms=5.5467
+```
+
+Conclusion:
+
+```text
+This is the largest win since the compacted role schedule. The score/P lifetime
+was blocked less by the SMEM old-scale handoff and more by per-element software
+FP4 quantization in the P producer. The next profile should be taken from this
+new 5.53 ms checkpoint before further structural changes.
+```
