@@ -7614,3 +7614,84 @@ The direct byte-store path removes subbyte RMW traffic and halves P conversion
 instructions. Next profile should verify how much of the local spill/shared
 wavefront excess remains before attempting the next row-state handoff change.
 ```
+
+## Rejected: MMA-Side Row Scale Cache
+
+2026-04-28T23:18:00-05:00
+
+Tried caching the row scale in the MMA thread before applying `old_scale_stage`
+and before final output normalization:
+
+```text
+before:
+  each accumulator element reloads old_scale_stage[row] or global_l[row]
+
+after:
+  cache the last row seen by this thread and reuse the scale while row matches
+```
+
+Correctness was unchanged:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000659900, max_abs=0.00350227, cosine=0.988955
+
+full grid first tile:
+  finite, mean_abs=0.000158765, max_abs=0.000815836, cosine=0.992936
+```
+
+Timing regressed:
+
+```text
+packed P baseline repeat=20:       min_ms=3.8795, mean_ms=3.9161
+row-scale cache repeat=20:         min_ms=3.9884, mean_ms=4.0268
+```
+
+Decision:
+
+```text
+Rejected and reverted. The extra compare/live scalar state costs more than the
+saved row-scale SMEM loads in the current fragment order. Do not retry this as a
+per-element cache. If row-state traffic is attacked again, it needs a structural
+ownership change or a fragment-layout-aware row broadcast, not an in-loop branch.
+```
+
+## Profile: Packed P Store Checkpoint
+
+2026-04-28T23:20:00-05:00
+
+Profiled the packed-P-store checkpoint (`e131aa9`) with Nsight Compute:
+
+```text
+report:                            reports/sm120_nvfp4_packed_p_current.ncu-rep
+duration under ncu:                3.93-3.96 ms
+registers/thread:                  128
+stack size:                        1888 bytes
+local memory spilling requests:    72.66 MB
+executed instructions:             ~508.1M
+eligible warps/scheduler:          0.13
+active warps/scheduler:            3.50
+issue slots busy:                  ~7.6%
+SM busy:                           ~10.0%
+compute throughput:                ~13.7%
+memory throughput:                 ~45%
+shared load conflicts:             8.3-way average
+shared store conflicts:            5.9-way average
+```
+
+Compared to the pre-packed profile, packed P stores reduced stack size and
+instruction count, but did not reduce spill traffic:
+
+```text
+before packed P:                   stack 2512 B, spills 72.59 MB, ~560.0M inst
+after packed P:                    stack 1888 B, spills 72.66 MB, ~508.1M inst
+```
+
+Conclusion:
+
+```text
+The packed-store win came from fewer instructions and less P-store sidecar work,
+not from solving the local-memory spill problem. Spill remains >50 MB, so the
+next high-probability lever is a separate live-range issue, likely around QK
+accumulator/PV fragment lifetime or the nested generic lambdas in the MMA loop.
+```
