@@ -6101,3 +6101,105 @@ the SM100 path uses TMEM for O and a different role/register pressure model.
 Register reconfiguration should be revisited only after the S/P/PV lifetime
 matches the reference more closely.
 ```
+
+### Compact A/SFA P Double-Buffer And Final-Only O Handoff
+
+2026-04-28T20:10:00-05:00
+
+Ported the next S/P lifetime correction in the active SM120 benchmark kernel.
+The failed first attempt used two aliased S/P slots:
+
+```text
+stage 0: qk_tensors.smem_B / smem_SFB
+stage 1: qk_tensors.smem_A / smem_SFA
+```
+
+That compiled but produced huge incorrect values for `kv_tiles=2`. The reason
+is structural: `smem_B` is owned by the K TMA pipeline. It can hold the BF16
+score tile only after QK consumes K for the current tile, but it cannot hold a
+durable P tile across the next QK tile because later K loads overwrite the same
+region before PV consumes the previous tile.
+
+Corrected lifetime model:
+
+```text
+qk_tensors.smem_B:
+  transient BF16 score tile after current QK
+  final BF16 O epilogue tile after final PV
+
+qk_tensors.smem_A:
+  compact PV P stage 0
+  compact PV P stage 1
+
+qk_tensors.smem_SFA:
+  compact PV P scale stage 0
+  compact PV P scale stage 1
+```
+
+`smem_A` is free after Q is resident in registers. The compact PV P stage is
+16 KiB and the scale stage is 2 KiB, so two P stages fit in the existing
+32 KiB A region and 4 KiB SFA region without increasing shared-memory usage.
+
+Pipeline corrections:
+
+```text
+MMA/QK:
+  commit score tile
+  wait until softmax has converted score -> compact P
+  only then release K pipeline storage
+
+MMA/PV:
+  consume compact P from A/SFA stage selected by tile parity
+  keep O accumulator in registers
+  use pipeline_mma_corr only for the final O handoff
+
+Correction:
+  updates double-buffered row/global scale state for every tile
+  no longer waits on pipeline_mma_corr for non-final tiles
+  waits on final O handoff only before committing pipeline_corr_epi
+
+Softmax:
+  uses tile-parity workers with distinct P buffers
+  does not use the SM100 order_s01 barrier in this adapted path, because the
+  two SM120 softmax workers do not both participate in the same score tile
+```
+
+Deadlock diagnoses fixed during the port:
+
+```text
+1. Releasing K only after P staging exposed a load-order cycle:
+   load K1[0] -> V1 -> K1[1]
+   V1 could block behind V0, while MMA needed K1[1] before it could run PV0.
+   The next-tile load order is now K1[0] -> K1[1] -> V1.
+
+2. Correction waited on pipeline_mma_corr for tile 0 before processing tile 1.
+   MMA waited for tile-1 P before running tile-0 PV, which created:
+   correction0 waits PV0, softmax1 waits correction1, MMA waits softmax1.
+   Non-final pipeline_mma_corr waits were removed.
+```
+
+Validation:
+
+```text
+git diff --check: pass
+online kv_tiles=1:  finite, mean_abs=0.00253858, max_abs=0.0139102, cosine=0.989597
+online kv_tiles=2:  finite, mean_abs=0.00184219, max_abs=0.00911981, cosine=0.987296
+online kv_tiles=16: finite, mean_abs=0.000650525, max_abs=0.00309772, cosine=0.988925
+full grid:          finite first tile, mean_abs=0.000155273, max_abs=0.000907625, cosine=0.992944
+full-grid min:      14.7649 ms
+```
+
+Conclusion:
+
+```text
+The compact P double-buffer and final-only output handoff are correct, but the
+current schedule is slower than the previous 14.1334 ms checkpoint. The
+regression is expected from the safety constraint: QK now waits for
+softmax/P staging before releasing K storage. That prevents K/logit clobbering,
+but it serializes the next QK tile behind softmax.
+
+The next structural port must remove the durable BF16 score tile from the
+critical path, matching Example 77 more closely: softmax must consume the QK
+result into registers and write compact P without forcing the next QK tile to
+wait on a full score-tile lifetime in `smem_B`.
+```
