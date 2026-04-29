@@ -7174,3 +7174,87 @@ To make Example 88's row-state lifecycle pay, the corresponding QK softmax/PV
 state must be owned by the same atom-level role, or the row-state handoff must be
 made cheaper without recomputing reductions.
 ```
+
+## Profile: Compacted Schedule After Row-State Rejections
+
+2026-04-29T01:07:00-05:00
+
+Profiled the current fast path (`656e6c2` code shape) with Nsight Compute:
+
+```text
+duration:                         7.81 ms under ncu
+registers/thread:                 96
+dynamic shared memory/block:      96.26 KiB
+occupancy limiters:               1 block/SM by registers and shared memory
+SM busy:                          22.22%
+tensor pipe active:               7.45% active, 5.02% elapsed
+eligible warps/scheduler:         0.39
+active warps/scheduler:           4.49
+issue slots busy:                 22.22%
+memory throughput:                54.20 GB/s, 34.17% memory-active
+L2 hit rate:                      99.73%
+```
+
+Dominant stall ratios:
+
+```text
+sleeping:                         6.00 cycles/issue
+wait:                             2.59
+long scoreboard:                  2.13
+barrier:                          0.51
+short scoreboard:                 0.43
+mio throttle:                     0.26
+```
+
+Conclusion:
+
+```text
+The current kernel is not bandwidth-bound and is still far from tensor-pipe
+saturation. The largest reported stall class is role wait/sleep from the
+pipeline/role schedule, followed by wait and long scoreboard. This explains why
+removing the empty Correction role helped. Further role compaction is worth
+testing only if it does not increase per-thread producer work.
+```
+
+## Rejected: 2-Warp Softmax Role Compaction
+
+2026-04-29T01:16:00-05:00
+
+Tested reducing each softmax role from 4 warps to 2 warps:
+
+```text
+before:
+  softmax0=4, softmax1=4, correction=0, mma=8, load=1, epilogue=1
+  total_warps=18, total_threads=576
+
+after:
+  softmax0=2, softmax1=2, correction=0, mma=8, load=1, epilogue=1
+  total_warps=14, total_threads=448
+```
+
+The first version compiled but produced bad output because the CUTLASS
+`partition_D` producer for the NVFP4 P tile was only covering virtual producer
+threads 0-63. Fixed that by having each physical softmax thread cover the
+missing virtual producer slice as well. Correctness then matched the baseline:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000649069, max_abs=0.00317944, cosine=0.988839
+```
+
+Timing:
+
+```text
+baseline compacted schedule:      min_ms=7.6561
+2-warp softmax compacted:         min_ms=10.9802
+```
+
+Decision:
+
+```text
+Rejected and reverted. Although the NCU profile shows many sleeping/waiting
+role warps, reducing the softmax producer from 128 physical threads to 64
+physical threads doubles per-thread P producer work and dominates any benefit
+from fewer parked warps. The 4+4 softmax roles are not the next bottleneck to
+compact in this implementation.
+```
