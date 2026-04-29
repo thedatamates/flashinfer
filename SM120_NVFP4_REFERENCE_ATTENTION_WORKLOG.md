@@ -8544,12 +8544,87 @@ Shape A, q=2048, kv=1024, D=256, group=2:
 Decision:
 
 ```text
-Current Gemma4 coverage policy should be per-shape:
-  Shape B global D512/group8: use the SM120 fused NVFP4 split-KV path.
+Current Gemma4 coverage policy must be per cell:
   Shape A sliding D256/group2: dispatch per q_len with current measurements:
     q=512  -> FP8 FA2
     q=2048 -> CUTLASS two-stage NVFP4
 
 The fused D512 kernel is now a Shape B-grid specialization, not a full Gemma4
-kernel by itself.
+kernel by itself, and not automatically the shipping Shape B policy. Shape B
+still has to be selected by the grid table because the CUTLASS two-stage
+reference remains faster than the fused prototype on known q=512 cells.
+```
+
+## Gemma4 Grid Candidate Policy Smoke
+
+2026-04-29T11:07:00-05:00
+
+Ran the new grid harness with warmup=1/repeat=3 for:
+
+```text
+Shape A:
+  CUTLASS two-stage, NVFP4 FA2, FP8 FA2, BF16
+
+Shape B:
+  SM120 fused split-KV
+  CUTLASS two-stage
+  FP8 FA2
+```
+
+Shape A policy from measured candidates:
+
+```text
+q=512,  kv=1024: FP8 FA2                0.034784 ms
+q=2048, kv=1024: CUTLASS two-stage      0.050144 ms
+```
+
+Shape B candidate table:
+
+```text
+q=512, kv=8192:
+  fused=1.447648 ms, two-stage=0.154560 ms, fp8_fa2=1.320352 ms
+  best: CUTLASS two-stage
+
+q=512, kv=32768:
+  fused=1.797984 ms, two-stage=0.633856 ms, fp8_fa2=5.035392 ms
+  best: CUTLASS two-stage
+
+q=512, kv=131072:
+  fused=7.118656 ms, two-stage=3.715072 ms, fp8_fa2=20.044479 ms
+  best: CUTLASS two-stage
+
+q=512, kv=262144:
+  fused=13.558464 ms, two-stage=7.751552 ms, fp8_fa2=39.897377 ms
+  best: CUTLASS two-stage
+
+q=2048, kv=8192:
+  fused=1.944448 ms, two-stage=0.629280 ms, fp8_fa2=5.680544 ms
+  best: CUTLASS two-stage
+
+q=2048, kv=32768:
+  fused=7.130144 ms, two-stage=2.695968 ms, fp8_fa2=24.322304 ms
+  best: CUTLASS two-stage
+
+q=2048, kv=131072:
+  fused=27.215712 ms, two-stage=17.324320 ms, fp8_fa2=99.449409 ms
+  best: CUTLASS two-stage
+
+q=2048, kv=262144:
+  fused=52.566303 ms, two-stage=OOM, fp8_fa2=199.291077 ms
+  best among completed candidates: SM120 fused split-KV
+```
+
+Decision:
+
+```text
+For coverage, the current shipping candidate is a cell-level dispatch table:
+  A q=512             -> FP8 FA2
+  A q=2048            -> CUTLASS two-stage NVFP4
+  B except 2048/256K  -> CUTLASS two-stage NVFP4
+  B q=2048/256K       -> SM120 fused split-KV
+
+For kernel development, the fused D512 path remains valuable because it is the
+only completed candidate that covers B q=2048/kv=262144 without materializing
+the full logits/probability tensors. It still does not justify replacing
+CUTLASS two-stage on the other Shape B cells.
 ```
