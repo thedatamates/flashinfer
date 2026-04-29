@@ -255,6 +255,13 @@ def main() -> None:
         help="Backend used for FP4 grouped/separate runs. FP8 baseline always uses FA2.",
     )
     parser.add_argument(
+        "--bf16-backend",
+        type=str,
+        default="fmha_v2",
+        choices=["fa2", "fmha_v2"],
+        help="Backend used for the BF16 grouped baseline.",
+    )
+    parser.add_argument(
         "--only",
         type=str,
         default="all",
@@ -376,6 +383,7 @@ def main() -> None:
         "page_size": args.page_size,
         "dtype": args.dtype,
         "fp8_backend": "fa2",
+        "bf16_backend": args.bf16_backend,
         "fp4_backend": args.fp4_backend,
         "fp4_v_layout": args.fp4_v_layout,
         "fp4_v_sf_layout": args.fp4_v_sf_layout,
@@ -441,6 +449,7 @@ def main() -> None:
         )
         wrapper_grouped_bf16 = (
             _make_wrapper(
+                backend=args.bf16_backend,
                 workspace_mib=args.workspace_mib,
                 q_len=args.q_len,
                 kv_len=args.kv_len,
