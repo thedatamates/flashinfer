@@ -8456,3 +8456,100 @@ the gain is ~1.1% on reuse4 and neutral/slightly negative on reuse2. The core
 gap remains inside the stage kernel's residency, load pipeline, and PV
 accumulator pressure.
 ```
+
+## Coverage Correction: Gemma4 Shape B Extends To 256K
+
+2026-04-29T10:48:00-05:00
+
+The Gemma4 31B target is model coverage, not one frozen benchmark cell. Shape B
+uses the global-attention layers and must support the model-config maximum
+context:
+
+```text
+max_position_embeddings = 262144
+
+Shape B:
+  D=512
+  group=8
+  q_len in {512, 2048}
+  kv_len in {8192, 32768, 131072, 262144}
+```
+
+Implementation update:
+
+```text
+The split-KV fused wrapper now infers q_rows and kv_len from tensor shapes
+instead of enforcing q=512 / kv=32768. The first specialization remains Shape B
+D512/group8, but it is no longer tied to one q_len/kv_len cell.
+
+The row-owned combine scratch cap was raised from 131072 to 262144 tokens:
+  kShapeBMaxKvLen = 262144
+  kShapeBMaxKvTiles = 2048
+
+This uses 8 KiB of shared split-weight scratch per combine CTA, which is still
+acceptable for the row-owned combine path.
+```
+
+Open coverage gap:
+
+```text
+Shape A is still not covered by this fused specialization:
+  D=256, group=2, kv_len=1024, q_len in {512,2048}
+
+Gemma4 coverage is not complete until Shape A has either:
+  1. a dedicated fused specialization, or
+  2. an explicit production dispatch policy proving another backend wins those
+     cells.
+```
+
+Smoke results after parameterization:
+
+```text
+Shape B, q=512, kv=8192:
+  output_shape=[4096,512], partial_shape=[2,4096,512]
+  finite=true, cosine=0.989759
+  repeat1 min_ms=1.4693
+
+Shape B, q=512, kv=262144:
+  output_shape=[4096,512], partial_shape=[40,4096,512]
+  finite=true, cosine=0.991515
+  repeat1 min_ms=13.5523
+
+Shape B, q=2048, kv=8192:
+  output_shape=[16384,512], partial_shape=[2,16384,512]
+  finite=true, cosine=0.991272
+  repeat1 min_ms=2.0016
+```
+
+The grid harness was updated to include kv_len=262144 and to pass Shape B
+dimensions into the fused benchmark. A smoke run with the harness successfully
+recorded fused results for q=512 at kv=8192 and kv=262144.
+
+Shape A existing-path check:
+
+```text
+Shape A, q=512, kv=1024, D=256, group=2:
+  CUTLASS two-stage NVFP4: 0.048480 ms
+  FlashInfer NVFP4 FA2:    0.036480 ms
+  FlashInfer FP8 FA2:      0.034784 ms  <-- fastest
+  BF16:                    0.173056 ms
+
+Shape A, q=2048, kv=1024, D=256, group=2:
+  CUTLASS two-stage NVFP4: 0.050144 ms  <-- fastest
+  FlashInfer NVFP4 FA2:    0.064288 ms
+  FlashInfer FP8 FA2:      0.057344 ms
+  BF16:                    0.176352 ms
+```
+
+Decision:
+
+```text
+Current Gemma4 coverage policy should be per-shape:
+  Shape B global D512/group8: use the SM120 fused NVFP4 split-KV path.
+  Shape A sliding D256/group2: dispatch per q_len with current measurements:
+    q=512  -> FP8 FA2
+    q=2048 -> CUTLASS two-stage NVFP4
+
+The fused D512 kernel is now a Shape B-grid specialization, not a full Gemma4
+kernel by itself.
+```

@@ -44,6 +44,8 @@ constexpr int kCutlassTileK128 = 128;
 constexpr int kDebugHead = 0;
 constexpr int kProbPackedCols = kKvLen / 2;
 constexpr int kProbScaleCols = kKvLen / 16;
+constexpr int kShapeBMaxKvLen = 262144;
+constexpr int kShapeBMaxKvTiles = kShapeBMaxKvLen / kCutlassTileN;
 constexpr int kFusedWarpsPerCta = 8;
 constexpr int kSplitKvLen = 1024;
 constexpr int kNumKvSplits = kKvLen / kSplitKvLen;
@@ -887,6 +889,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     int q_tile,
     int kv_tile_start,
     int num_kv_tiles,
+    int total_kv_tiles,
     int out_group_idx,
     int out_stride_cols,
     float* split_m,
@@ -905,8 +908,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   const int effective_split_idx = int(blockIdx.z);
   const int effective_kv_tile_start =
       kv_tile_start + effective_split_idx * num_kv_tiles;
-  constexpr int kTotalKvTiles = kKvLen / kCutlassTileN;
-  const int remaining_kv_tiles = kTotalKvTiles - effective_kv_tile_start;
+  const int remaining_kv_tiles = total_kv_tiles - effective_kv_tile_start;
   const int effective_num_kv_tiles =
       remaining_kv_tiles < num_kv_tiles ? remaining_kv_tiles : num_kv_tiles;
   if (effective_num_kv_tiles <= 0) {
@@ -1794,24 +1796,26 @@ __global__ void sm120_nvfp4_splitkv_combine_kernel(
     const float* split_m,
     const float* split_l,
     __nv_bfloat16* out,
-    int num_splits) {
+    int num_splits,
+    int q_rows,
+    int head_dim) {
   const int row = int(blockIdx.x);
-  if (row >= kQRows) {
+  if (row >= q_rows) {
     return;
   }
-  __shared__ float split_weights[kKvLen / kCutlassTileN];
+  __shared__ float split_weights[kShapeBMaxKvTiles];
 
   if (threadIdx.x == 0) {
     float global_m = -INFINITY;
 #pragma unroll 1
     for (int split = 0; split < num_splits; ++split) {
-      global_m = fmaxf(global_m, split_m[split * kQRows + row]);
+      global_m = fmaxf(global_m, split_m[split * q_rows + row]);
     }
 
     float global_l = 0.0f;
 #pragma unroll 1
     for (int split = 0; split < num_splits; ++split) {
-      const int stats_idx = split * kQRows + row;
+      const int stats_idx = split * q_rows + row;
       const float correction = __expf(split_m[stats_idx] - global_m);
       split_weights[split] = correction;
       global_l += correction * split_l[stats_idx];
@@ -1825,15 +1829,15 @@ __global__ void sm120_nvfp4_splitkv_combine_kernel(
 
   __syncthreads();
 
-  for (int col = int(threadIdx.x); col < kHeadDim; col += int(blockDim.x)) {
+  for (int col = int(threadIdx.x); col < head_dim; col += int(blockDim.x)) {
     float acc = 0.0f;
 #pragma unroll 1
     for (int split = 0; split < num_splits; ++split) {
       const int partial_idx =
-          split * kQRows * kHeadDim + row * kHeadDim + col;
+          split * q_rows * head_dim + row * head_dim + col;
       acc += split_weights[split] * __bfloat162float(partial[partial_idx]);
     }
-    out[row * kHeadDim + col] = __float2bfloat16(acc);
+    out[row * head_dim + col] = __float2bfloat16(acc);
   }
 }
 
@@ -2221,8 +2225,8 @@ void sm120_nvfp4_qkv_online_register_q_stage(torch::Tensor q_packed,
       reinterpret_cast<__nv_bfloat16*>(out_group.data_ptr<at::BFloat16>()),
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
       static_cast<int>(q_tile), static_cast<int>(kv_tile_start),
-      static_cast<int>(num_kv_tiles), static_cast<int>(out_group_idx),
-      kCutlassTileN, nullptr, nullptr, 0, 0);
+      static_cast<int>(num_kv_tiles), kKvLen / kCutlassTileN,
+      static_cast<int>(out_group_idx), kCutlassTileN, nullptr, nullptr, 0, 0);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2321,7 +2325,8 @@ void sm120_nvfp4_qkv_online_register_q_full_grid(torch::Tensor q_packed,
       qk_params, pv_params,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha), 0, 0,
-      kKvLen / kCutlassTileN, 0, kHeadDim, nullptr, nullptr, 0, 0);
+      kKvLen / kCutlassTileN, kKvLen / kCutlassTileN, 0, kHeadDim, nullptr,
+      nullptr, 0, 0);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2355,34 +2360,59 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
   check_tensor(split_l, "split_l", torch::kFloat32);
   check_tensor(out, "out", torch::kBFloat16);
   check_tensor(workspace, "workspace", torch::kUInt8);
-  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
-              "q_packed must have shape [4096, 256]");
-  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
-              "q_scales must have shape [4096, 32]");
-  TORCH_CHECK(k_packed.sizes() == torch::IntArrayRef({kKvLen, kPackedHeadDim}),
-              "k_packed must have shape [32768, 256]");
-  TORCH_CHECK(k_scales.sizes() == torch::IntArrayRef({kKvLen, kScaleCols}),
-              "k_scales must have shape [32768, 32]");
+  TORCH_CHECK(q_packed.dim() == 2, "q_packed must be 2D");
+  TORCH_CHECK(k_packed.dim() == 2, "k_packed must be 2D");
+  TORCH_CHECK(v_pv_packed.dim() == 2, "v_pv_packed must be 2D");
+  const int64_t q_rows64 = q_packed.size(0);
+  const int64_t packed_head_dim64 = q_packed.size(1);
+  const int64_t head_dim64 = packed_head_dim64 * 2;
+  const int64_t scale_cols64 = head_dim64 / 16;
+  const int64_t kv_len64 = k_packed.size(0);
+  const int64_t prob_packed_cols64 = kv_len64 / 2;
+  const int64_t prob_scale_cols64 = kv_len64 / 16;
+  TORCH_CHECK(head_dim64 == kHeadDim,
+              "Shape B fused wrapper currently supports D512 only, got D",
+              head_dim64);
+  TORCH_CHECK(q_rows64 > 0 && q_rows64 % kCutlassTileM == 0,
+              "q rows must be a positive multiple of ", kCutlassTileM);
+  TORCH_CHECK(kv_len64 > 0 && kv_len64 % kCutlassTileN == 0,
+              "KV length must be a positive multiple of ", kCutlassTileN);
+  TORCH_CHECK(kv_len64 <= kShapeBMaxKvLen,
+              "KV length exceeds Shape B max supported by combine scratch: ",
+              kv_len64);
+  TORCH_CHECK(k_packed.size(1) == packed_head_dim64,
+              "k_packed packed head dim must match q_packed");
+  TORCH_CHECK(q_scales.sizes() ==
+                  torch::IntArrayRef({q_rows64, scale_cols64}),
+              "q_scales must have shape [q_rows, D/16]");
+  TORCH_CHECK(k_scales.sizes() ==
+                  torch::IntArrayRef({kv_len64, scale_cols64}),
+              "k_scales must have shape [kv_len, D/16]");
   TORCH_CHECK(v_pv_packed.sizes() ==
-                  torch::IntArrayRef({kHeadDim, kProbPackedCols}),
-              "v_pv_packed must have shape [512, 16384]");
+                  torch::IntArrayRef({head_dim64, prob_packed_cols64}),
+              "v_pv_packed must have shape [D, kv_len/2]");
   TORCH_CHECK(v_pv_scales.sizes() ==
-                  torch::IntArrayRef({kHeadDim, kProbScaleCols}),
-              "v_pv_scales must have shape [512, 2048]");
+                  torch::IntArrayRef({head_dim64, prob_scale_cols64}),
+              "v_pv_scales must have shape [D, kv_len/16]");
   TORCH_CHECK(split_kv_tiles > 0, "split_kv_tiles must be positive");
+  const int q_rows = static_cast<int>(q_rows64);
+  const int head_dim = static_cast<int>(head_dim64);
+  const int kv_len = static_cast<int>(kv_len64);
+  const int total_kv_tiles = kv_len / kCutlassTileN;
   const int num_splits =
-      static_cast<int>(((kKvLen / kCutlassTileN) + split_kv_tiles - 1) /
-                       split_kv_tiles);
+      static_cast<int>((total_kv_tiles + split_kv_tiles - 1) / split_kv_tiles);
+  TORCH_CHECK(num_splits <= kShapeBMaxKvTiles,
+              "num_splits exceeds Shape B combine scratch");
   TORCH_CHECK(partial.sizes() ==
-                  torch::IntArrayRef({num_splits, kQRows, kHeadDim}),
-              "partial must have shape [num_splits, 4096, 512]");
-  TORCH_CHECK(split_m.sizes() == torch::IntArrayRef({num_splits, kQRows}),
-              "split_m must have shape [num_splits, 4096]");
-  TORCH_CHECK(split_l.sizes() == torch::IntArrayRef({num_splits, kQRows}),
-              "split_l must have shape [num_splits, 4096]");
-  TORCH_CHECK(out.sizes() == torch::IntArrayRef({kQRows, kHeadDim}),
-              "out must have shape [4096, 512]");
-  TORCH_CHECK(kHeadDim % (kOutputGroupSpan * kCutlassTileN) == 0,
+                  torch::IntArrayRef({num_splits, q_rows64, head_dim64}),
+              "partial must have shape [num_splits, q_rows, D]");
+  TORCH_CHECK(split_m.sizes() == torch::IntArrayRef({num_splits, q_rows64}),
+              "split_m must have shape [num_splits, q_rows]");
+  TORCH_CHECK(split_l.sizes() == torch::IntArrayRef({num_splits, q_rows64}),
+              "split_l must have shape [num_splits, q_rows]");
+  TORCH_CHECK(out.sizes() == torch::IntArrayRef({q_rows64, head_dim64}),
+              "out must have shape [q_rows, D]");
+  TORCH_CHECK(head_dim % (kOutputGroupSpan * kCutlassTileN) == 0,
               "head dimension must be divisible by output-group span");
 
   float alpha = 1.0f;
@@ -2393,9 +2423,9 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
       q_scales.data_ptr<uint8_t>(),
       k_scales.data_ptr<uint8_t>(),
       &alpha,
-      kQRows,
-      kKvLen,
-      kHeadDim,
+      q_rows,
+      kv_len,
+      head_dim,
       1);
   CutlassGemm qk_gemm;
   const size_t qk_workspace_size = qk_gemm.get_workspace_size(qk_args);
@@ -2418,8 +2448,8 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
       v_pv_scales.data_ptr<uint8_t>(),
       &alpha,
       kCutlassTileM,
-      kHeadDim,
-      kKvLen,
+      head_dim,
+      kv_len,
       1);
   CutlassGemmK128Stage2 pv_gemm;
   const size_t pv_workspace_size = pv_gemm.get_workspace_size(pv_args);
@@ -2440,26 +2470,27 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
       sm120_nvfp4_qkv_online_register_q_stage_kernel<kOutputGroupSpan>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-  stage_kernel<<<dim3(kQRows / kCutlassTileM,
-                      kHeadDim / (kOutputGroupSpan * kCutlassTileN),
+  stage_kernel<<<dim3(q_rows / kCutlassTileM,
+                      head_dim / (kOutputGroupSpan * kCutlassTileN),
                       num_splits),
                  kSm120Nvfp4FmhaThreadCount, kSmemBytes,
                  at::cuda::getCurrentCUDAStream()>>>(
       qk_params, pv_params,
       reinterpret_cast<__nv_bfloat16*>(partial.data_ptr<at::BFloat16>()),
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha), 0, 0,
-      static_cast<int>(split_kv_tiles), 0, kHeadDim, split_m.data_ptr<float>(),
-      split_l.data_ptr<float>(), kQRows, kQRows * kHeadDim);
+      static_cast<int>(split_kv_tiles), total_kv_tiles, 0, head_dim,
+      split_m.data_ptr<float>(), split_l.data_ptr<float>(), q_rows,
+      q_rows * head_dim);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   constexpr int kThreads = 256;
-  sm120_nvfp4_splitkv_combine_kernel<<<kQRows, kThreads, 0,
+  sm120_nvfp4_splitkv_combine_kernel<<<q_rows, kThreads, 0,
                                        at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const __nv_bfloat16*>(
           partial.data_ptr<at::BFloat16>()),
       split_m.data_ptr<float>(), split_l.data_ptr<float>(),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-      num_splits);
+      num_splits, q_rows, head_dim);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

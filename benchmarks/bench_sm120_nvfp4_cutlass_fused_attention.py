@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 from pathlib import Path
 
@@ -36,6 +38,30 @@ def quantize_cutlass(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
         do_shuffle=False,
     )
     return packed, block_scale, scale
+
+
+def make_shape_inputs(
+    device: torch.device,
+    *,
+    q_len: int,
+    group: int,
+    kv_len: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1234)
+    q = (torch.randn((q_len, group, head_dim), device=device, generator=gen) / 4).to(
+        torch.bfloat16
+    )
+    k_bf16 = (torch.randn((kv_len, head_dim), device=device, generator=gen) / 4).to(
+        torch.bfloat16
+    )
+    v_bf16 = (torch.randn((kv_len, head_dim), device=device, generator=gen) / 4).to(
+        torch.bfloat16
+    )
+    k, k_scales = fp32_to_nvfp4_rowmajor(k_bf16)
+    v, v_scales = fp32_to_nvfp4_rowmajor(v_bf16)
+    return q.contiguous(), k, v, k_scales, v_scales
 
 
 def event_ms(fn, *, warmup: int, repeat: int) -> dict[str, float]:
@@ -116,14 +142,46 @@ def main() -> None:
     parser.add_argument("--smem-atom-unit-scales", action="store_true")
     parser.add_argument("--smem-atom-q-code", type=int, default=-1)
     parser.add_argument("--smem-atom-k-code", type=int, default=-1)
+    parser.add_argument("--q-len", type=int, default=Q_LEN)
+    parser.add_argument("--kv-len", type=int, default=32768)
+    parser.add_argument("--head-dim", type=int, default=HEAD_DIM)
+    parser.add_argument("--group", type=int, default=GROUP)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.device}")
-    q, k, v, k_scales, v_scales = make_inputs(device)
+    default_shape = (
+        args.q_len == Q_LEN
+        and args.group == GROUP
+        and args.kv_len == 32768
+        and args.head_dim == HEAD_DIM
+    )
+    if default_shape:
+        q, k, v, k_scales, v_scales = make_inputs(device)
+    else:
+        q, k, v, k_scales, v_scales = make_shape_inputs(
+            device,
+            q_len=args.q_len,
+            group=args.group,
+            kv_len=args.kv_len,
+            head_dim=args.head_dim,
+        )
     ext = build_extension()
     metadata = dict(ext.cutlass_sm120_blockscaled_collective_metadata())
+
+    def compare(name: str, actual: torch.Tensor, ref: torch.Tensor) -> dict[str, object]:
+        delta = (actual.float() - ref.float()).abs()
+        cos = torch.sum(actual.float() * ref.float()) / torch.clamp(
+            torch.linalg.vector_norm(actual.float()) * torch.linalg.vector_norm(ref.float()),
+            min=1.0e-20,
+        )
+        return {
+            f"{name}_finite": bool(torch.isfinite(actual).all().item()),
+            f"{name}_mean_abs": float(delta.mean().item()),
+            f"{name}_max_abs": float(delta.max().item()),
+            f"{name}_cosine": float(cos.item()),
+        }
 
     if args.sm120_role_schedule_check_only:
         marker = torch.empty(16, device=device, dtype=torch.int32)
@@ -166,6 +224,143 @@ def main() -> None:
             }
         )
         return
+
+    if (
+        args.sm120_qkv_online_splitkv_full_grid_bench
+        or args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
+        or args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
+    ):
+        if args.head_dim != HEAD_DIM or args.group != GROUP:
+            raise ValueError(
+                "current fused Shape B specialization requires --head-dim=512 "
+                "and --group=8"
+            )
+        if args.kv_len % 128 != 0:
+            raise ValueError("--kv-len must be a multiple of 128")
+        if args.split_kv_len <= 0 or args.split_kv_len % 128 != 0:
+            raise ValueError("--split-kv-len must be a positive multiple of 128")
+        q_rows = args.q_len * args.group
+        k_ref_f32 = nvfp4_rowmajor_to_fp32(k, k_scales)
+        v_ref_f32 = nvfp4_rowmajor_to_fp32(v, v_scales)
+        q_cutlass, q_cutlass_scales, q_cutlass_global = quantize_cutlass(
+            q.reshape(q_rows, args.head_dim)
+        )
+        k_cutlass, k_cutlass_scales, k_cutlass_global = quantize_cutlass(
+            k_ref_f32.to(torch.bfloat16)
+        )
+        v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = quantize_cutlass(
+            v_ref_f32.T.contiguous().to(torch.bfloat16)
+        )
+        qk_alpha = 1.0 / (q_cutlass_global * k_cutlass_global)
+        pv_alpha = 1.0 / v_pv_cutlass_global
+        workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
+        num_splits = (args.kv_len + args.split_kv_len - 1) // args.split_kv_len
+        split_kv_tiles = args.split_kv_len // 128
+        out = torch.empty((q_rows, args.head_dim), device=device, dtype=torch.bfloat16)
+        partial = torch.empty(
+            (num_splits, q_rows, args.head_dim),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        split_m = torch.empty((num_splits, q_rows), device=device, dtype=torch.float32)
+        split_l = torch.empty((num_splits, q_rows), device=device, dtype=torch.float32)
+        splitkv_fn = (
+            ext.sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid
+            if args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
+            else (
+                ext.sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid
+                if args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
+                else ext.sm120_nvfp4_qkv_online_register_q_splitkv_full_grid
+            )
+        )
+        splitkv_name = (
+            "sm120_qkv_online_register_q_splitkv_reuse4_full_grid"
+            if args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
+            else (
+                "sm120_qkv_online_register_q_splitkv_reuse2_full_grid"
+                if args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
+                else "sm120_qkv_online_register_q_splitkv_full_grid"
+            )
+        )
+        splitkv_fn(
+            q_cutlass,
+            q_cutlass_scales,
+            k_cutlass,
+            k_cutlass_scales,
+            v_pv_cutlass,
+            v_pv_cutlass_scales,
+            partial,
+            split_m,
+            split_l,
+            out,
+            workspace,
+            float(qk_alpha.item()),
+            float(pv_alpha.item()),
+            split_kv_tiles,
+        )
+        torch.cuda.synchronize()
+
+        tactic = min(2, int(metadata["runner_tactic_count"]) - 1)
+        qk_ref = torch.empty(
+            (128, args.kv_len), device=device, dtype=torch.bfloat16
+        )
+        ext.cutlass_runner_fp4_gemm(
+            q_cutlass[:128].contiguous(),
+            k_cutlass.contiguous(),
+            q_cutlass_scales[:128].contiguous(),
+            k_cutlass_scales.contiguous(),
+            qk_alpha,
+            qk_ref,
+            workspace,
+            tactic,
+        )
+        torch.cuda.synchronize()
+        probs = torch.softmax(qk_ref.float() / math.sqrt(args.head_dim), dim=-1)
+        exact_ref = torch.matmul(probs.float(), v_ref_f32[:, :128].float())
+        result = {
+            splitkv_name: True,
+            "q_len": args.q_len,
+            "kv_len": args.kv_len,
+            "head_dim": args.head_dim,
+            "group": args.group,
+            "output_shape": list(out.shape),
+            "partial_shape": list(partial.shape),
+            "splits": num_splits,
+            "split_kv_len": args.split_kv_len,
+            "storage_bytes": metadata["sm120_qkv_load_collective_storage_bytes"],
+            "storage_margin_bytes": metadata[
+                "sm120_qkv_load_collective_storage_margin_bytes"
+            ],
+        }
+        result.update(compare("splitkv_full_grid_first_tile_vs_exact", out[:128, :128], exact_ref))
+        result[f"bench_{splitkv_name}"] = event_ms(
+            lambda: splitkv_fn(
+                q_cutlass,
+                q_cutlass_scales,
+                k_cutlass,
+                k_cutlass_scales,
+                v_pv_cutlass,
+                v_pv_cutlass_scales,
+                partial,
+                split_m,
+                split_l,
+                out,
+                workspace,
+                float(qk_alpha.item()),
+                float(pv_alpha.item()),
+                split_kv_tiles,
+            ),
+            warmup=args.warmup,
+            repeat=args.repeat,
+        )
+        print(json.dumps(result))
+        return
+
+    if not default_shape:
+        raise ValueError(
+            "non-default shapes are currently supported only by the split-KV "
+            "Shape B benchmark path"
+        )
 
     q_expected, q_scales_expected = fp32_to_nvfp4_rowmajor(
         q.reshape(Q_LEN * GROUP, HEAD_DIM)
@@ -410,115 +605,6 @@ def main() -> None:
                 workspace,
                 float(qk_alpha.item()),
                 float(pv_alpha.item()),
-            ),
-            warmup=args.warmup,
-            repeat=args.repeat,
-        )
-        print(result)
-        return
-
-    if (
-        args.sm120_qkv_online_splitkv_full_grid_bench
-        or args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
-        or args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
-    ):
-        (
-            q_cutlass,
-            q_cutlass_scales,
-            _,
-            k_cutlass,
-            k_cutlass_scales,
-            _,
-            qk_alpha,
-            workspace,
-            tactic,
-        ) = cutlass_qk_inputs()
-        v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
-        if args.split_kv_len <= 0 or args.split_kv_len % 128 != 0:
-            raise ValueError("--split-kv-len must be a positive multiple of 128")
-        num_splits = (32768 + args.split_kv_len - 1) // args.split_kv_len
-        split_kv_tiles = args.split_kv_len // 128
-        out = torch.empty((Q_LEN * GROUP, HEAD_DIM), device=device, dtype=torch.bfloat16)
-        partial = torch.empty((num_splits, Q_LEN * GROUP, HEAD_DIM), device=device, dtype=torch.bfloat16)
-        split_m = torch.empty((num_splits, Q_LEN * GROUP), device=device, dtype=torch.float32)
-        split_l = torch.empty((num_splits, Q_LEN * GROUP), device=device, dtype=torch.float32)
-        pv_alpha = 1.0 / v_pv_cutlass_global
-        splitkv_fn = (
-            ext.sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid
-            if args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
-            else (
-                ext.sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid
-                if args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
-                else ext.sm120_nvfp4_qkv_online_register_q_splitkv_full_grid
-            )
-        )
-        splitkv_name = (
-            "sm120_qkv_online_register_q_splitkv_reuse4_full_grid"
-            if args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
-            else (
-                "sm120_qkv_online_register_q_splitkv_reuse2_full_grid"
-                if args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
-                else "sm120_qkv_online_register_q_splitkv_full_grid"
-            )
-        )
-        splitkv_fn(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            v_pv_cutlass,
-            v_pv_cutlass_scales,
-            partial,
-            split_m,
-            split_l,
-            out,
-            workspace,
-            float(qk_alpha.item()),
-            float(pv_alpha.item()),
-            split_kv_tiles,
-        )
-        torch.cuda.synchronize()
-        qk_ref = qk_runner_ref(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            qk_alpha,
-            workspace,
-            tactic,
-            q_rows=128,
-            kv_rows=k_cutlass.shape[0],
-        )
-        probs = torch.softmax(qk_ref.float() / (HEAD_DIM**0.5), dim=-1)
-        exact_ref = torch.matmul(probs.float(), v_ref_f32[:, :128].float())
-        result = {
-            splitkv_name: True,
-            "output_shape": tuple(out.shape),
-            "partial_shape": tuple(partial.shape),
-            "splits": num_splits,
-            "split_kv_len": args.split_kv_len,
-            "storage_bytes": metadata["sm120_qkv_load_collective_storage_bytes"],
-            "storage_margin_bytes": metadata[
-                "sm120_qkv_load_collective_storage_margin_bytes"
-            ],
-        }
-        result.update(compare("splitkv_full_grid_first_tile_vs_exact", out[:128, :128], exact_ref))
-        result[f"bench_{splitkv_name}"] = event_ms(
-            lambda: splitkv_fn(
-                q_cutlass,
-                q_cutlass_scales,
-                k_cutlass,
-                k_cutlass_scales,
-                v_pv_cutlass,
-                v_pv_cutlass_scales,
-                partial,
-                split_m,
-                split_l,
-                out,
-                workspace,
-                float(qk_alpha.item()),
-                float(pv_alpha.item()),
-                split_kv_tiles,
             ),
             warmup=args.warmup,
             repeat=args.repeat,
