@@ -7695,3 +7695,46 @@ not from solving the local-memory spill problem. Spill remains >50 MB, so the
 next high-probability lever is a separate live-range issue, likely around QK
 accumulator/PV fragment lifetime or the nested generic lambdas in the MMA loop.
 ```
+
+## Rejected: 64-Column PV Tile Probe
+
+2026-04-28T23:22:00-05:00
+
+Tried reducing the PV/output tile from `128x128x128` to `128x64x128` as a
+direct attack on the remaining local-memory spill:
+
+```text
+motivation:
+  NCU after packed P stores still reports ~72.66 MB local spill traffic.
+  The full-grid launch has 128 CTAs, below the 188 SMs on the RTX PRO 6000.
+  Halving the PV N tile would cut accumulator live state and launch 256 CTAs.
+
+probe:
+  CutlassThreadBlockShapeK128 = Shape<128,64,128>
+  active output group width = 64
+```
+
+The probe failed at compile time inside the SM120 block-scaled CUTLASS builder:
+
+```text
+CUTLASS TMA assert:
+  TMA requires CTA_Tile and SLayout top-level size equivalence
+```
+
+Current metadata and runner configs only expose the practical SM120 FP4 runner
+tile shapes:
+
+```text
+128x128x128
+128x128x256
+256x128x128
+```
+
+Decision:
+
+```text
+Rejected and reverted. Do not retry this as a simple tile-shape edit. A
+64-column PV path needs explicit SM120 block-scaled scale-layout/TMA-layout work
+or a manual V/scale loader. The next live-range work should stay on the accepted
+128-wide CUTLASS collective path unless we intentionally port the scale layout.
+```
