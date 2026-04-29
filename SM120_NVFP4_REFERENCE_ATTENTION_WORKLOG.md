@@ -9064,3 +9064,54 @@ This is still dense, non-paged, q>=128 only, and not production causal/ragged
 integration. It also uses group=2 because that matched the D128 smoke shape.
 If a target D128 model has a different GQA group, it needs its own sweep.
 ```
+
+## D128 NVFP4 FA2 Comparison
+
+Measured the matching D128/group2 dense grid against NVFP4 FA2.
+
+Command shape:
+
+```bash
+benchmarks/bench_nvfp4_fmha_v2_gqa_grouped_attention.py \
+  --device 0 \
+  --q-len {512,2048} \
+  --kv-len {8192,32768,131072,262144} \
+  --head-dim 128 \
+  --group-sizes 2 \
+  --batch-size 1 \
+  --only grouped-fp4 \
+  --fp4-backend fa2 \
+  --fp4-v-layout nhd \
+  --fp4-v-sf-layout linear
+```
+
+D128/group2 dense fused vs NVFP4 FA2:
+
+```text
+q     kv       SM120 fused ms   NVFP4 FA2 ms   winner     gap
+512   8192     0.752576         0.048640       NVFP4 FA2  15.47x
+512   32768    0.744288         0.111040       NVFP4 FA2  6.70x
+512   131072   0.778464         0.375168       NVFP4 FA2  2.07x
+512   262144   1.540544         0.730976       NVFP4 FA2  2.11x
+2048  8192     0.734016         0.116224       NVFP4 FA2  6.32x
+2048  32768    0.781024         0.386048       NVFP4 FA2  2.02x
+2048  131072   2.992704         1.492480       NVFP4 FA2  2.01x
+2048  262144   5.319200         2.961472       NVFP4 FA2  1.80x
+```
+
+Conclusion:
+
+```text
+The fused kernel does not win at D128. NVFP4 FA2 wins all 8 dense D128/group2
+long-context cells, by 1.8x to 15.5x.
+
+This means the current fused kernel's structural advantage is not generic to
+D128. The D512 win appears tied to the D512/global-attention surface where
+output-group reuse and long-KV split-KV amortization overcome the fused kernel's
+fixed overhead. At D128, FA2's lower overhead and mature small-head path dominate.
+
+Current dispatch implication:
+  - D512 dense prefill long-KV: SM120 fused remains useful.
+  - D256/D128: current fused path is correctness coverage only; do not dispatch
+    it over NVFP4 FA2 without a real D256/D128 specialization proving a win.
+```
