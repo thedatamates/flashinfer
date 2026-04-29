@@ -2910,7 +2910,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
 
       commit_score_stages();
-      wait_p_ready_and_release_k();
     };
 
     auto run_pv_tile = [&](int tile, bool final_tile) {
@@ -2948,6 +2947,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       if (tile > 0) {
         run_pv_tile(tile - 1, false);
       }
+      wait_p_ready_and_release_k();
     }
     run_pv_tile(num_kv_tiles - 1, true);
   } else if (is_softmax) {

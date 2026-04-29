@@ -6676,3 +6676,71 @@ to amortize pipeline overhead. A tiny row mailbox is structurally wrong on
 SM120. If we revisit independent S/P storage, it should be via a smaller-M CTA
 or a larger independent S buffer, not 4-row strip streaming at M=128.
 ```
+
+## QK / Softmax / PV Interleave Fix
+
+2026-04-28T22:05:00-05:00
+
+Found and fixed a real schedule bug in the active role pipeline.
+
+Previous active order:
+
+```text
+for tile n:
+  QK(n)
+  publish S(n)
+  wait Softmax(n) -> P(n)
+  release K(n)
+  PV(n-1)
+```
+
+That serialized PV for the previous tile behind softmax/P staging for the
+current tile. It preserved correctness, but it left MMA idle while the softmax
+roles converted the current BF16 score tile into compact P.
+
+New active order:
+
+```text
+for tile n:
+  QK(n)
+  publish S(n)
+  PV(n-1) while Softmax(n) stages P(n)
+  wait Softmax(n) -> P(n)
+  release K(n)
+
+tail:
+  PV(last)
+```
+
+This matches the 88-style QK/softmax/PV interleave more closely while
+preserving SM120 role ownership:
+
+```text
+MMA owns QK/PV tensor-core work.
+Softmax owns online row state and compact P production.
+K/B shared memory is still released only after Softmax consumes the score tile.
+```
+
+Validation:
+
+```text
+git diff --check: pass
+online kv_tiles=16:
+  finite, mean_abs=0.000650689, max_abs=0.00309772, cosine=0.988923
+
+full grid first tile:
+  finite, mean_abs=0.000155332, max_abs=0.000899995, cosine=0.992945
+
+full-grid min:
+  before interleave fix: 9.8332 ms
+  after interleave fix:  8.2618 ms
+```
+
+Conclusion:
+
+```text
+This is the largest win since softmax-owned online state. The issue was not the
+score tile alone; the schedule also failed to spend the softmax window on useful
+MMA work. The remaining gap should be profiled again from this checkpoint
+before attempting more S/P storage rewrites.
+```
