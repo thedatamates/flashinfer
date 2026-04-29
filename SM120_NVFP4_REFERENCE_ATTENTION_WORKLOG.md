@@ -7083,3 +7083,94 @@ schedule is the real win. This is still far from the two-stage CUTLASS ceiling,
 so the next work must attack per-tile QK/PV/softmax overlap and P/O storage
 lifetime, not split-KV parallelism.
 ```
+
+## Rejected: Load-Order-Only K/V Interleave
+
+2026-04-29T00:41:00-05:00
+
+Tested a narrow load-order patch in the active Load role:
+
+```text
+before: load K chunk 0, load K chunk 1, load V
+after:  load K chunk 0, load V,         load K chunk 1
+```
+
+Correctness was unchanged:
+
+```text
+online kv_tiles=16:
+  finite, mean_abs=0.000649069, max_abs=0.00317944, cosine=0.988839
+```
+
+Timing did not improve:
+
+```text
+compacted baseline repeat=20:  min_ms=7.6561
+load-order-only repeat=5:      min_ms=7.6663, mean_ms=7.6714
+```
+
+Conclusion:
+
+```text
+Rejected and reverted. SM100/FA-3 load ordering is not just a static K/V issue
+permutation; V must be temporally anchored to QK/softmax progress so it arrives
+before PV consumes it. Reordering the issue sequence inside the same serial
+prefetch point does not create overlap.
+
+Do not spend more time on static K/V ordering probes. The next structural port
+is register-resident softmax row state from Example 88, followed by tighter
+MMA/softmax/PV handoff.
+```
+
+## Rejected: Duplicated Register-Resident MMA Row State
+
+2026-04-29T00:55:00-05:00
+
+Attempted to port the Example 88 online softmax row-state lifecycle into the
+SM120 MMA role so PV rescale would no longer read per-tile `old_scale` from
+SMEM.
+
+Two variants were tested:
+
+```text
+full duplicated state:
+  MMA role recomputes tile max, running max, running sum, old scale, and final
+  normalization in registers.
+
+old-scale-only state:
+  MMA role recomputes tile max and running max only, keeps per-tile old scale in
+  registers, while final denominator remains produced by the Softmax role.
+```
+
+Results:
+
+```text
+baseline compacted schedule:
+  storage_bytes=96256, min_ms=7.6561
+
+full duplicated state:
+  storage_bytes=94208
+  online kv_tiles=16 finite, mean_abs=0.00434299, cosine=0.988652
+  full-grid min_ms=8.2163
+
+old-scale-only state:
+  storage_bytes=94208
+  online kv_tiles=16 finite, mean_abs=0.000652661, cosine=0.988712
+  full-grid min_ms=7.9107
+```
+
+Decision:
+
+```text
+Rejected and reverted. Moving row state into MMA registers is not a free port
+of Example 88 in this role-split SM120 kernel. Because Softmax remains a
+separate role, the MMA role has to duplicate QK row reductions to derive the
+same online state. That duplicated max/sum work costs more than the SMEM
+old-scale handoff it removes.
+
+The lesson is narrower than "register-resident row state is bad": it is bad in
+this hybrid role decomposition where Softmax already owns the row reductions.
+To make Example 88's row-state lifecycle pay, the corresponding QK softmax/PV
+state must be owned by the same atom-level role, or the row-state handoff must be
+made cheaper without recomputing reductions.
+```
