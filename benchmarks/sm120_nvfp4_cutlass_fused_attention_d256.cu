@@ -2501,18 +2501,31 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
       sm120_nvfp4_qkv_online_register_q_stage_kernel<kOutputGroupSpan>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(
       stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  const bool direct_single_split = num_splits == 1;
+  __nv_bfloat16* stage_out = direct_single_split
+                                 ? reinterpret_cast<__nv_bfloat16*>(
+                                       out.data_ptr<at::BFloat16>())
+                                 : reinterpret_cast<__nv_bfloat16*>(
+                                       partial.data_ptr<at::BFloat16>());
+  float* stage_split_m =
+      direct_single_split ? nullptr : split_m.data_ptr<float>();
+  float* stage_split_l =
+      direct_single_split ? nullptr : split_l.data_ptr<float>();
+  const int stage_output_stride = q_rows * head_dim;
   stage_kernel<<<dim3(q_rows / kCutlassTileM,
                       head_dim / (kOutputGroupSpan * kCutlassTileN),
                       num_splits),
                  kSm120Nvfp4FmhaThreadCount, kSmemBytes,
                  at::cuda::getCurrentCUDAStream()>>>(
-      qk_params, pv_params,
-      reinterpret_cast<__nv_bfloat16*>(partial.data_ptr<at::BFloat16>()),
+      qk_params, pv_params, stage_out,
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha), 0, 0,
       static_cast<int>(split_kv_tiles), total_kv_tiles, 0, head_dim,
-      split_m.data_ptr<float>(), split_l.data_ptr<float>(), q_rows,
-      q_rows * head_dim);
+      stage_split_m, stage_split_l, q_rows, stage_output_stride);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (direct_single_split) {
+    return;
+  }
 
   constexpr int kThreads = 256;
   sm120_nvfp4_splitkv_combine_kernel<<<q_rows, kThreads, 0,
@@ -2562,25 +2575,11 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
     double pv_alpha,
     int64_t split_kv_tiles,
     int requested_output_group_span) {
-  const int64_t head_dim64 = q_packed.size(1) * 2;
-  const int available_groups = static_cast<int>(head_dim64 / kCutlassTileN);
-  const int span = std::min(requested_output_group_span, available_groups);
-  if (span >= 4) {
-    sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<4>(
-        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
-        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-        split_kv_tiles);
-  } else if (span >= 2) {
-    sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<2>(
-        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
-        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-        split_kv_tiles);
-  } else {
-    sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<1>(
-        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
-        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-        split_kv_tiles);
-  }
+  (void)requested_output_group_span;
+  sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<1>(
+      q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
+      partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
+      split_kv_tiles);
 }
 
 void sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid(

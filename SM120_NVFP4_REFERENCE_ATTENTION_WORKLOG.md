@@ -9234,3 +9234,70 @@ D128 q512/group2/kv1024: finite, cosine 0.991650, min 0.153792 ms
 These files are copied scaffold seeds. They still report the D512-shaped
 `storage_bytes=96256` footprint. The next native-specialization work is to shrink
 the D256/D128 storage and role machinery inside the dedicated files.
+
+## D256 Shape-A First Specialization Pass
+
+Focused the first D256-only pass on Gemma4 Shape A:
+
+```text
+D=256, group=2, kv_len=1024
+q_len in {512, 2048}
+```
+
+Changes:
+
+```text
+1. D256 split-KV wrapper now writes directly to `out` and skips the combine
+   kernel when `num_splits == 1`.
+2. D256 dispatch is locked to output span 1. Span1 is faster than span2/span4
+   for SWA because it exposes more CTAs and avoids over-reuse inside each CTA.
+3. Gemma4 grid harness now uses the D256 span1 path and q-dependent split-KV:
+   q512  -> split_kv_len=128
+   q2048 -> split_kv_len=512
+```
+
+Measured D256 span sweep at `kv=1024`:
+
+```text
+q512:
+  split 1024 -> 0.150240 ms
+  split 512  -> 0.098240 ms
+  split 256  -> 0.070368 ms
+  split 128  -> 0.061888 ms  best
+
+q2048:
+  split 1024 -> 0.149856 ms
+  split 512  -> 0.106272 ms  best
+  split 256  -> 0.132768 ms
+  split 128  -> 0.147776 ms
+```
+
+Updated Shape A comparison:
+
+```text
+q512 / kv1024:
+  sm120_fused D256:       0.061792 ms
+  CUTLASS two-stage:      0.047712 ms
+  FlashInfer NVFP4 FA2:   0.034496 ms
+  FlashInfer FP8 FA2:     0.028992 ms  best
+  FlashInfer BF16:        0.167264 ms
+
+q2048 / kv1024:
+  sm120_fused D256:       0.106528 ms
+  CUTLASS two-stage:      0.048576 ms  best benchmark path
+  FlashInfer NVFP4 FA2:   0.059584 ms
+  FlashInfer FP8 FA2:     0.054016 ms
+  FlashInfer BF16:        0.166112 ms
+```
+
+Interpretation:
+
+```text
+The D256 split-KV/dispatch tuning moved the fused scaffold from ~0.174 ms to:
+  q512  -> ~0.062 ms
+  q2048 -> ~0.106 ms
+
+This is a real D256 improvement, but not enough to beat the existing Shape A
+paths. The remaining gap is still structural: the D256 kernel retains the
+D512-shaped 96 KiB shared-memory footprint and 384-thread role structure.
+```

@@ -180,7 +180,11 @@ def summarize_result(
         }
 
     if kernel == "sm120_fused":
-        key = "bench_sm120_qkv_online_register_q_splitkv_reuse4_full_grid"
+        key = (
+            "bench_sm120_qkv_online_register_q_splitkv_full_grid"
+            if cell.head_dim == 256
+            else "bench_sm120_qkv_online_register_q_splitkv_reuse4_full_grid"
+        )
         bench = data[key]
         return {
             "status": "ok",
@@ -268,6 +272,14 @@ def command_for_kernel(
             return unsupported("current fused kernel requires q_len * group multiple of 128")
         if cell.kv_len % 128 != 0:
             return unsupported("current fused kernel requires kv_len multiple of 128")
+        span_flag = (
+            "--sm120-qkv-online-splitkv-full-grid-bench"
+            if cell.head_dim == 256
+            else "--sm120-qkv-online-splitkv-reuse4-full-grid-bench"
+        )
+        split_kv_len = args.sm120_fused_split_kv_len
+        if cell.shape == "A" and cell.head_dim == 256 and cell.kv_len == 1024:
+            split_kv_len = 128 if cell.q_len <= 512 else 512
         return [
             py,
             str(root / "benchmarks" / "bench_sm120_nvfp4_cutlass_fused_attention.py"),
@@ -280,9 +292,9 @@ def command_for_kernel(
             str(cell.head_dim),
             "--group",
             str(cell.group),
-            "--sm120-qkv-online-splitkv-reuse4-full-grid-bench",
+            span_flag,
             "--split-kv-len",
-            str(args.sm120_fused_split_kv_len),
+            str(split_kv_len),
         ]
 
     if kernel == "cutlass_two_stage":
