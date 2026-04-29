@@ -8880,3 +8880,47 @@ The next production decision should be made against the live vLLM workload
 mix: fraction of time spent in decode-only vs mixed prefill/decode, and the
 batch-size/context distribution at the attention backend boundary.
 ```
+
+## Dense Shape B NVFP4 FA2 Comparison
+
+Measured the missing dense Shape B comparison against NVFP4 FA2 on the same
+single-sequence grid as the SM120 fused kernel.
+
+Command:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 PYTHONUNBUFFERED=1 \
+  /home/josh/tdm/infer/current/.venv/bin/python \
+  benchmarks/bench_gemma4_attention_grid.py \
+  --device 0 --warmup 3 --repeat 10 --timeout-sec 2400 \
+  --shapes B --kernels flashinfer_nvfp4_fa2 \
+  --output-prefix reports/gemma4_grid_shape_b_nvfp4_fa2_dense
+```
+
+Dense Shape B, D512/group8:
+
+```text
+q     kv       SM120 fused ms   NVFP4 FA2 ms   winner       gap
+512   8192     1.447648         1.239360       NVFP4 FA2    1.17x
+512   32768    1.797984         4.702976       SM120 fused  2.62x
+512   131072   7.118656         18.605600      SM120 fused  2.61x
+512   262144   13.558464        37.257439      SM120 fused  2.75x
+2048  8192     1.944448         5.318048       SM120 fused  2.73x
+2048  32768    7.130144         22.368095      SM120 fused  3.14x
+2048  131072   27.215712        89.971970      SM120 fused  3.31x
+2048  262144   52.566303        184.741852     SM120 fused  3.51x
+```
+
+Conclusion:
+
+```text
+The dense Shape B win is real against NVFP4 FA2, not only against FP8 FA2.
+The SM120 fused kernel wins 7/8 dense Shape B cells. The only losing cell is
+q=512, kv=8192, where NVFP4 FA2 is 1.17x faster.
+
+This does not change the known production gaps:
+  - no Shape A D256/group2 specialization
+  - no q<128 decode path
+  - no paged KV integration
+  - no production causal/ragged integration
+```
