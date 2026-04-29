@@ -8994,3 +8994,73 @@ This leaves known D256/D128 specialization headroom:
   - D256-native reuse2 and D128-native reuse1 kernels instead of runtime
     dispatch through the D512-shaped scaffold
 ```
+
+## D128 Full-Context Dense Sweep
+
+The first D128 smoke only covered `kv=1024`, which is not representative for a
+full-attention D128 model. Ran the long-KV dense sweep directly through the
+SM120 fused benchmark because the Gemma4 grid harness maps Shape B to D512 by
+definition.
+
+Command shape:
+
+```bash
+benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py \
+  --device 0 \
+  --q-len {512,2048} \
+  --group 2 \
+  --head-dim 128 \
+  --kv-len {8192,32768,131072,262144} \
+  --split-kv-len 6656 \
+  --warmup 2 --repeat 5 \
+  --sm120-qkv-online-splitkv-reuse4-full-grid-bench
+```
+
+D128/group2 dense full-context results:
+
+```text
+q     kv       min_ms    mean_ms   cosine    mean_abs       splits
+512   8192     0.752576  0.755827  0.991670  0.000358909    2
+512   32768    0.744288  0.749530  0.991927  0.000163162    5
+512   131072   0.778464  0.780704  0.992852  0.000084713    20
+512   262144   1.540544  1.545267  0.989608  0.000060659    40
+2048  8192     0.734016  0.737984  0.991690  0.000358841    2
+2048  32768    0.781024  0.783661  0.991925  0.000162758    5
+2048  131072   2.992704  2.998445  0.992812  0.000084998    20
+2048  262144   5.319200  5.329664  0.989474  0.000060928    40
+```
+
+Interpretation:
+
+```text
+D128 now runs at long KV and preserves the same approximate correctness band as
+the D256/D512 bring-up: finite output and cosine around 0.99 against the
+first-tile exact reference.
+
+The q=512 times are nearly flat from 8K through 131K because split-KV exposes
+enough CTA parallelism to keep the work near one SM wave:
+  q_rows = 512 * group2 = 1024
+  q_tiles = 1024 / 128 = 8
+  splits at 131K = 20
+  CTAs = 8 * 20 = 160, still below 188 SMs
+
+At 262K:
+  splits = 40
+  CTAs = 8 * 40 = 320
+  this becomes roughly two waves, and wall time roughly doubles.
+
+For q=2048:
+  q_rows = 4096
+  q_tiles = 32
+  CTAs at 131K = 32 * 20 = 640
+  CTAs at 262K = 32 * 40 = 1280
+  wall time scales with the additional SM waves.
+```
+
+Remaining caveats:
+
+```text
+This is still dense, non-paged, q>=128 only, and not production causal/ragged
+integration. It also uses group=2 because that matched the D128 smoke shape.
+If a target D128 model has a different GQA group, it needs its own sweep.
+```
