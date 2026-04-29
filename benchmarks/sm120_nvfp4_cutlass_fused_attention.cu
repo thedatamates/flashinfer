@@ -53,7 +53,7 @@ constexpr int kBenchRows = 128;
 constexpr int kBenchQTiles = kBenchRows / kTileM;
 constexpr int kColumnGroups = kHeadDim / (kTileN * kFusedWarpsPerCta);
 constexpr float kProbGlobalScale = 6.0f * 448.0f;
-constexpr float kQkScale = 0.044194173824159216f;  // 1 / sqrt(512)
+constexpr float kQkScale = 0.044194173824159216f;  // legacy fixed D512 path
 
 enum class Sm120Nvfp4FmhaRole : int {
   Softmax0 = 0,
@@ -914,6 +914,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   if (effective_num_kv_tiles <= 0) {
     return;
   }
+  const int qk_head_chunks = 2;
+  const float qk_scale = qk_alpha * rsqrtf(static_cast<float>(out_stride_cols));
   const int effective_out_group_base =
       out_group_idx + int(blockIdx.y) * kOutputGroupSpan;
   __nv_bfloat16* out_split_base =
@@ -1275,15 +1277,23 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   if (is_load) {
     load_q_chunk(0);
     load_k_chunk(effective_kv_tile_start, 0);
-    load_q_chunk(1);
+    if (qk_head_chunks > 1) {
+      load_q_chunk(1);
+    }
     if constexpr (kOutputGroupSpan == 1) {
       load_v_group_span(effective_kv_tile_start);
-      load_k_chunk(effective_kv_tile_start, 1);
+      if (qk_head_chunks > 1) {
+        load_k_chunk(effective_kv_tile_start, 1);
+      }
     } else if constexpr (kOutputGroupSpan == 2) {
-      load_k_chunk(effective_kv_tile_start, 1);
+      if (qk_head_chunks > 1) {
+        load_k_chunk(effective_kv_tile_start, 1);
+      }
       load_v_group_span(effective_kv_tile_start);
     } else {
-      load_k_chunk(effective_kv_tile_start, 1);
+      if (qk_head_chunks > 1) {
+        load_k_chunk(effective_kv_tile_start, 1);
+      }
       load_v_group_range(effective_kv_tile_start, 0, 2);
     }
     qk_collective.load_tail(q_pipeline, q_pipe_write);
@@ -1293,7 +1303,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         if (tile + 1 < effective_num_kv_tiles) {
           const int next_kv_tile = effective_kv_tile_start + tile + 1;
           load_k_chunk(next_kv_tile, 0);
-          load_k_chunk(next_kv_tile, 1);
+          if (qk_head_chunks > 1) {
+            load_k_chunk(next_kv_tile, 1);
+          }
         }
         load_v_group_range(effective_kv_tile_start + tile, 2, 4);
         if (tile + 1 < effective_num_kv_tiles) {
@@ -1305,10 +1317,14 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         if constexpr (kOutputGroupSpan == 1) {
           load_v_group_span(next_kv_tile);
           load_k_chunk(next_kv_tile, 0);
-          load_k_chunk(next_kv_tile, 1);
+          if (qk_head_chunks > 1) {
+            load_k_chunk(next_kv_tile, 1);
+          }
         } else {
           load_k_chunk(next_kv_tile, 0);
-          load_k_chunk(next_kv_tile, 1);
+          if (qk_head_chunks > 1) {
+            load_k_chunk(next_kv_tile, 1);
+          }
           load_v_group_span(next_kv_tile);
         }
       }
@@ -1343,9 +1359,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     cutlass_qk_tma_q_register_stage(
         q_pipeline, q_pipe_read, q_frag0, q_scale_frag0, qk_mma_thread_idx,
         storage.qk_tensors);
-    cutlass_qk_tma_q_register_stage(
-        q_pipeline, q_pipe_read, q_frag1, q_scale_frag1, qk_mma_thread_idx,
-        storage.qk_tensors);
+    if (qk_head_chunks > 1) {
+      cutlass_qk_tma_q_register_stage(
+          q_pipeline, q_pipe_read, q_frag1, q_scale_frag1, qk_mma_thread_idx,
+          storage.qk_tensors);
+    }
     cute::clear(pv_accum0);
     if constexpr (kOutputGroupSpan >= 2) {
       cute::clear(pv_accum1);
@@ -1561,12 +1579,20 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     };
 
     auto wait_p_ready_and_release_k = [&]() {
-      pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
-      pipeline_mma_s0_acquired = true;
-      release_k_chunk();
-      pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
-      pipeline_mma_s1_acquired = true;
-      release_k_chunk();
+      if (qk_head_chunks == 1) {
+        pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
+        pipeline_mma_s0_acquired = true;
+        pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
+        pipeline_mma_s1_acquired = true;
+        release_k_chunk();
+      } else {
+        pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
+        pipeline_mma_s0_acquired = true;
+        release_k_chunk();
+        pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
+        pipeline_mma_s1_acquired = true;
+        release_k_chunk();
+      }
     };
 
     auto acquire_output_stage = [&]() {
@@ -1593,7 +1619,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           qk_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShape{}));
       cute::clear(qk_accum);
       qk_consume_k_stage(q_frag0, q_scale_frag0, qk_accum);
-      qk_consume_k_stage(q_frag1, q_scale_frag1, qk_accum);
+      if (qk_head_chunks > 1) {
+        qk_consume_k_stage(q_frag1, q_scale_frag1, qk_accum);
+      }
 
       auto cC = cute::make_identity_tensor(
           cute::take<0, 2>(CutlassThreadBlockShape{}));
@@ -1603,7 +1631,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const int row = int(cute::get<0>(coord));
         const int col = int(cute::get<1>(coord));
         if (row < kCutlassTileM && col < kCutlassTileN) {
-          const float logit = qk_accum(i) * qk_alpha * kQkScale;
+          const float logit = qk_accum(i) * qk_scale;
           smem_logits_stage[row * kCutlassTileN + col] =
               __float2bfloat16(logit);
         }
@@ -2370,8 +2398,8 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
   const int64_t kv_len64 = k_packed.size(0);
   const int64_t prob_packed_cols64 = kv_len64 / 2;
   const int64_t prob_scale_cols64 = kv_len64 / 16;
-  TORCH_CHECK(head_dim64 == kHeadDim,
-              "Shape B fused wrapper currently supports D512 only, got D",
+  TORCH_CHECK(head_dim64 == 128 || head_dim64 == 256 || head_dim64 == 512,
+              "SM120 fused wrapper currently supports D128/D256/D512 only, got D",
               head_dim64);
   TORCH_CHECK(q_rows64 > 0 && q_rows64 % kCutlassTileM == 0,
               "q rows must be a positive multiple of ", kCutlassTileM);
@@ -2515,6 +2543,43 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
       split_kv_tiles);
 }
 
+void sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
+    torch::Tensor q_packed,
+    torch::Tensor q_scales,
+    torch::Tensor k_packed,
+    torch::Tensor k_scales,
+    torch::Tensor v_pv_packed,
+    torch::Tensor v_pv_scales,
+    torch::Tensor partial,
+    torch::Tensor split_m,
+    torch::Tensor split_l,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    double qk_alpha,
+    double pv_alpha,
+    int64_t split_kv_tiles,
+    int requested_output_group_span) {
+  const int64_t head_dim64 = q_packed.size(1) * 2;
+  const int available_groups = static_cast<int>(head_dim64 / kCutlassTileN);
+  const int span = std::min(requested_output_group_span, available_groups);
+  if (span >= 4) {
+    sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<4>(
+        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
+        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
+        split_kv_tiles);
+  } else if (span >= 2) {
+    sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<2>(
+        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
+        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
+        split_kv_tiles);
+  } else {
+    sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<1>(
+        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
+        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
+        split_kv_tiles);
+  }
+}
+
 void sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid(
     torch::Tensor q_packed,
     torch::Tensor q_scales,
@@ -2530,10 +2595,10 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid(
     double qk_alpha,
     double pv_alpha,
     int64_t split_kv_tiles) {
-  sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<2>(
+  sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
       q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
       partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-      split_kv_tiles);
+      split_kv_tiles, 2);
 }
 
 void sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid(
@@ -2551,10 +2616,10 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid(
     double qk_alpha,
     double pv_alpha,
     int64_t split_kv_tiles) {
-  sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<4>(
+  sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
       q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
       partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-      split_kv_tiles);
+      split_kv_tiles, 4);
 }
 
 RunnerConfig runner_config_from_tactic(int64_t tactic) {

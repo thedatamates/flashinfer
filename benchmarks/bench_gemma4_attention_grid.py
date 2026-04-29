@@ -262,12 +262,12 @@ def command_for_kernel(
         str(args.repeat),
     ]
     if kernel == "sm120_fused":
-        if not (
-            cell.shape == "B"
-            and cell.head_dim == 512
-            and cell.group == 8
-        ):
-            return unsupported("current fused kernel supports Shape B D512 group8 only")
+        if cell.head_dim not in (128, 256, 512):
+            return unsupported("current fused kernel supports D128/D256/D512 only")
+        if (cell.q_len * cell.group) % 128 != 0:
+            return unsupported("current fused kernel requires q_len * group multiple of 128")
+        if cell.kv_len % 128 != 0:
+            return unsupported("current fused kernel requires kv_len multiple of 128")
         return [
             py,
             str(root / "benchmarks" / "bench_sm120_nvfp4_cutlass_fused_attention.py"),

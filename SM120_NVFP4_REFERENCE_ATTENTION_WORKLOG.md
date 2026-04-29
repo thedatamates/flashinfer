@@ -8924,3 +8924,73 @@ This does not change the known production gaps:
   - no paged KV integration
   - no production causal/ragged integration
 ```
+
+## Head-Dim Parameterization Bring-Up
+
+Opened the SM120 fused split-KV wrapper and grid harness for head dimensions
+128, 256, and 512.
+
+Implementation notes:
+
+```text
+- The wrapper now accepts D in {128, 256, 512}.
+- The Python benchmark no longer rejects D128/D256.
+- The Gemma4 grid harness now allows sm120_fused for D128/D256/D512 cells.
+- Output-group reuse dispatch degrades by available width:
+    D512 -> reuse4
+    D256 -> reuse2
+    D128 -> reuse1
+- QK scaling is now runtime 1/sqrt(D) instead of fixed 1/sqrt(512).
+```
+
+Important finding:
+
+```text
+The D128/D256 paths are not true one-K-chunk QK paths. The SM120 QK collective
+must keep the existing two-stage QK cadence even when logical head_dim is 128 or
+256. When the one-chunk path was tried, the online softmax stats corrupted:
+split_l became inf and output scale exploded. Keeping two QK stages restores
+correctness.
+```
+
+Smoke results:
+
+```text
+D256 / group2 / kv1024 / q512:
+  mean_abs=0.0009214, max_abs=0.0053578, cosine=0.9898322
+  min_ms=0.181056
+
+D128 / group2 / kv1024 / q512:
+  mean_abs=0.0009627, max_abs=0.0055012, cosine=0.9916502
+  min_ms=0.152352
+
+D128 / group2 / kv1024 / q2048:
+  mean_abs=0.0009659, max_abs=0.0056391, cosine=0.9916368
+  min_ms=0.156704
+
+D512 / group8 / kv32768 / q512 regression check:
+  mean_abs=0.0001588, max_abs=0.0007830, cosine=0.9929289
+  min_ms=1.833536
+```
+
+Gemma4 Shape A grid through the generic harness:
+
+```text
+D256 / group2 / kv1024 / q512:  min_ms=0.174208
+D256 / group2 / kv1024 / q2048: min_ms=0.177696
+```
+
+Interpretation:
+
+```text
+The fused kernel now functionally covers D128 and Gemma4 Shape A D256, but this
+is only a correctness/coverage bring-up. It still uses the D512-era 96 KiB
+shared-storage footprint and the same role/pipeline shape.
+
+This leaves known D256/D128 specialization headroom:
+  - compact shared storage instead of the D512 storage footprint
+  - deeper K/V pipelines where smem allows
+  - possible 2 CTAs/SM if register/smem occupancy permits
+  - D256-native reuse2 and D128-native reuse1 kernels instead of runtime
+    dispatch through the D512-shaped scaffold
+```

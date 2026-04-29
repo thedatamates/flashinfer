@@ -230,10 +230,10 @@ def main() -> None:
         or args.sm120_qkv_online_splitkv_reuse2_full_grid_bench
         or args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
     ):
-        if args.head_dim != HEAD_DIM or args.group != GROUP:
+        if args.head_dim not in (128, 256, 512):
             raise ValueError(
-                "current fused Shape B specialization requires --head-dim=512 "
-                "and --group=8"
+                "current fused specialization requires --head-dim in "
+                "{128,256,512}"
             )
         if args.kv_len % 128 != 0:
             raise ValueError("--kv-len must be a multiple of 128")
