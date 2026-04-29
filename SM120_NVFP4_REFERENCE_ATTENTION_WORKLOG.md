@@ -6952,3 +6952,134 @@ full grid first tile:
 full-grid min:
   8.3033 ms
 ```
+
+## Rejected: SM100 Role Register Reconfiguration
+
+2026-04-28T23:42:00-05:00
+
+Tried porting the SM100 role-level register schedule from
+`sm100_fmha_fwd_kernel_tma_warpspecialized.hpp`:
+
+```text
+Softmax0/Softmax1: 192 regs
+Correction:         64 regs
+MMA:               192 regs on SM120, not SM100's 64, because SM120 keeps
+                   Q fragments and O accumulators in registers instead of TMEM
+Load/Epilogue:      64 regs
+```
+
+The first version added two Empty warps to complete the final warpgroup and
+called `setmaxnreg` inside each role branch. It compiled and the role schedule
+smoke passed, but the online correctness gate timed out. The likely cause was
+divergent `setmaxnreg.sync.aligned` use in the mixed final warpgroup.
+
+The second version moved the calls to one warpgroup-uniform site and gave the
+mixed Load/Epilogue/Empty warpgroup a single 64-register budget. It also
+compiled and the role schedule smoke passed:
+
+```text
+role_warp_counts:
+  softmax0=4, softmax1=4, correction=4, mma=8, load=1, epilogue=1, empty=2
+total_threads=768
+```
+
+but the online correctness gate still timed out.
+
+Decision:
+
+```text
+Rejected and reverted. The SM100 register-donation mechanism is not a safe
+drop-in port for this SM120 no-TMEM benchmark kernel. SM100's MMA/Load/Epilogue
+roles all use a low "other" register budget because O lives in TMEM; this SM120
+kernel keeps Q and O accumulator state in registers. Completing the final
+warpgroup and applying setmaxnreg changes synchronization/runtime behavior
+enough to hang before correctness. Do not retry this as a tuning knob unless the
+SM120 kernel is first restructured around a warpgroup layout where every
+setmaxnreg call is both warpgroup-uniform and matched to the real per-role
+register lifetimes.
+```
+
+## Port: Softmax Probability Alias + SM120 Epilogue Substitution
+
+2026-04-29T00:28:00-05:00
+
+Ported the next softmax/epilogue structural slice while preserving the
+role-owned dataflow:
+
+```text
+Softmax role:
+  before:
+    pass 1: read logits, compute tile max
+    pass 2: read logits, compute exp/tile sum and P scales
+    barrier
+    helper pass: read logits again, compute exp again, write NVFP4 P via CUTLASS partition_D
+
+  after:
+    pass 1: read logits, compute tile max
+    pass 2: compute scaled probabilities once, overwrite the S/logits SMEM
+            region with BF16 probabilities, write P scales
+    barrier
+    helper pass: read BF16 probabilities, write NVFP4 P via CUTLASS partition_D
+```
+
+This keeps the CUTLASS `partition_D` producer convention for the actual NVFP4 P
+tile. The rejected direct row-owner variant wrote `p_sA(row, col)` with scalar
+nibble stores; it preserved correctness but regressed full-grid time to
+~8.36 ms. The kept alias version avoids the second exp pass without abandoning
+the vectorized/partitioned producer mapping.
+
+Ported the SM120 epilogue substitution:
+
+```text
+SM100:
+  Correction role reads O from TMEM, rescales by final row sum, writes epilogue SMEM.
+
+SM120:
+  no TMEM exists, so O lives in MMA registers.
+  MMA applies final row normalization before writing epilogue SMEM.
+  Epilogue remains the only role that writes global output.
+```
+
+After this, the old Correction role had no work. Removed it from the active
+schedule and deleted the unused MMA->Correction pipeline storage:
+
+```text
+old active schedule:
+  softmax0=4, softmax1=4, correction=4, mma=8, load=1, epilogue=1
+  total_threads=704
+
+new active schedule:
+  softmax0=4, softmax1=4, correction=0, mma=8, load=1, epilogue=1
+  total_threads=576
+```
+
+Validation:
+
+```text
+role schedule smoke:
+  softmax0=4, softmax1=4, correction=0, mma=8, load=1, epilogue=1
+  total_warps=18, total_threads=576
+
+online kv_tiles=16:
+  finite, mean_abs=0.000649069, max_abs=0.00317944, cosine=0.988839
+
+full grid first tile:
+  finite, mean_abs=0.000155417, max_abs=0.000869478, cosine=0.992919
+
+full-grid min:
+  cleanup baseline:                         8.3033 ms
+  BF16 probability alias only:              8.3025 ms
+  final normalization in MMA regs:          8.2831 ms
+  compacted no-correction role schedule:    7.6612 ms
+  compacted schedule, repeat=20:             7.6561 ms
+```
+
+Conclusion:
+
+```text
+The SM120 no-TMEM substitution should not preserve an empty Correction role.
+Once final normalization moves to the MMA register drain, compacting the role
+schedule is the real win. This is still far from the two-stage CUTLASS ceiling,
+so the next work must attack per-tile QK/PV/softmax overlap and P/O storage
+lifetime, not split-KV parallelism.
+```
