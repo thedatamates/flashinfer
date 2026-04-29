@@ -894,6 +894,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   const int effective_split_idx = int(blockIdx.z);
   const int effective_kv_tile_start =
       kv_tile_start + effective_split_idx * num_kv_tiles;
+  constexpr int kTotalKvTiles = kKvLen / kCutlassTileN;
+  const int remaining_kv_tiles = kTotalKvTiles - effective_kv_tile_start;
+  const int effective_num_kv_tiles =
+      remaining_kv_tiles < num_kv_tiles ? remaining_kv_tiles : num_kv_tiles;
+  if (effective_num_kv_tiles <= 0) {
+    return;
+  }
   const int effective_out_group_idx = out_group_idx + int(blockIdx.y);
   __nv_bfloat16* out_split_base =
       out_group + effective_split_idx * split_output_stride_elems;
@@ -1231,8 +1238,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     load_k_chunk(effective_kv_tile_start, 1);
     qk_collective.load_tail(q_pipeline, q_pipe_write);
 
-    for (int tile = 0; tile < num_kv_tiles; ++tile) {
-      if (tile + 1 < num_kv_tiles) {
+    for (int tile = 0; tile < effective_num_kv_tiles; ++tile) {
+      if (tile + 1 < effective_num_kv_tiles) {
         const int next_kv_tile = effective_kv_tile_start + tile + 1;
         load_v_chunk(next_kv_tile);
         load_k_chunk(next_kv_tile, 0);
@@ -1538,7 +1545,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
     };
 
-    for (int tile = 0; tile < num_kv_tiles; ++tile) {
+    for (int tile = 0; tile < effective_num_kv_tiles; ++tile) {
       acquire_score_stages();
       run_qk_tile(tile);
       if (tile > 0) {
@@ -1546,7 +1553,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
       wait_p_ready_and_release_k();
     }
-    run_pv_tile(num_kv_tiles - 1, true);
+    run_pv_tile(effective_num_kv_tiles - 1, true);
   } else if (is_softmax) {
     auto wait_score_stage = [&]() {
       if (is_softmax0) {
@@ -1612,7 +1619,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       return tile_l_scaled;
     };
 
-    for (int tile = 0; tile < num_kv_tiles; ++tile) {
+    for (int tile = 0; tile < effective_num_kv_tiles; ++tile) {
       wait_score_stage();
       const __nv_bfloat16* smem_logits_stage =
           (tile & 1) == 0 ? smem_logits0 : smem_logits1;
@@ -1637,7 +1644,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         running_l = running_l * old_scale + tile_l_scaled;
         running_m = next_m;
         storage.old_scale_stage[tile & 1][owned_row] = old_scale;
-        if (tile == num_kv_tiles - 1) {
+        if (tile == effective_num_kv_tiles - 1) {
           storage.global_m[owned_row] = running_m;
           storage.global_l[owned_row] = running_l;
         }
@@ -2235,10 +2242,9 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
                   torch::IntArrayRef({kHeadDim, kProbScaleCols}),
               "v_pv_scales must have shape [512, 2048]");
   TORCH_CHECK(split_kv_tiles > 0, "split_kv_tiles must be positive");
-  TORCH_CHECK((kKvLen / kCutlassTileN) % split_kv_tiles == 0,
-              "split_kv_tiles must divide the total KV tile count");
   const int num_splits =
-      static_cast<int>((kKvLen / kCutlassTileN) / split_kv_tiles);
+      static_cast<int>(((kKvLen / kCutlassTileN) + split_kv_tiles - 1) /
+                       split_kv_tiles);
   TORCH_CHECK(partial.sizes() ==
                   torch::IntArrayRef({num_splits, kQRows, kHeadDim}),
               "partial must have shape [num_splits, 4096, 512]");

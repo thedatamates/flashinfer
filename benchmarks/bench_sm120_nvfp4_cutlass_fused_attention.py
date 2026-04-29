@@ -428,9 +428,9 @@ def main() -> None:
             tactic,
         ) = cutlass_qk_inputs()
         v_ref_f32, v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = cutlass_v_inputs()
-        if 32768 % args.split_kv_len != 0 or args.split_kv_len % 128 != 0:
-            raise ValueError("--split-kv-len must be a multiple of 128 and divide 32768")
-        num_splits = 32768 // args.split_kv_len
+        if args.split_kv_len <= 0 or args.split_kv_len % 128 != 0:
+            raise ValueError("--split-kv-len must be a positive multiple of 128")
+        num_splits = (32768 + args.split_kv_len - 1) // args.split_kv_len
         split_kv_tiles = args.split_kv_len // 128
         out = torch.empty((Q_LEN * GROUP, HEAD_DIM), device=device, dtype=torch.bfloat16)
         partial = torch.empty((num_splits, Q_LEN * GROUP, HEAD_DIM), device=device, dtype=torch.bfloat16)

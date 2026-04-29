@@ -7828,3 +7828,67 @@ still far from the two-stage CUTLASS ceiling, so the next profile should focus
 on remaining per-CTA load stalls, tensor-pipe utilization, and whether local
 spill traffic drops with shorter KV loops.
 ```
+
+## Profile And Sweep: Dynamic Split-KV
+
+2026-04-28T23:38:00-05:00
+
+Relaxed split-KV so `split_kv_len` no longer has to divide 32768 exactly. The
+last split now handles the remaining KV tiles. This allows testing split counts
+that better match the 188-SM wave geometry.
+
+Nsight Compute on the 4-way 8192-token split stage:
+
+```text
+report:                         reports/sm120_nvfp4_splitkv_8192_stage.ncu-rep
+grid size:                      512 CTAs
+waves/SM:                       2.72
+registers/thread:               128
+stack size:                     1888 bytes
+local memory spilling requests: 0
+issue slots busy:               ~10.1%
+SM busy:                        ~13.1%
+memory throughput:              ~142-144 GB/s
+mem busy:                       ~60%
+eligible warps/scheduler:       0.13
+active warps/scheduler:         3.49
+warp cycles/issued inst:        ~30.6
+top stalls:                     sleep/yield/block ~43%, long scoreboard ~30%
+```
+
+Key conclusion:
+
+```text
+Split-KV eliminated the local-memory spill traffic. The remaining bottleneck is
+not spill; it is low eligible-warp rate plus load/scoreboard stalls and role
+pipeline waiting. The grid tail is visible but not the dominant lever by itself.
+```
+
+Uneven split sweep:
+
+```text
+split_kv_len=11008  splits=3   min_ms=3.8613
+split_kv_len=6656   splits=5   min_ms=3.3024
+split_kv_len=5504   splits=6   min_ms=3.4023
+split_kv_len=4736   splits=7   min_ms=3.0971
+split_kv_len=3712   splits=9   min_ms=3.2950
+split_kv_len=3328   splits=10  min_ms=3.1482
+```
+
+Checkpoint rerun for the best uneven split:
+
+```text
+split-KV full-grid, split_kv_len=4736, splits=7, repeat=20:
+  finite, mean_abs=0.000158890, max_abs=0.000776978, cosine=0.992912
+  min_ms=3.0958, mean_ms=3.1071
+```
+
+Decision:
+
+```text
+Keep dynamic split-KV support. The best measured split is currently 7-way at
+4736 tokens, only modestly ahead of the 4-way split. The next performance work
+should target per-CTA stall sources: sleep/wait-heavy role sequencing, long
+scoreboard from load staging, and tensor-pipe starvation. Further split-count
+tuning alone is not enough to reach the two-stage CUTLASS ceiling.
+```
