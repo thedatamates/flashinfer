@@ -842,14 +842,16 @@ __device__ __forceinline__ void sm120_stage_o_fragment_to_epilogue_smem(
     CoordTensor const& coords,
     __nv_bfloat16* smem_o,
     const float* global_l,
-    float pv_base_scale) {
+    float pv_base_scale,
+    bool normalize_by_l) {
   for (int i = 0; i < int(cute::size(accum)); ++i) {
     auto coord = coords(i);
     const int row = int(cute::get<0>(coord));
     const int col = int(cute::get<1>(coord));
     if (row < kCutlassTileM && col < kCutlassTileN) {
+      const float norm = normalize_by_l ? fmaxf(global_l[row], 1.0e-20f) : 1.0f;
       const float row_scale =
-          pv_base_scale / fmaxf(global_l[row], 1.0e-20f);
+          pv_base_scale / norm;
       smem_o[row * kCutlassTileN + col] =
           __float2bfloat16(accum(i) * row_scale);
     }
@@ -1540,7 +1542,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const float pv_base_scale = pv_alpha / kProbGlobalScale;
         sm120_stage_o_fragment_to_epilogue_smem(
             pv_accum, pv_tCcC, smem_epilogue_o, storage.global_l,
-            pv_base_scale);
+            pv_base_scale, split_m == nullptr);
         commit_output_stage(true);
       }
     };
@@ -1703,10 +1705,10 @@ __global__ void sm120_nvfp4_splitkv_combine_kernel(
 #pragma unroll 1
   for (int split = 0; split < num_splits; ++split) {
     const int stats_idx = split * kQRows + row;
-    const float weight = __expf(split_m[stats_idx] - global_m) *
-                         split_l[stats_idx];
+    const float correction = __expf(split_m[stats_idx] - global_m);
+    const float weight = correction * split_l[stats_idx];
     const int partial_idx = split * kQRows * kHeadDim + row * kHeadDim + col;
-    acc += weight * __bfloat162float(partial[partial_idx]);
+    acc += correction * __bfloat162float(partial[partial_idx]);
     global_l += weight;
   }
 

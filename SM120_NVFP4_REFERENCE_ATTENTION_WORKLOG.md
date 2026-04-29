@@ -7892,3 +7892,47 @@ should target per-CTA stall sources: sleep/wait-heavy role sequencing, long
 scoreboard from load staging, and tensor-pipe starvation. Further split-count
 tuning alone is not enough to reach the two-stage CUTLASS ceiling.
 ```
+
+## Win: Unnormalized Split-KV Partials
+
+2026-04-28T23:47:00-05:00
+
+Changed split-KV partial output from locally normalized `O_s` to unnormalized
+partial accumulators:
+
+```text
+before stage:
+  partial_s = acc_s * pv_base_scale / l_s
+
+before combine:
+  out = sum_s exp(m_s - M) * l_s * partial_s / L
+
+after stage:
+  partial_s = acc_s * pv_base_scale
+
+after combine:
+  out = sum_s exp(m_s - M) * partial_s / L
+```
+
+This preserves the same online-softmax merge math while removing one per-output
+division in the split stage and one multiply by `l_s` on the combine numerator.
+
+Results:
+
+```text
+split_kv_len=4736, splits=7:
+  before: min_ms=3.0958, mean_ms=3.1071
+  after:  min_ms=3.0764, mean_ms=3.0867
+  correctness: finite, mean_abs=0.000158847, max_abs=0.000777204,
+               cosine=0.992912
+
+split_kv_len=8192, splits=4:
+  after: min_ms=3.0995, mean_ms=3.1195
+```
+
+Decision:
+
+```text
+Keep unnormalized split partials. The win is small but consistent, and the
+7-way split remains the best measured point.
+```
