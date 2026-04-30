@@ -9422,3 +9422,2014 @@ expanded matrix, not from Gemma4 group2 alone. The baseline says the generic
 D256 scaffold still carries too much D512-era overhead across the broader
 group surface.
 ```
+
+## D256 Active Hillclimb Surface Narrowed
+
+The D256 hillclimb surface is now narrowed to the high-q, high-context cells
+that match the large-batch operating envelope we care about next:
+
+```text
+q_len:  {2048, 4096, 8192, 16384, 32768}
+kv_len: {16384, 32768, 65536, 131072, 262144}
+group:  {2, 4, 6, 8}
+```
+
+Dropped from the active optimization loop:
+
+```text
+q_len < 2048
+kv_len < 16384
+group: {12, 16}
+```
+
+Group 2 is retained because it is the Gemma4 D256 sliding-attention shape.
+Groups 4, 6, and 8 remain in the active loop because the broader D256 surface
+showed better long-context scaling at higher GQA group sizes.
+
+Current harness default:
+
+```text
+benchmarks/bench_sm120_d256_hillclimb.py
+  DEFAULT_Q_LENS  = (2048, 4096, 8192, 16384, 32768)
+  DEFAULT_KV_LENS = (16384, 32768, 65536, 131072, 262144)
+  DEFAULT_GROUPS  = (2, 4, 6, 8)
+```
+
+## Rejected Baseline: FlashInfer FMHA v2 For NVFP4 Gate
+
+The hillclimb gate remains `nvfp4_fa2`, not FlashInfer FMHA v2.
+
+Reason from the vLLM dispatch path in `worktrees/vllm-nvfp4-kv`:
+
+```text
+vllm/platforms/cuda.py
+  SM120/SM121 prioritizes the FlashInfer attention backend.
+
+vllm/v1/attention/backends/flashinfer.py
+  _get_prefill_wrapper() constructs BatchPrefillWithPagedKVCacheWrapper(...,
+  backend="auto") for the native FlashInfer path.
+
+  _can_use_fmha_v2_prefill() rejects quantized KV because it requires
+  self.cache_dtype == "auto".
+
+  The FMHA v2 direct prefill branch later asserts not self.is_kvcache_nvfp4.
+```
+
+So for NVFP4 KV cache on SM120, the production path is the FlashInfer wrapper
+auto path, which resolves to the FA2-style NVFP4 implementation. FMHA v2 is not
+the decision gate for this hillclimb.
+
+Smoke timing on D256 group=2 q=2048 kv=16384 also confirms FMHA v2 is not a
+hidden fast baseline:
+
+```text
+flashinfer_nvfp4_fmha_v2: 5.696 ms
+nvfp4_fa2:                0.539 ms
+```
+
+The FMHA v2 column was removed from the default D256 hillclimb harness after
+this check. Keep `nvfp4_fa2` as the primary gate.
+
+## SM120f Build And Native MMA Verification
+
+The D256 fused attention benchmark extension is compiled with CUDA 13.2 and
+SM120 family-conditional codegen:
+
+```text
+build.ninja:
+  nvcc = /usr/local/cuda-13.2/bin/nvcc
+  -gencode=arch=compute_120f,code=sm_120f
+```
+
+The torch extension cache directory is still named `py312_cu130` because the
+PyTorch wheel is CUDA 13.0, but the actual extension build uses CUDA 13.2 for
+headers, nvcc, link flags, and the SM120f gencode.
+
+`cuobjdump --list-elf` labels the emitted cubin as `sm_120`, but the SASS
+contains the native scaled FP4 tensor-core path:
+
+```text
+OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X
+```
+
+This means the active D256 fused kernel is not falling back to a software
+dequant + BF16 MMA path. The remaining D256 gap against `nvfp4_fa2` is a kernel
+structure / scheduling / occupancy issue, not a missing SM120f codegen issue.
+
+FlashInfer JIT cache check:
+
+```text
+0.6.9/120f/.../batch_prefill_dtype_q_bf16_dtype_kv_u8...D256/build.ninja:
+  cuda_home = /usr/local/cuda-13.2
+  -gencode=arch=compute_120f,code=sm_120f
+
+0.6.9/120a/.../batch_prefill_dtype_q_bf16_dtype_kv_u8...D256/build.ninja:
+  cuda_home = /usr/local/cuda-13.0
+  -gencode=arch=compute_120a,code=sm_120a
+```
+
+Both cache families exist on disk from different phases of the project. The
+D256 hillclimb harness now sets `CUDA_HOME=/usr/local/cuda-13.2`,
+`TORCH_CUDA_ARCH_LIST=12.0f`, and `FLASHINFER_CUDA_ARCH_LIST=12.0f`, so future
+baseline runs target the 0.6.9/120f artifact explicitly. Old 120a reports
+should not be compared against current 120f fused runs without labeling the
+architecture target.
+
+## D256 Hillclimb Procedure: Structural Wins First
+
+The first broad D256 baseline sweep was intentionally useful but too expensive
+for the inner loop. It also exposed a harness bug: results were buffered in
+memory and only written at the end, so the final heavy-cell failure destroyed
+the final report. The harness now appends every completed row to JSONL/CSV
+immediately and rewrites summary Markdown/CSV after each row. Failed cells are
+recorded as `status=error` rows instead of losing the run.
+
+Baseline failure to remember:
+
+```text
+D=256, group=8, q=32768, kv=262144, split_kv_len=6656, span=1
+sm120_fused: illegal memory access during cuda synchronize
+```
+
+This is a fused-kernel extreme-shape bug, not a baseline FA2 failure. It should
+be debugged when that shape becomes an active target, but it should not block
+the D256 structural hillclimb.
+
+Inner-loop policy:
+
+```text
+Do not run the full grid after every feature.
+Use 1-2 focused cells for each structural change, then run the broader grid only
+at checkpoints.
+```
+
+Focused cells for the next D256 phase are now group=6 only. This is the active
+online/offline D256 operating surface:
+
+```text
+q=8192:
+  kv={16384, 32768, 65536, 131072, 262144}
+  Regime: online vLLM default, mid through max context.
+
+q=16384:
+  kv={16384, 32768, 65536, 131072, 262144}
+  Regime: offline / 16K setting, mid through max context.
+
+q=32768:
+  kv={32768, 65536, 131072, 262144}
+  Regime: high-throughput offline, longer through max context.
+
+Optional extreme safety cell:
+  group=8, q=32768, kv=262144
+  Reason: currently triggers illegal memory access. This is not part of the
+  active group=6 hillclimb; run it only when checking indexing/workspace fixes.
+```
+
+Structural priority order:
+
+```text
+1. D256-native reuse2 kernel.
+   D256 is exactly 2 x 128 output groups, so reuse2 is the natural shape. Remove
+   D512/reuse4 assumptions rather than only selecting span2 at dispatch.
+
+2. Reduce shared-memory footprint toward <64 KiB.
+   Current D256 path still carries D512-era storage. The goal is to unlock
+   either 2 CTAs/SM or K/V pipeline depth 3.
+
+3. K/V pipeline depth 3.
+   Only after the smem reduction. If D256 cannot fit depth 3, the smem cleanup
+   is incomplete.
+
+4. Occupancy target / 2 CTAs per SM.
+   Use NCU on the worst focused cell after steps 1-3. If eligible warps and
+   issue-slot busy are still low, prefer occupancy even if it sacrifices some
+   reuse.
+
+5. Shape-dependent dispatch policy.
+   group=2 may prefer a low-overhead path; group=4/6/8 may prefer reuse2 and
+   deeper split-KV. Dispatch policy comes after the native variants exist.
+```
+
+Per-change loop:
+
+```text
+1. Run focused cells only.
+2. Record min_ms, cosine, and nvfp4_fa2 speedup.
+3. NCU the worst focused cell if the result does not explain itself.
+4. Keep the change only if correctness holds and at least one target cell moves
+   materially without unacceptable regressions.
+5. Write one worklog entry after the structural change lands.
+6. Run the broader grid only at checkpoints, not after every edit.
+```
+
+## D256 Group=6 Focus Baseline
+
+Baseline reports:
+
+```text
+reports/d256_group6_focus_baseline_20260429.{jsonl,csv,summary.csv,md}
+reports/d256_group6_focus_q32768_baseline_20260429.{jsonl,csv,summary.csv,md}
+```
+
+These runs use CUDA 13.2 / SM120f and stream each completed row to disk. They
+cover the active D256 group=6 focus surface:
+
+```text
+q=8192,  kv={16384, 32768, 65536, 131072, 262144}
+q=16384, kv={16384, 32768, 65536, 131072, 262144}
+q=32768, kv={32768, 65536, 131072, 262144}
+```
+
+Baseline result:
+
+```text
+q      kv      fused_ms  nvfp4_fa2_ms  fp8_fa2_ms  bf16_fa2_ms  nvfp4/fused  cosine
+8192   16384   7.844     5.022         4.459       3.044        0.64x        0.9907
+8192   32768   15.474    11.639        10.353      7.072        0.75x        0.9935
+8192   65536   30.573    24.883        22.051      15.077       0.81x        0.9899
+8192   131072  60.693    51.536        45.748      31.585       0.85x        0.9884
+8192   262144  125.529   105.270       95.692      67.072       0.84x        0.9910
+16384  16384   15.494    6.205         5.493       3.744        0.40x        0.9903
+16384  32768   30.721    18.301        16.263      11.065       0.60x        0.9906
+16384  65536   60.732    42.675        37.991      25.733       0.70x        0.9903
+16384  131072  127.497   93.650        83.637      55.857       0.73x        0.9912
+16384  262144  263.427   199.966       180.254     121.975      0.76x        0.9914
+32768  32768   60.892    23.579        20.990      14.246       0.39x        0.9908
+32768  65536   125.690   70.974        62.952      42.296       0.56x        0.9923
+32768  131072  259.593   173.700       156.151     103.531      0.67x        0.9911
+32768  262144  525.793   376.761       338.681     230.227      0.72x        0.9915
+```
+
+Interpretation:
+
+```text
+The D256 fused path is correct but loses to nvfp4_fa2 on every active group=6
+cell. The gap is worst at high-q / shorter-kv cells and narrows as kv grows.
+This points at D512-era reuse/occupancy structure and launch/CTA scheduling
+overheads, not missing native FP4 tensor-core codegen.
+
+Next lever: measure D256 reuse2/span2 on the same focused cells. D=256 maps
+naturally to two 128-column output groups, so this is the first structural
+check before deeper smem/pipeline edits.
+```
+
+## D256 Group=6 Span2 Lever Result
+
+Reports:
+
+```text
+reports/d256_group6_focus_span2_fused_20260429.{jsonl,csv,summary.csv,md}
+reports/d256_group6_focus_q32768_span2_fused_20260429.{jsonl,csv,summary.csv,md}
+```
+
+The span2 path is the existing D256 `requested_output_group_span=2` dispatch.
+It is not yet a fully native D256 storage/pipeline rewrite, but it changes the
+output-group reuse structure from span1 to the D=256-natural two 128-column
+groups.
+
+Result:
+
+```text
+q      kv      span1_ms  span2_ms  span2/span1  nvfp4_fa2_ms  nvfp4/span2  cosine
+8192   16384   7.844     5.181     0.66x        5.022         0.97x        0.9907
+8192   32768   15.474    10.234    0.66x        11.639        1.14x        0.9935
+8192   65536   30.573    19.964    0.65x        24.883        1.25x        0.9899
+8192   131072  60.693    39.811    0.66x        51.536        1.29x        0.9884
+8192   262144  125.529   83.543    0.67x        105.270       1.26x        0.9910
+16384  16384   15.494    10.310    0.67x        6.205         0.60x        0.9903
+16384  32768   30.721    20.276    0.66x        18.301        0.90x        0.9906
+16384  65536   60.732    40.613    0.67x        42.675        1.05x        0.9903
+16384  131072  127.497   84.186    0.66x        93.650        1.11x        0.9912
+16384  262144  263.427   176.612   0.67x        199.966       1.13x        0.9914
+32768  32768   60.892    40.270    0.66x        23.579        0.59x        0.9908
+32768  65536   125.690   83.759    0.67x        70.974        0.85x        0.9923
+32768  131072  259.593   175.252   0.68x        173.700       0.99x        0.9911
+32768  262144  525.793   355.971   0.68x        376.761       1.06x        0.9915
+```
+
+Interpretation:
+
+```text
+Span2 is a real structural win: 32-35% wall-time reduction on every focused
+cell with unchanged correctness. It turns q=8192 into a mostly winning surface
+and wins long-context cells at q=16384/q=32768, but short and mid-kv high-q
+cells still lose badly.
+
+The remaining worst cell is q=32768, kv=32768, group=6:
+  span2 fused: 40.270 ms
+  nvfp4_fa2:   23.579 ms
+  gap:         nvfp4_fa2/span2 = 0.59x
+
+Next diagnostic target: NCU this span2 worst cell. The likely bottleneck is
+still occupancy/scheduler pressure from D512-era storage and role structure,
+not output-group reuse. The next implementation lever should be selected from
+the profile, with smem-footprint reduction toward <64 KiB and 2 CTAs/SM as the
+primary candidate.
+```
+
+## D256 Group=6 Span2 NCU: Worst Focus Cell
+
+Profile report:
+
+```text
+reports/ncu_d256_g6_q32768_kv32768_span2_20260429.ncu-rep
+reports/ncu_d256_g6_q32768_kv32768_span2_20260429.details.txt
+```
+
+Profiled cell:
+
+```text
+D=256, group=6, q=32768, kv=32768, span2, split_kv_len=6656
+```
+
+Key NCU counters:
+
+```text
+dynamic shared memory per block:   96256 B
+registers/thread:                  168
+theoretical occupancy:             25%
+achieved occupancy:                24.73%
+active warps/scheduler:            2.98
+eligible warps/scheduler:          0.19
+issued warp/scheduler:             0.16
+issue slots busy:                  15.71%
+SM busy:                           16.76%
+tensor pipe active:                16.76%
+mem busy:                          73.48%
+max bandwidth:                     69.09%
+local memory spilling requests:    0
+shared memory spilling requests:   0
+top stalls:
+  long scoreboard:                 5.54 cycles/issued inst
+  sleeping:                        4.25
+  wait:                            2.22
+  short scoreboard:                1.94
+  barrier:                         0.45
+```
+
+Interpretation:
+
+```text
+The kernel is not spilling. Barrier stalls are no longer the headline for this
+cell. The active problem is low eligibility from one CTA/SM plus memory-wait
+behavior: 96 KiB smem forces 25% theoretical occupancy, leaving only 0.19
+eligible warps/scheduler and 15.7% issue-slot busy.
+
+The previous "<64 KiB" target is insufficient for 2 CTAs/SM on this RTX PRO
+6000, because the SM reports ~100 KiB usable shared memory. A true 2-CTA target
+requires roughly <=50 KiB dynamic shared memory per CTA after driver overhead.
+
+Current storage breakdown from metadata:
+  qk tensor storage:                73728 B
+  q/k pipeline overhead included:   qk load collective = 74752 B
+  v stage sidecar + pipelines:      total qkv storage = 96256 B
+  qk_smem_A:                        32768 B
+  qk_smem_B:                        32768 B
+  qk_smem_SFA/SFB:                  4096 B each
+  PV P stage:                       16384 B
+  two compact P stages:             32768 B
+
+Next structural lever is not another span/threshold sweep. It is a native D256
+storage rewrite aimed at 2 CTAs/SM:
+  - reduce Q tile height from 128 to 64,
+  - use the D256-natural K128 QK mainloop chunks,
+  - shrink/serialize the P staging so it fits the smaller QK A/SFA storage,
+  - keep span2 as the D256 output-group policy.
+
+This may sacrifice some QK/PV overlap, but the profile says the larger lever is
+warp eligibility/occupancy. Keep the change only if the focused cells improve
+and correctness stays intact.
+```
+
+## D256 Data-Movement Pivot: Manual QK Primitive
+
+The naive M64 `CollectiveBuilder` path was rejected because the SM120
+block-scaled TMA collective owns scale-side layout constraints that are not
+shape-generic under a simple tile-shape swap. The active D256-native direction
+is now:
+
+```text
+Do not use the CUTLASS GEMM collective as the data-movement layer for the
+native D256 path.
+
+Keep:
+  SM120 block-scaled FP4 MMA atom
+  MMA_Traits fragment layouts
+  row-major NVFP4 + UE4M3 scale semantics
+
+Replace:
+  CUTLASS CollectiveBuilder TensorStorage / TMA sidecar layout
+with:
+  our own compact Q/K/V/P data movement around the atom.
+```
+
+First landed primitive:
+
+```text
+sm120_d256_manual_qk_m64n128
+```
+
+Shape:
+
+```text
+M = 64 Q rows
+N = 128 KV rows
+K = 256 head dim
+8 warps / 256 threads
+one warp computes one or more 16x16 output atoms
+direct fragment construction through cute::MMA_Traits<Fp4MmaAtom>
+no CUTLASS CollectiveBuilder storage
+no TMA collective layout
+no dynamic shared memory
+```
+
+Correctness:
+
+```text
+q=8192, kv=16384, group=6, D=256
+tile (qbase=0,    kvbase=0):    mean_abs=0, max_abs=0, cosine=1.0
+tile (qbase=64,   kvbase=128):  mean_abs=0, max_abs=0, cosine=1.0
+tile (qbase=256,  kvbase=1024): mean_abs=0, max_abs=0, cosine=1.0000001
+tile (qbase=4096, kvbase=8192): mean_abs=0, max_abs=0, cosine=0.9999999
+```
+
+Benchmark:
+
+```text
+bench_manual_qk_m64n128:
+  min_ms:  0.06428799778223038
+  mean_ms: 0.06570666780074437
+  max_ms:  0.06777600198984146
+```
+
+Interpretation:
+
+```text
+The atom-level D256 QK data movement is correct for nonzero Q and KV offsets.
+This is not yet the performance path: it directly constructs fragments from
+global memory and therefore is a correctness/contract primitive. The next layer
+is to put this same fragment mapping behind a compact producer/cache for Q and
+K so the fused mainloop can keep <=50 KiB dynamic shared memory and target
+2 CTAs/SM.
+```
+
+Second landed primitive:
+
+```text
+sm120_d256_manual_pv_m64n128k128
+```
+
+Shape:
+
+```text
+M = 64 P rows
+N = 128 output columns
+K = 128 KV tile columns
+8 warps / 256 threads
+P is the A operand, V^T is the B operand
+direct fragment construction through cute::MMA_Traits<Fp4MmaAtom>
+no CUTLASS CollectiveBuilder storage
+no TMA collective layout
+no dynamic shared memory
+```
+
+Correctness:
+
+```text
+q=8192, kv=16384, group=6, D=256
+tile (p_col=0,    v_kv=0,    out_col=0):   mean_abs=0, max_abs=0, cosine=1.0
+tile (p_col=128,  v_kv=128,  out_col=128): mean_abs=0, max_abs=0, cosine=1.0000001
+tile (p_col=1024, v_kv=1024, out_col=0):   mean_abs=0, max_abs=0, cosine=1.0
+tile (p_col=8192, v_kv=8192, out_col=128): mean_abs=0, max_abs=0, cosine=1.0
+```
+
+Benchmark:
+
+```text
+bench_manual_pv_m64n128k128:
+  min_ms:  0.029440000653266907
+  mean_ms: 0.03041066663960616
+  max_ms:  0.03174399957060814
+```
+
+QK regression check after the PV addition:
+
+```text
+bench_manual_qk_m64n128:
+  mean_abs=0, max_abs=0, cosine=1.0
+  min_ms: 0.06230400130152702
+```
+
+Interpretation:
+
+```text
+Both D256 block-scaled MMA orientations are now validated without the CUTLASS
+load collective:
+
+  QK: A=Q[M,D], B=K[N,D]
+  PV: A=P[M,KV_TILE], B=V^T[D,KV_TILE]
+
+The next milestone is a compact fused tile that uses these contracts in one
+kernel:
+
+  manual QK tile
+  row softmax + P quantization
+  manual PV tile
+
+That fused tile is still a correctness/structure milestone, not the final
+throughput path. The throughput path comes after replacing direct global
+fragment construction with a compact producer/cache that targets <=50 KiB smem
+and 2 CTAs/SM.
+```
+
+First compact manual data-movement primitive:
+
+```text
+sm120_d256_manual_qk_smem_m64n128
+```
+
+Shape:
+
+```text
+M = 64 Q rows
+N = 128 KV rows
+K = 256 head dim
+compact row-major shared-memory staging for Q, K, SFA, and SFB
+same direct SM120 block-scaled MMA atom fragments as the direct QK primitive
+no CUTLASS CollectiveBuilder storage
+```
+
+Correctness:
+
+```text
+q=8192, kv=16384, group=6, D=256
+mean_abs=0, max_abs=0, cosine=1.0
+```
+
+Benchmark:
+
+```text
+direct global-fragment QK min_ms: 0.06230400130152702
+compact-smem QK min_ms:         0.02147199958562851
+speedup:                        2.90x
+```
+
+Interpretation:
+
+```text
+The direct-fragment primitive was a contract test, not a data movement layer.
+Compact manual row-major smem staging immediately gives a ~2.9x QK-tile
+speedup while preserving exactness. This validates the pivot away from
+CollectiveBuilder/TMA scale-side storage for D256 and toward our own compact
+producer/cache around the SM120 FP4 atom.
+
+Next: add the symmetric compact-smem PV primitive, then replace the fused
+tile's direct Q/K/V fragment reads with these compact caches.
+```
+
+Second compact manual data-movement primitive:
+
+```text
+sm120_d256_manual_pv_smem_m64n128k128
+```
+
+Shape:
+
+```text
+M = 64 P rows
+N = 128 output columns
+K = 128 KV tile columns
+compact row-major shared-memory staging for P, V^T, SFA, and SFB
+same direct SM120 block-scaled MMA atom fragments as the direct PV primitive
+no CUTLASS CollectiveBuilder storage
+```
+
+Correctness:
+
+```text
+q=8192, kv=16384, group=6, D=256
+mean_abs=0, max_abs=0, cosine=0.9999999
+```
+
+Benchmark:
+
+```text
+direct global-fragment PV min_ms: 0.029440000653266907
+compact-smem PV min_ms:         0.011008000001311302
+speedup:                        2.67x
+```
+
+Interpretation:
+
+```text
+Both QK and PV now have exact compact manual shared-memory staging around the
+SM120 NVFP4 atom. The immediate fused-tile integration target is:
+
+  compact Q/K staging
+  QK atom
+  row softmax + P quantization in shared memory
+  compact V staging
+  PV atom
+
+This will still be single-tile and single-CTA, but it removes the direct global
+fragment construction path from the fused prototype.
+```
+
+First compact fused tile:
+
+```text
+sm120_d256_manual_fused_tile_smem_m64n128
+```
+
+Shape:
+
+```text
+M = 64 Q/P rows
+N = 128 KV/output columns
+D = 256 for QK
+K = 128 for PV
+dynamic smem = 74240 bytes
+Q, K, V, P, scales, and FP32 logits all staged in compact row-major smem
+```
+
+Correctness:
+
+```text
+vs Python quantized-P reference:
+  mean_abs=0.001456401776522398
+  max_abs=0.011022660881280899
+  cosine=0.9967120289802551
+
+vs exact-P reference:
+  mean_abs=0.0021152817644178867
+  max_abs=0.009820207953453064
+  cosine=0.9949629902839661
+```
+
+Benchmark:
+
+```text
+direct fused tile min_ms:       0.05648000165820122
+compact-smem fused tile min_ms: 0.04265600070357323
+speedup:                       1.32x
+```
+
+Interpretation:
+
+```text
+Replacing direct Q/K/V fragment reads with compact manual smem staging improves
+the fused tile, but the first fused-smem version is still too large for 2 CTAs/SM
+because it keeps K and V resident simultaneously and stores logits as FP32.
+
+Next structural step:
+
+  alias K and V storage because K is dead after QK
+  store logits as BF16 instead of FP32
+
+Expected smem budget:
+
+  q_tile      8192
+  kv_tile    16384  (K first, then V)
+  q_scales   1024
+  kv_scales  2048   (K scales first, then V scales)
+  p_tile     4096
+  p_scales   512
+  logits     16384  (BF16)
+  total      48640 bytes
+
+This crosses the <=50 KiB target needed for 2 CTAs/SM.
+```
+
+Aliased compact fused tile:
+
+```text
+sm120_d256_manual_fused_tile_compact_m64n128
+```
+
+Shape:
+
+```text
+M = 64 Q/P rows
+N = 128 KV/output columns
+D = 256 for QK
+K = 128 for PV
+dynamic smem = 48640 bytes
+K and V share the same compact tile storage
+K scales and V scales share the same sidecar storage
+logits are stored as BF16
+__launch_bounds__(256, 2)
+```
+
+Correctness:
+
+```text
+vs Python quantized-P reference:
+  mean_abs=0.0014686554204672575
+  max_abs=0.009155270643532276
+  cosine=0.9966394901275635
+
+vs BF16-logit exact-P reference:
+  mean_abs=0.002107701962813735
+  max_abs=0.009784484282135963
+  cosine=0.9949572682380676
+```
+
+Benchmark:
+
+```text
+compact-smem fused tile min_ms: 0.04265600070357323
+aliased compact tile min_ms:    0.04451199993491173
+single-tile delta:              -4.3%
+```
+
+Resource usage:
+
+```text
+manual_fused_tile_smem:
+  regs/thread: 210
+  static shared: 1024
+  dynamic shared at launch: 74240
+
+manual_fused_tile_compact:
+  regs/thread: 128
+  stack: 264
+  static shared: 1024
+  dynamic shared at launch: 48640
+```
+
+Interpretation:
+
+```text
+The 48.6 KiB compact variant is slightly slower for a single isolated tile
+because it aliases K/V storage and reloads V after softmax, but it is the first
+variant with both smem and register usage compatible with 2 CTAs/SM. The
+previous 74 KiB variant is a useful correctness/per-tile reference but cannot
+unlock the occupancy lever.
+
+The next production integration step is not another isolated tile tweak. It is
+to move this compact data movement into the D256 split-KV online-softmax grid
+kernel so the full-grid benchmark can test whether the 2-CTA/SM resource shape
+beats the current span2 CollectiveBuilder path.
+```
+
+Manual compact full-grid bridge:
+
+```text
+sm120_d256_manual_compact_splitkv_full_grid
+```
+
+Design:
+
+```text
+one CTA per (q64 tile, kv128 tile)
+the CTA computes both D256 output groups, so QK/softmax/P are reused across
+the two output halves
+each kv128 tile is emitted as one split partial
+the existing split-KV combine kernel merges the split stats/output
+dynamic smem = 48640 bytes
+```
+
+Smoke cell:
+
+```text
+q=512, kv=8192, group=6, D=256
+splits=64
+partial_shape=[64, 3072, 256]
+first tile vs exact:
+  finite=true
+  mean_abs=0.0022063846699893475
+  max_abs=0.009833753108978271
+  cosine=0.9919490218162537
+min_ms=0.733951985836029
+```
+
+Comparison on the same smoke cell:
+
+```text
+current CollectiveBuilder span2 path:
+  split_kv_len=1024
+  splits=8
+  smem=96256 bytes
+  min_ms=0.3556160032749176
+
+manual compact one-tile split path:
+  split_kv_len=128
+  splits=64
+  smem=48640 bytes
+  min_ms=0.733951985836029
+```
+
+Interpretation:
+
+```text
+The 48.6 KiB path gets the intended 2-CTA/SM resource shape, but one split per
+128-token tile creates too much partial-output/combine traffic. It is a valid
+manual data-movement bridge but not competitive yet.
+```
+
+Manual compact online split-KV bridge:
+
+```text
+sm120_d256_manual_compact_online_splitkv_full_grid
+```
+
+Design:
+
+```text
+one CTA per (q64 tile, output128 group, split)
+split_kv_tiles is configurable
+shared BF16 O accumulator stores one output group across the local split loop
+dynamic smem = 65792 bytes
+```
+
+Smoke cell:
+
+```text
+q=512, kv=8192, group=6, D=256
+split_kv_len=1024
+splits=8
+partial_shape=[8, 3072, 256]
+first tile vs exact:
+  finite=true
+  mean_abs=0.0022248162422329187
+  max_abs=0.009922564029693604
+  cosine=0.9918416142463684
+min_ms=1.5099200010299683
+```
+
+Interpretation:
+
+```text
+The online bridge reduces split count by 8x but is slower because it loses the
+2-CTA/SM target and keeps a BF16 O accumulator in shared memory while still
+recomputing QK/softmax per output group. This is the wrong tradeoff as written.
+
+Do not continue optimizing this BF16-O shared-memory online bridge unless a
+profile later shows combine traffic is dominant enough to justify revisiting it.
+The next useful manual-data-movement lever is to keep the 48.6 KiB one-tile
+resource shape and reduce its per-tile cost/partial overhead without adding
+shared O state.
+```
+
+## D256 Manual Compact Split-KV: cp.async Staging
+
+Applied 16-byte `cp.async` staging to the active compact split-KV bridge for:
+
+```text
+Q packed tile
+K packed tile
+Q scale tile
+K scale tile
+V packed tile
+```
+
+V scale staging remains scalar because the compact PV sidecar is 8 bytes per row
+(`N=128 -> 8 scale bytes`). A 16-byte `cp.async` copy there overwrites adjacent
+rows in the compact sidecar layout.
+
+Smoke cell:
+
+```text
+q=512, kv=8192, group=6, D=256
+splits=64
+partial_shape=[64, 3072, 256]
+storage_bytes=48640
+first tile vs exact:
+  finite=true
+  mean_abs=0.0022063846699893475
+  max_abs=0.009833753108978271
+  cosine=0.9919490218162537
+min_ms=0.6721919775009155
+```
+
+Previous compact split-KV time on the same cell:
+
+```text
+sync staging: 0.733951985836029 ms
+cp.async staging: 0.6721919775009155 ms
+win: ~8.4%
+```
+
+Interpretation:
+
+```text
+The manual compact data-movement layer is working and async staging helps, but
+this bridge is still slower than the current span2 online path on the same cell
+(~0.356 ms). The gap is now dominated by split granularity/partial traffic: one
+partial per 128-token tile creates 64 splits at kv=8192. The next structural
+change should preserve the compact 48.6 KiB resource shape while reducing split
+count or carrying online state across multiple 128-token tiles without adding a
+large shared BF16 O accumulator.
+```
+
+## D256 Manual Register-O Split-KV Bridge
+
+Added a manual compact split-KV bridge with register-resident O across local KV
+tiles:
+
+```text
+sm120_d256_manual_compact_register_o_splitkv_full_grid
+```
+
+Initial design:
+
+```text
+one CTA per (q64 tile, split)
+compute both D256 output halves in the CTA
+keep two PV accumulator sets in registers across split_kv_tiles
+emit one partial per split instead of one partial per 128-token KV tile
+```
+
+Smoke cell:
+
+```text
+q=512, kv=8192, group=6, D=256, split_kv_len=1024
+```
+
+Results:
+
+```text
+q64 FP32 O, launch_bounds(256,1): 0.8192639946937561 ms, regs=255
+q32 FP32 O, launch_bounds(256,1): 0.84825599193573 ms,  regs=255
+q32 BF16 O, launch_bounds(256,1): 0.8256319761276245 ms, regs=255
+q32 BF16 O, launch_bounds(256,2): 0.7269120216369629 ms, regs=128, stack=64
+```
+
+Correctness for the best variant:
+
+```text
+finite=true
+mean_abs=0.0022248162422329187
+max_abs=0.009922564029693604
+cosine=0.9918416142463684
+```
+
+Comparison on the same cell:
+
+```text
+manual compact one-tile split path, cp.async: 0.6721919775009155 ms
+current span2 CollectiveBuilder path:        0.35785600543022156 ms
+```
+
+Interpretation:
+
+```text
+Register-resident O removes the 64-way partial split issue, but the naive manual
+mainloop still has too much per-CTA work. Forcing 2 CTAs/SM helps materially
+(0.826 -> 0.727 ms), proving occupancy matters, but the path is still slower
+than the simpler one-tile bridge and much slower than span2.
+
+The register-O implementation is now resource-shaped correctly enough to profile
+(regs=128, smem=49.4 KiB), but it is not yet a winning implementation. The next
+question is whether it behaves better at the real large-q focused cells, where
+more CTA parallelism and lower split count may matter more than on q=512.
+```
+
+## D256 Real-Cell Check: Manual Register-O vs Span2
+
+Focused cell:
+
+```text
+q=8192, kv=16384, group=6, D=256, split_kv_len=1024
+```
+
+Results:
+
+```text
+manual compact register-O split-KV: 18.730911254882812 ms
+current span2 CuTe/CUTLASS path:     6.6702399253845215 ms
+```
+
+Correctness:
+
+```text
+manual register-O cosine: 0.9904744029045105
+span2 cosine:             0.9906792044639587
+```
+
+Conclusion:
+
+```text
+The manual direct-fragment path is not the right base for D256. It has the
+compact smem/resource shape, but it cannot match the existing CuTe/CUTLASS atom
+mainloop. The next D256 structural path is to keep the span2 CuTe atom mainloop
+and replace only the 96 KiB collective data-movement/storage layer with a compact
+manual load layout. In other words: do not keep optimizing the direct manual
+fragment bridge; port the compact data movement into the winning span2 mainloop.
+```
+
+## D256 Span2 Split-KV Length Sweep: Focus Cell
+
+Focused cell:
+
+```text
+q=8192, kv=16384, group=6, D=256
+```
+
+Span2 sweep:
+
+```text
+split_kv_len  splits  min_ms
+1024          16      6.673791885375977
+2048          8       5.821407794952393
+4096          4       5.512832164764404
+5120          4       5.32912015914917
+6144          3       5.382239818572998
+6656          3       5.270304203033447
+7168          3       5.177792072296143
+7680          3       5.457376003265381
+8192          2       5.684703826904297
+8704          2       5.62713623046875
+9728          2       5.515007972717285
+10240         2       5.471776008605957
+11264         2       5.355648040771484
+12288         2       5.242559909820557
+16384         1       6.385087966918945
+```
+
+Interpretation:
+
+```text
+Split policy is a material dispatch lever. The best tested value is 7168 tokens
+for this cell, improving span2 from 6.67 ms to 5.18 ms. That nearly matches the
+nvfp4_fa2 baseline from the focus table (~5.02 ms) but does not beat it.
+
+This does not replace the storage rewrite. It means future focused comparisons
+must use a tuned split length; otherwise the kernel looks worse than it is. The
+remaining gap on short/mid context is still structural: one CTA/SM and memory
+wait from the 96 KiB span2 storage footprint.
+```
+
+## D256 M64 CollectiveBuilder Feasibility Check
+
+Added metadata-only instantiation for:
+
+```text
+Sm120Fp4Tile64x128x256
+```
+
+Compile result: passed.
+
+Metadata:
+
+```text
+mainloop_tensor_storage_bytes:   80896
+mainloop_shared_storage_bytes:   81920
+gemm_kernel_shared_storage:      91136
+score_scratch_bytes:             32768
+p_packed_bytes:                  8192
+p_scales_bytes:                  1024
+row_state_bytes:                 1280
+scaffold_storage_min_bytes:      91392
+sm120 margin:                    9984
+```
+
+Interpretation:
+
+```text
+The M64 CUTLASS collective is feasible but not the storage solution. It still
+uses ~91 KiB shared memory, so it cannot unlock 2 CTAs/SM. The native D256 path
+cannot be just another CollectiveBuilder tile. The next implementation has to
+use CuTe atom/copy primitives with a custom compact storage layout, keeping the
+span2 mainloop structure but not the collective TensorStorage allocation.
+```
+
+## Rejected: SM120 Block-Scaled StageCount<1>
+
+Tried metadata-only instantiation of fixed `StageCount<1>` variants for:
+
+```text
+128x128x256_stage1
+64x128x256_stage1
+```
+
+Compile result: rejected by CUTLASS.
+
+Failure:
+
+```text
+sm120_blockscaled_mma_tma.hpp: static assertion failed:
+"Specialization requires Stages set to value 2 or more."
+```
+
+Interpretation:
+
+```text
+The SM120 block-scaled TMA collective cannot be shrunk to a one-stage
+CollectiveBuilder path. Stage-count reduction is not a viable shortcut to the
+<=50 KiB 2-CTA/SM target. The custom D256 path must either keep the two-stage
+collective storage or bypass the TMA collective with a custom CuTe atom/copy
+loader.
+```
+
+## Harness Default Update
+
+Updated `benchmarks/bench_sm120_d256_hillclimb.py` so the D256 focused harness
+defaults to:
+
+```text
+--fused-output-group-span 2
+```
+
+Reason:
+
+```text
+D=256 has exactly two 128-column output groups. Span2 is the D256-natural fused
+path and measured 32-35% faster than span1 across the focused group=6 surface.
+Leaving the harness default at span1 makes future reports compare against a
+known-stale implementation.
+```
+
+The split length default remains `6656` because the existing NCU/focus reports
+used that value. Per-cell tuned split lengths should still be passed explicitly
+when running short-context focus cells, e.g. `7168` for q=8192/kv=16384/group=6.
+
+## D256 Span2 Split Sweep: Worst Focus Cell
+
+Focused worst cell:
+
+```text
+q=32768, kv=32768, group=6, D=256
+```
+
+Span2 sweep, repeat=1:
+
+```text
+split_kv_len  splits  min_ms
+4096          8       41.82281494140625
+6144          6       41.322975158691406
+6656          5       40.494720458984375
+7168          5       40.394142150878906
+8192          4       40.06790542602539
+12288         3       39.339263916015625
+16384         2       39.26464080810547
+```
+
+Interpretation:
+
+```text
+Unlike the q=8192/kv=16384 short-context cell, split length is not a large lever
+on the worst high-q cell. Moving from 6656 to 16384 improves only ~3.0% and the
+kernel remains far behind nvfp4_fa2 (~23.6 ms from the focus baseline).
+
+This confirms the NCU conclusion: the high-q/mid-kv gap is not primarily split
+combine overhead. It is the one-CTA/SM, 96 KiB-storage, memory-wait regime. The
+next implementation work should target compact CuTe storage / 2-CTA resource
+shape, not further split tuning.
+```
+
+## D256 Compact CuTe Storage Constraint
+
+The D256 span2 path is currently blocked by shared-memory footprint, not by the
+M dimension alone:
+
+```text
+128x128x256 span2 storage: ~96 KiB
+64x128x256 CollectiveBuilder storage: ~91 KiB
+2 CTA/SM target on SM120: <= ~49.5 KiB per CTA, practically <= 48 KiB
+```
+
+Interpretation:
+
+```text
+Halving M only saves the Q-side portion of each staged tile. K, V, and their
+scale sidecars dominate the footprint, and CUTLASS's TMA collective multiplies
+that footprint by at least two stages. The structural storage lever is therefore
+stage count, not M alone.
+```
+
+The failed StageCount<1> experiment localizes the constraint to the TMA
+collective layer:
+
+```text
+sm120_blockscaled_mma_tma.hpp: static assertion failed:
+"Specialization requires Stages set to value 2 or more."
+```
+
+This does not prove the SM120 NVFP4 MMA atom requires two stages. It proves the
+SM120 block-scaled TMA CollectiveBuilder path requires two stages. The next path
+is therefore:
+
+```text
+Use the SM120 block-scaled CuTe MMA/copy atoms and atom-compatible smem layouts,
+but bypass CollectiveBuilder's two-stage TMA storage.
+
+Implementation target:
+  - manual cp.async 16B gmem->smem staging
+  - one-stage K/V data and scale storage
+  - one-stage Q only long enough to copy Q into register fragments
+  - reuse the span2 mainloop structure and CuTe gemm atom calls
+  - <= 48 KiB dynamic smem so the kernel can reach 2 CTAs/SM
+```
+
+The direct manual-fragment compact path proves the footprint is feasible, but it
+is the wrong performance base because it bypasses the CuTe atom/copy layout path.
+The new path must keep CuTe atom fragment/copy conventions while owning the
+storage and load pipeline manually.
+
+## D256 Track 1 CUTLASS Small-K Metadata
+
+Track 1 patched the local CUTLASS tree at `/home/josh/tdm/cutlass` so SM120
+NVFP4 cooperative small tiles instantiate correctly:
+
+```text
+Sm120Fp4CollectiveTraits<cute::Shape<_64, _N, _K>> works with SFA M padding.
+TileK=64 takes the SingleCtaKBlock consumer path in sm120_blockscaled_mma_tma.hpp.
+M<128 cooperative preconditions are relaxed for SM120 block-scaled kernels.
+Stages>=2 remains a real PipelineTmaAsync correctness constraint.
+```
+
+The D256 extension can now target that tree with:
+
+```text
+CUTLASS_ROOT=/home/josh/tdm/cutlass
+```
+
+Important correction to the previous compact-storage conclusion:
+
+```text
+The earlier 64x128x256 metadata result used full K=256 and StageCountAutoCarveout.
+It was not evidence that CollectiveBuilder could not reach 2-CTA storage.
+The correct probe is fixed StageCount<2> with smaller TileK.
+```
+
+Fixed StageCount<2> metadata on SM120:
+
+```text
+tile          mainloop  gemm_kernel  scaffold_min  2CTA scaffold margin
+128x128x128   37888 B    47104 B       77312 B      -26624 B
+128x128x256   74752 B    83968 B       94720 B      -44032 B
+128x128x64    19456 B    28672 B       72704 B      -22016 B
+256x128x128   56320 B    65536 B      154624 B     -103936 B
+64x128x128    29696 B    38912 B       38656 B       12032 B
+64x128x256    58368 B    67584 B       67840 B      -17152 B
+64x128x64     15360 B    24576 B       36352 B       14336 B
+64x256x128    48128 B    57344 B       71424 B      -20736 B
+64x64x128     21504 B    30720 B       26368 B       24320 B
+```
+
+Interpretation:
+
+```text
+CUTLASS small-K is now the active D256 path. No manual compact CuTe storage
+rewrite is needed for the next milestone.
+
+2 CTA/SM candidates under the current scaffold model:
+  - 64x128x64  (best useful M64/N128 candidate, 36.4 KiB scaffold)
+  - 64x128x128 (fewer inner K passes, 38.7 KiB scaffold)
+  - 64x64x128  (most headroom, smaller N tile)
+
+128x128x64 has a small CUTLASS mainloop footprint but does not fit the current
+fused scaffold because the 128x128 score scratch alone is 64 KiB. It only
+becomes a candidate after the score/P staging is fully register/alias based.
+```
+
+Next implementation target:
+
+```text
+Add D256 policy variants backed by the Track 1 CUTLASS small-K collectives,
+starting with 64x128x128 and 64x128x64. Benchmark focused cells:
+q=32768, kv in {32768, 65536, 131072, 262144}, group=6.
+Compare against the current span2 path and nvfp4_fa2.
+```
+
+## D256 Cooperative Tile Pivot Back To Span2 Internals
+
+Timestamp: 2026-04-29 18:17 CDT
+
+The small cooperative CUTLASS tile path is no longer the active optimization
+path for D256. It remains useful as metadata and correctness coverage, but the
+measured behavior does not justify continuing tile-shape probes before fixing
+span2 internals:
+
+```text
+64x128x128:
+  storage_bytes: 62464 B
+  q=32768 kv=32768 group=6 split_kv_len=16384:
+    before span2 P-fragment reuse: 38.6588 ms
+    cosine: 0.9904504
+
+64x128x64:
+  storage_bytes: 73728 B in the current scaffold
+  prior focused smoke: ~43.65 ms
+  not a valid active candidate yet because D=256 needs four K=64 chunks, while
+  the current Q path only carries two Q fragments.
+
+64x64x128:
+  metadata storage: 39936 B after output-width decoupling
+  QK atom smoke: exact
+  fused path: illegal instruction at UTMALDG.4D in the load warp
+```
+
+Interpretation:
+
+```text
+Even if 64x64x128 reaches 2 CTAs/SM, the cooperative path still runs 4 MMA
+warps per CTA, so 2 CTAs/SM gives roughly the same 8 MMA warps/SM as span2's
+single CTA. The cooperative CTAs duplicate role state, pipelines, and barriers,
+while span2 keeps one coordinated QK -> softmax -> PV pipeline.
+
+The remaining D256 gap is therefore inside span2: role-warp utilization,
+role-handoff overhead, softmax/stat staging, and QK/PV handoff structure.
+```
+
+Span2-internal P-fragment reuse landed:
+
+```text
+Change:
+  For kOutputGroupSpan=2 non-final PV tiles, copy the P fragment from smem to
+  registers once, then reuse it for both V output groups.
+
+Focused cell:
+  q=32768 kv=32768 group=6 split_kv_len=16384 tile=64x128x128
+
+Result:
+  before: 38.6588 ms
+  after:  36.0104 ms
+  delta:  -6.8%
+  cosine: 0.9904504
+```
+
+This is the first useful result after returning to span2 internals. Continue
+there before adding more cooperative tile-shape work.
+
+## D256 Span2 Role-Idling Cuts
+
+Timestamp: 2026-04-29 18:35 CDT
+
+The post-P-fragment-reuse NCU profile for the focused cell:
+
+```text
+shape: q=32768 kv=32768 group=6 split_kv_len=16384 tile=64x128x128
+wall: 36.05 ms
+
+issue slots busy:          10.30%
+SM busy:                   10.46%
+tensor pipe:               ~10.6%
+mem busy:                  28.54%
+L2 hit:                    99.34%
+local/shared spills:       0
+active warps/scheduler:    3.00
+eligible warps/scheduler:  0.12
+top stall:                 sleeping, 18.0 cycles/issued instruction
+```
+
+Interpretation:
+
+```text
+The focused D256 cell is not spilling and is not bandwidth-bound. The dominant
+problem is explicit role idling / handoff waiting. The next useful changes are
+span2 role-schedule cuts, not load-path or cooperative-tile work.
+```
+
+Measured role-idling edits:
+
+```text
+Focused cell: q=32768 kv=32768 group=6 split_kv_len=16384 tile=64x128x128
+
+P-fragment reuse baseline:
+  36.0104 ms
+
+Direct MMA epilogue:
+  small q512/kv8192: 0.6191 -> 0.6157 ms
+  focused cell:      36.0104 -> 36.4759 ms
+  decision: disabled by default; rejected for the target regime.
+
+Single softmax warp, still consuming both row-group handoffs:
+  small q512/kv8192: 0.6157 -> 0.5851 ms
+  focused cell:      36.0104 -> 35.6933 ms
+
+Single softmax warp + single row-group handoff:
+  small q512/kv8192: 0.5851 -> 0.5857 ms
+  focused cell:      35.6933 -> 35.4112 ms
+```
+
+The single-softmax direction is correct for D256, but the win is modest. The
+remaining gap is likely at the QK -> softmax -> P/PV boundary itself rather than
+in the number of pipeline objects.
+
+## D256 MMA-Owned Softmax Breakthrough
+
+Timestamp: 2026-04-29 18:40 CDT
+
+Structural change:
+
+```text
+SM120_D256_MMA_OWNS_SOFTMAX=1
+
+For D256, remove the separate softmax role from the active path. The MMA role
+now owns:
+  - per-row running m_i/l_i in registers
+  - old_scale production
+  - P quantization/staging to the PV smem layout
+
+One MMA thread owns one softmax row for the 64-row tile. The score pipeline
+handoff to Softmax0/Softmax1 is skipped entirely; the QK -> P/PV boundary is now
+an in-role barrier instead of a cross-role pipeline.
+```
+
+Measured result:
+
+```text
+Focused cell: q=32768 kv=32768 group=6 split_kv_len=16384 tile=64x128x128
+
+single-softmax + single-handoff baseline: 35.4112 ms
+MMA-owned softmax:                       21.7293 ms
+delta:                                   -38.6%
+cosine:                                  0.9904504
+
+small q=512 kv=8192 group=6:
+single-softmax + single-handoff baseline: 0.5857 ms
+MMA-owned softmax:                        0.3728 ms
+delta:                                    -36.3%
+```
+
+This confirms the prior NCU diagnosis. The dominant D256 cost was the
+cross-role QK -> softmax -> PV handoff, not the data movement layer.
+
+The focused cell now beats the known nvfp4_fa2 baseline for the same cell
+(~23.58 ms), but it is not yet at the original 2x aspirational gap. Continue
+profiling and optimizing from this new 21.7 ms regime.
+
+## D256 Post-MMA-Owned Retune
+
+Timestamp: 2026-04-29 18:46 CDT
+
+Post-MMA-owned-softmax profile for the focused cell:
+
+```text
+shape: q=32768 kv=32768 group=6 split_kv_len=16384 tile=64x128x128
+wall: 21.78 ms
+
+issue slots busy:          17.68%
+SM busy:                   17.68%
+mem busy:                  46.08%
+L2 hit:                    99.27%
+local/shared spills:       0
+active warps/scheduler:    2.50
+eligible warps/scheduler:  0.21
+top stall:                 barrier, 4.5 cycles/issued instruction
+```
+
+The structural rewrite did what it was supposed to do: sleeping/role-idle
+dominance is gone, issue utilization nearly doubled, and the next bottleneck is
+CTA barrier waiting inside the remaining in-role QK/P/PV sequence.
+
+Focused split retune after the rewrite:
+
+```text
+q=32768 kv=32768 group=6 tile=64x128x128
+
+split_kv_len  splits  min_ms
+4096          8       23.6276
+8192          4       22.3550
+16384         2       21.7060
+32768         1       21.5716
+```
+
+The optimal split for this cell moved to no split. The split/combine overhead is
+now visible because the per-CTA mainloop is much faster.
+
+Additional direct-epilogue retest in the new regime:
+
+```text
+small q=512 kv=8192:       0.3749 -> 0.3716 ms
+focused q=32768 kv=32768:  21.5716 -> 21.8377 ms
+decision: keep direct epilogue disabled by default; focused cell remains the
+          gate.
+```
+
+## D256 Remaining Barrier Cuts
+
+Timestamp: 2026-04-29 18:51 CDT
+
+After MMA-owned softmax, the profile moved to barrier stalls. Two remaining
+barrier cuts were tested:
+
+```text
+Focused cell: q=32768 kv=32768 group=6 tile=64x128x128
+Current best split: split_kv_len=32768 (no split)
+
+Delayed QK completion barrier:
+  Move the QK-logit readiness barrier from immediately after QK to immediately
+  before in-role softmax. This lets PV(tile-1) run before the current tile's
+  softmax readiness barrier.
+
+  result: 21.5716 -> 21.7077 ms in one run with direct epilogue disabled at
+          split=32768, but 21.7293 -> 21.7077 ms at split=16384. Net effect is
+          tiny/noisy; kept for now because it is structurally correct and did
+          not affect correctness.
+
+Remove QK K-copy-side barriers in MMA-owned mode:
+  The K pipeline stages are not released until after P staging, so the
+  per-K-chunk copy barrier before advancing the local read state is redundant
+  in the MMA-owned path.
+
+  small q=512 kv=8192:      0.3749 -> 0.3635 ms
+  focused q=32768 kv=32768: 21.5716 -> 21.0206 ms
+
+Move V pipeline release after PV GEMM:
+  Copy V to registers, run PV GEMM, then release the V pipeline stage. This
+  removes the explicit pre-GEMM V-copy barrier and uses the pipeline release as
+  the stage lifetime boundary.
+
+  small q=512 kv=8192:      0.3635 -> 0.3657 ms
+  focused q=32768 kv=32768: 21.0206 -> 20.6937 ms
+```
+
+Current focused best:
+
+```text
+q=32768 kv=32768 group=6 split_kv_len=32768 tile=64x128x128
+min_ms: 20.6937
+cosine: 0.9904627
+```
+
+## D256 Four-Thread Row Softmax
+
+Timestamp: 2026-04-29 19:41 CDT
+
+Structural change:
+
+```text
+In the MMA-owned softmax path, switch from one MMA thread per score row to four
+MMA threads per score row.
+
+Before:
+  64 of 256 MMA threads produced P and row stats.
+  192 MMA threads waited at the P-ready barrier.
+
+After:
+  all 256 MMA threads participate.
+  each row uses 4 threads, each thread owns 32 columns / 2 scale groups.
+  row max and row sum use 4-lane shfl_xor reductions.
+```
+
+Measured result:
+
+```text
+small q=512 kv=8192 group=6:
+  before: 0.3639 ms
+  after:  0.2620 ms
+
+focused q=32768 kv=32768 group=6 split_kv_len=32768:
+  before: 20.6937 ms
+  after:  14.4057 ms
+  delta:  -30.4%
+  cosine: 0.9904513
+```
+
+This confirms that the remaining barrier wait after MMA-owned softmax was
+mostly warp imbalance before the P-ready barrier. All-MMA-thread P production is
+now the active D256 structure.
+
+Post-change NCU profile on the focused cell:
+
+```text
+q=32768 kv=32768 group=6 split_kv_len=32768 tile=64x128x128
+profile wall:                 14.720 ms
+issue slots busy:             29.07%
+tensor pipe:                  26.54%
+mem busy:                     53.46%
+max bandwidth:                28.67%
+L2 hit:                       99.56%
+local/shared spills:          0
+active warps/scheduler:       2.50
+eligible warps/scheduler:     0.42
+top stalls per instruction:
+  sleeping:                   1.90
+  wait:                       1.35
+  MIO throttle:               0.95
+  short scoreboard:           0.90
+  math pipe throttle:         0.74
+  barrier:                    0.28
+```
+
+The profile is no longer the old barrier-dominated shape. Issue utilization is
+near the 30% target and eligible warps/scheduler is above 0.4. The next obvious
+question is whether a second CTA/SM can increase scheduler supply.
+
+## D256 Compact Storage And Occupancy Probe
+
+Timestamp: 2026-04-29 20:28 CDT
+
+Storage layout inspection showed the D256 QKV storage had already aliased all
+large P/logits buffers, but two aliased empty P-buffer placeholders still carried
+`alignas(1024)` and wasted padding:
+
+```text
+before:
+  storage bytes: 52224
+  p_smem_A0 offset: 49152  (empty, padded to 1024)
+  p_smem_A1 offset: 50176  (empty, padded to 1024)
+
+after:
+  storage bytes: 50176
+  p_smem_A0 offset: 48161
+  p_smem_A1 offset: 48177
+```
+
+Correctness held:
+
+```text
+q=512   kv=8192  group=6: cosine 0.9911097, min_ms 0.2599
+q=32768 kv=32768 group=6: cosine 0.9904529, min_ms 14.6326
+```
+
+But NCU after compaction still reports one CTA/SM:
+
+```text
+active warps/scheduler:       2.50
+eligible warps/scheduler:     0.42
+issue slots busy:             29.07%
+tensor pipe:                  26.54%
+```
+
+So shared memory is no longer the occupancy limiter. Resource usage for the
+active `kOutputGroupSpan=2` kernel:
+
+```text
+launch_bounds min blocks = 1:
+  registers/thread:           166
+  stack/thread:               0
+  focused min_ms:             14.63 ms
+
+launch_bounds min blocks = 2:
+  registers/thread:           96
+  stack/thread:               344 bytes
+  focused min_ms:             23.66 ms
+```
+
+Conclusion: forcing occupancy with launch bounds spills heavily and regresses.
+The path to 2 CTA/SM requires structural live-range reduction, not a register
+cap. Keep min-blocks default at 1.
+
+Additional source-counter profile after compaction:
+
+```text
+L1 shared wavefronts:             3.149B
+L1 ideal shared wavefronts:       1.653B
+excessive shared wavefronts:      1.496B (48%)
+
+largest source lines:
+  QK logits BF16 store:           704.6M excessive wavefronts
+  P FP4 byte stores:              302.0M
+  QK logits BF16 reload, pass 1:  302.0M
+  QK logits BF16 reload, pass 2:  151.0M
+```
+
+This points back to the BF16 logits round-trip as the next structural target.
+The current kernel still materializes QK logits to shared memory, then reloads
+them for softmax/P quantization. That was acceptable as a bridge, but it is now
+the main on-chip traffic source.
+
+Rejected probe: row-dependent XOR layout for the logits scratch.
+
+```text
+change:
+  store/read logits through col ^ ((row & 0x0f) << 1)
+
+small q=512 kv=8192:
+  0.2598 -> 0.2647 ms
+
+focused q=32768 kv=32768:
+  14.65 -> 15.71 ms
+```
+
+The swizzle preserved correctness but added address arithmetic / worse access
+shape and regressed. Do not retry logits-layout swizzles as a substitute for
+removing the logits round-trip.
+
+Rejected probe: direct QK accumulator to P staging.
+
+```text
+change:
+  skip BF16 logits smem materialization and compute softmax/P directly from
+  QK accumulator fragments, using two block-wide barriers to combine the low
+  and high column halves for each row.
+
+small q=512 kv=8192 group=6:
+  storage: 50176 -> 61440 bytes
+  cosine:  0.991102
+  min_ms:  0.260 -> 0.587
+
+focused q=32768 kv=32768 group=6:
+  cosine:  0.990465
+  min_ms:  14.65 -> 35.39
+```
+
+Correctness held, but the path is structurally worse. It removes the BF16
+logits round trip only by adding extra global row-half reductions, extra
+barriers, duplicated exp work, and a second P buffer. This increases storage by
+11 KiB and more than doubles wall time. The code path was removed after logging
+the result.
+
+Conclusion: removing logits smem traffic must preserve the four-thread row
+softmax structure and avoid new block-wide reductions. Do not reintroduce a
+direct-QK accumulator path unless it has a different ownership model for the
+low/high column halves.
+
+Kept change: coalesce P FP4 shared stores inside the four-thread row softmax.
+
+```text
+change:
+  for each 16-value P scale group, pack the 8 FP4 bytes into two uint32 values
+  and store them with two 32-bit shared stores when the CuTe P layout is
+  contiguous/aligned; otherwise fall back to byte stores.
+
+small q=512 kv=8192 group=6:
+  cosine: 0.991114
+  min_ms: 0.2582 -> 0.2572
+
+focused q=32768 kv=32768 group=6:
+  cosine: 0.990407
+  min_ms: 14.65 -> 14.29
+  mean_ms: 14.29 over repeat=3
+```
+
+This is a small but real win (~2.4% on the focused cell). It directly targets
+the source-counter line where scalar P byte stores contributed ~302M excessive
+shared wavefronts. The improvement is not large enough to change the overall
+gap by itself, but it is aligned with the current bottleneck profile and keeps
+the stable softmax ownership model.
+
+Kept change: additive row skew for the BF16 logits scratch layout.
+
+```text
+reason:
+  row-major logits storage maps the same column pairs from different rows to the
+  same shared-memory banks because the row stride is 128 bf16 = 256 bytes. The
+  source-counter profile after P-store coalescing still showed ~704M excessive
+  shared wavefronts in the logits store path.
+
+change:
+  store/read logits at:
+    row * 128 + ((col + (row & 15) * skew) & 127)
+  with skew=4.
+
+small q=512 kv=8192 group=6:
+  skew=0: 0.2572 ms
+  skew=2: 0.2492 ms
+  skew=4: 0.2326 ms
+  skew=8: 0.2568 ms
+
+focused q=32768 kv=32768 group=6:
+  skew=0: 14.29 ms
+  skew=2: 14.52 ms
+  skew=4: 13.64 min / 13.66 mean over repeat=3
+```
+
+This is a larger layout win (~4.4% over the P-store coalesced focused baseline,
+~6.9% over the pre-P-store baseline). Unlike the rejected XOR layout, additive
+skew preserves contiguous per-row softmax reads while adding row entropy to the
+shared-memory bank index. D=256 default is now `SM120_D256_LOGITS_ROW_SKEW=4`;
+the env knob remains for future shape-specific sweeps.
+
+Rejected follow-up: unconditional P uint32 stores.
+
+```text
+change:
+  remove the runtime contiguous/alignment check from the P-store coalescing path
+  and always issue two uint32 shared stores per 16-value P group.
+
+small q=512 kv=8192 group=6:
+  checked coalesced store:       0.2324 ms
+  unconditional uint32 store:    0.2378 ms
+```
+
+Correctness held, but performance regressed. Keep the checked coalesced path.
+
+## D256 Group=6 q=32768 Four-Cell Validation After P-Store + Logits Skew
+
+Report files:
+
+```text
+reports/d256_group6_q32768_validation_lskew4_20260429.jsonl
+reports/d256_group6_q32768_validation_lskew4_20260429.csv
+reports/d256_group6_q32768_validation_lskew4_20260429.summary.csv
+reports/d256_group6_q32768_validation_lskew4_20260429.md
+```
+
+Configuration:
+
+```text
+D=256, group=6, q=32768
+tile policy:                 64x128x128
+output group span:           2
+split_kv_len:                32768
+SM120_D256_LOGITS_ROW_SKEW:  4
+```
+
+Results:
+
+```text
+kv       splits  fused ms   nvfp4_fa2 ms  fp8_fa2 ms  bf16_fa2 ms  speedup vs nvfp4  cosine
+32768    1       13.6616    23.7664       21.2194     14.3665      1.740x            0.990448
+65536    2       27.2928    71.7212       63.3527     42.5902      2.628x            0.991919
+131072   4       54.6482    174.1830      156.9015    104.1255     3.187x            0.990701
+262144   8       119.2026   378.3900      345.3158    233.2816     3.174x            0.991230
+```
+
+Interpretation:
+
+```text
+The long-KV cells now pass the 2x gate against NVFP4 FA2 and also beat FP8 FA2
+and BF16 FA2 by a wide margin. The remaining failure is the shortest focused
+cell, kv=32768, where fused is 1.74x faster than NVFP4 FA2 but misses the 2x
+target by 1.78 ms.
+
+The next optimization target should be the kv=32768 cell specifically. At longer
+KV, split-KV gives enough CTA parallelism and the per-tile improvements scale.
+At kv=32768, there is only one split and the kernel remains sensitive to per-CTA
+latency, register pressure, and on-chip layout.
+```
+
+Post-skew NCU for the focused cell:
+
+```text
+reports/ncu_d256_g6_q32768_kv32768_lskew4_20260429.ncu-rep
+reports/ncu_d256_g6_q32768_kv32768_lskew4_20260429.details.txt
+reports/ncu_d256_g6_q32768_kv32768_lskew4_20260429.source.csv
+
+duration under ncu:              14.16 ms
+compute throughput:              40.83%
+memory throughput:               44.45%
+issue slots busy:                37.58%
+active warps/scheduler:          2.50
+eligible warps/scheduler:        0.51
+excessive shared wavefronts:     496M (down from 1.219B after P-store coalesce,
+                                  down from 1.496B before both changes)
+local memory spilling requests:  31.5M
+```
+
+The row skew materially improved scheduler eligibility and shared wavefronts,
+but introduced/identified local-memory traffic. The next candidate is to keep
+the skewed logits layout while reducing register/local pressure in the softmax
+packing loop.
+
+Rejected follow-up: recompute P values during FP4 packing.
+
+```text
+change:
+  avoid keeping p_vals[16] live across scale selection by recomputing the two
+  probabilities used for each packed byte after the scale is known.
+
+small q=512 kv=8192 group=6:
+  stable skew4 path:          0.2324 ms
+  recompute-pack path:        0.2644 ms
+```
+
+Correctness held, but the extra exp/logit reload work is larger than the
+register/local-pressure relief. The knob and branch were removed from the
+active source; keep the stable p_vals path.
+
+## D256 Group=6 q=32768 Clean Four-Cell Validation
+
+After removing the rejected recompute-pack knob, reran the focused validation
+matrix with the cleaned default build.
+
+Report files:
+
+```text
+reports/d256_group6_q32768_validation_clean_lskew4_20260429.jsonl
+reports/d256_group6_q32768_validation_clean_lskew4_20260429.csv
+reports/d256_group6_q32768_validation_clean_lskew4_20260429.summary.csv
+reports/d256_group6_q32768_validation_clean_lskew4_20260429.md
+```
+
+Configuration:
+
+```text
+D=256, group=6, q=32768
+tile policy:                 64x128x128
+output group span:           2
+split_kv_len:                32768
+SM120_D256_LOGITS_ROW_SKEW:  4
+storage bytes:               50176
+```
+
+Results:
+
+```text
+kv       splits  fused ms   nvfp4_fa2 ms  fp8_fa2 ms  bf16_fa2 ms  speedup vs nvfp4  cosine
+32768    1       13.6291    23.7886       21.1376     14.3606      1.745x            0.990440
+65536    2       27.2997    71.5738       63.0309     42.4639      2.622x            0.991921
+131072   4       54.7097    174.2117      156.2655    104.0950     3.184x            0.990626
+262144   8       119.0001   378.2972      345.4784    232.6751     3.179x            0.991223
+```
+
+Conclusion:
+
+```text
+The long-KV validation cells pass the 2x gate and beat NVFP4, FP8, and BF16 FA2.
+The only remaining miss in this focused D=256 group=6 grid is kv=32768:
+
+  fused:         13.6291 ms
+  2x target:     11.8943 ms
+  gap:            1.7348 ms
+```
+
+Further layout levers are now expected to be incremental. The decision-relevant
+state is that the kernel is shippable for the long-context cells in this focused
+grid, while kv=32768 still needs either another structural latency reduction or
+a dispatch policy that leaves that cell on the incumbent path.
+
+## D256 q=32768 kv=32768 Split Resweep After Skew4
+
+Report:
+
+```text
+reports/d256_g6_q32768_kv32768_split_resweep_lskew4_20260429.jsonl
+```
+
+Results:
+
+```text
+split_kv_len  splits  fused ms   cosine
+8192          4       14.7523    0.990417
+16384         2       14.0877    0.990369
+32768         1       13.6672    0.990451
+```
+
+Conclusion:
+
+```text
+No split remains best for the shortest focused cell after the P-store and
+logits-skew improvements. The remaining 32K miss is per-CTA latency / on-chip
+execution overhead, not split-KV scheduling.
+
+## D256 q=32768 kv=32768 Output Span Resweep After Skew4
+
+Report:
+
+```text
+reports/d256_g6_q32768_kv32768_span_resweep_lskew4_20260429.jsonl
+```
+
+Results:
+
+```text
+output group span  fused ms   cosine     status
+1                  23.7119    0.990437   ok
+2                  13.6798    0.990400   ok
+4                  -          -          invalid in current D=256 path
+```
+
+Conclusion:
+
+```text
+Span2 remains the correct D=256 output policy. Span1 loses the P/V reuse benefit
+and is far slower; span4 is not a valid D=256 specialization in the current
+implementation. Continue optimizing the span2 kernel.
+
+## D256 Fine Logits-Row-Skew Sweep
+
+Report:
+
+```text
+reports/d256_g6_q512_kv8192_logits_skew_fine_20260429.jsonl
+```
+
+Small-cell filter:
+
+```text
+q=512, kv=8192, group=6
+
+skew  fused ms   cosine
+1     0.2841     0.991105
+3     0.2313     0.991129
+4     0.2150     0.991125
+5     0.2260     0.991111
+6     0.2297     0.991110
+7     0.2271     0.991119
+```
+
+Conclusion:
+
+```text
+No finer skew beats the current default. Keep SM120_D256_LOGITS_ROW_SKEW=4.
+The remaining shared-memory wavefront excess is not removable by this simple
+row-skew parameter.
+
+Rejected follow-up: BF16 old-scale sidecar.
+
+```text
+change:
+  store old_scale_stage as BF16 instead of FP32, converting back to FP32 when
+  rescaling the PV accumulator. This reduced D=256 shared storage from 50176 to
+  49152 bytes.
+
+small q=512 kv=8192 group=6:
+  0.2165 ms, cosine 0.991092
+
+focused q=32768 kv=32768 group=6:
+  repeat=1: 13.7058 ms, cosine 0.990434
+  repeat=3: 13.6998 min / 13.7113 mean, cosine 0.990489
+```
+
+Correctness held, but the focused cell regressed versus the stable FP32 old-scale
+path (~13.63-13.67 ms). Reverted. The old-scale sidecar is not the right next
+latency lever.
+```
+```
+```

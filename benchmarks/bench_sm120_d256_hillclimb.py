@@ -20,9 +20,9 @@ class Cell:
     group: int = 2
 
 
-DEFAULT_Q_LENS = (128, 256, 512, 1024, 2048, 4096)
-DEFAULT_KV_LENS = (8192, 32768, 65536, 131072, 262144)
-DEFAULT_GROUPS = (2, 4, 6, 8, 12, 16)
+DEFAULT_Q_LENS = (2048, 4096, 8192, 16384, 32768)
+DEFAULT_KV_LENS = (16384, 32768, 65536, 131072, 262144)
+DEFAULT_GROUPS = (2, 4, 6, 8)
 
 KERNELS = ("sm120_fused", "nvfp4_fa2", "fp8_fa2", "bf16_fa2")
 
@@ -52,6 +52,7 @@ def run_env(root: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("CUDA_HOME", "/usr/local/cuda-13.2")
     env.setdefault("TORCH_CUDA_ARCH_LIST", "12.0f")
+    env.setdefault("FLASHINFER_CUDA_ARCH_LIST", "12.0f")
     env["PYTHONPATH"] = (
         f"{root}:{root / 'benchmarks'}"
         + (f":{env['PYTHONPATH']}" if env.get("PYTHONPATH") else "")
@@ -90,6 +91,13 @@ def run_json(command: list[str], *, env: dict[str, str], timeout_sec: int) -> di
 
 
 def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]:
+    bench_flag = {
+        1: "--sm120-qkv-online-splitkv-full-grid-bench",
+        2: "--sm120-qkv-online-splitkv-reuse2-full-grid-bench",
+        4: "--sm120-qkv-online-splitkv-reuse4-full-grid-bench",
+    }.get(args.fused_output_group_span)
+    if bench_flag is None:
+        raise ValueError("--fused-output-group-span must be one of 1, 2, or 4")
     return [
         sys.executable,
         str(root / "benchmarks" / "bench_sm120_nvfp4_cutlass_fused_attention.py"),
@@ -109,7 +117,7 @@ def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]
         str(args.warmup),
         "--repeat",
         str(args.repeat),
-        "--sm120-qkv-online-splitkv-full-grid-bench",
+        bench_flag,
     ]
 
 
@@ -164,15 +172,22 @@ def summarize(
     kernel: str,
     data: dict[str, Any],
     command: list[str],
+    fused_output_group_span: int,
 ) -> dict[str, Any]:
     if kernel == "sm120_fused":
-        bench = data["bench_sm120_qkv_online_register_q_splitkv_full_grid"]
+        bench_keys = [
+            key for key in data if key.startswith("bench_sm120_qkv_online")
+        ]
+        if len(bench_keys) != 1:
+            raise KeyError(f"expected one SM120 fused bench key, got {bench_keys}")
+        bench = data[bench_keys[0]]
         return {
             "q": cell.q_len,
             "kv": cell.kv_len,
             "d": cell.head_dim,
             "group": cell.group,
             "kernel": kernel,
+            "fused_output_group_span": fused_output_group_span,
             "min_ms": bench["min_ms"],
             "mean_ms": bench["mean_ms"],
             "cosine": data.get("splitkv_full_grid_first_tile_vs_exact_cosine"),
@@ -221,6 +236,7 @@ def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
         "d",
         "group",
         "kernel",
+        "fused_output_group_span",
         "min_ms",
         "mean_ms",
         "cosine",
@@ -268,8 +284,24 @@ def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
             }
         )
 
+    summary_fieldnames = [
+        "group",
+        "q",
+        "kv",
+        "fused_ms",
+        "nvfp4_fa2_ms",
+        "fp8_fa2_ms",
+        "bf16_fa2_ms",
+        "fused_cosine",
+        "fused_vs_nvfp4_fa2_speedup",
+        "target_ms_for_2x",
+        "gap_to_target_ms",
+        "passes_2x",
+        "splits",
+        "split_kv_len",
+    ]
     with summary_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=summary_fieldnames)
         writer.writeheader()
         writer.writerows(summary_rows)
 
@@ -295,6 +327,180 @@ def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
     print(f"wrote {md_path}")
 
 
+def report_paths(prefix: Path) -> tuple[Path, Path, Path, Path]:
+    return (
+        prefix.with_suffix(".jsonl"),
+        prefix.with_suffix(".csv"),
+        prefix.with_name(prefix.name + ".summary.csv"),
+        prefix.with_suffix(".md"),
+    )
+
+
+def row_fieldnames() -> list[str]:
+    return [
+        "q",
+        "kv",
+        "d",
+        "group",
+        "kernel",
+        "fused_output_group_span",
+        "min_ms",
+        "mean_ms",
+        "cosine",
+        "splits",
+        "split_kv_len",
+        "storage_bytes",
+        "status",
+        "error",
+        "command",
+    ]
+
+
+def append_row(row: dict[str, Any], *, prefix: Path) -> None:
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_path, csv_path, _, _ = report_paths(prefix)
+
+    with jsonl_path.open("a") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=row_fieldnames())
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def load_jsonl_rows(prefix: Path) -> list[dict[str, Any]]:
+    jsonl_path, _, _, _ = report_paths(prefix)
+    if not jsonl_path.exists():
+        return []
+    rows = []
+    with jsonl_path.open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
+    _, _, summary_path, md_path = report_paths(prefix)
+    ok_rows = [row for row in rows if row.get("status", "ok") == "ok"]
+
+    by_cell: dict[tuple[int, int, int], dict[str, dict[str, Any]]] = {}
+    for row in ok_rows:
+        by_cell.setdefault((row["group"], row["q"], row["kv"]), {})[
+            row["kernel"]
+        ] = row
+
+    summary_rows: list[dict[str, Any]] = []
+    for cell_key in sorted(by_cell):
+        data = by_cell[cell_key]
+        fused = data.get("sm120_fused")
+        nvfp4 = data.get("nvfp4_fa2")
+        if not fused or not nvfp4:
+            continue
+        speedup = nvfp4["min_ms"] / fused["min_ms"]
+        target_ms = nvfp4["min_ms"] / 2.0
+        summary_rows.append(
+            {
+                "group": cell_key[0],
+                "q": cell_key[1],
+                "kv": cell_key[2],
+                "fused_ms": fused["min_ms"],
+                "nvfp4_fa2_ms": nvfp4["min_ms"],
+                "fp8_fa2_ms": data.get("fp8_fa2", {}).get("min_ms"),
+                "bf16_fa2_ms": data.get("bf16_fa2", {}).get("min_ms"),
+                "fused_cosine": fused["cosine"],
+                "fused_vs_nvfp4_fa2_speedup": speedup,
+                "target_ms_for_2x": target_ms,
+                "gap_to_target_ms": fused["min_ms"] - target_ms,
+                "passes_2x": speedup >= 2.0,
+                "splits": fused["splits"],
+                "split_kv_len": fused["split_kv_len"],
+            }
+        )
+
+    summary_fieldnames = [
+        "group",
+        "q",
+        "kv",
+        "fused_ms",
+        "nvfp4_fa2_ms",
+        "fp8_fa2_ms",
+        "bf16_fa2_ms",
+        "fused_cosine",
+        "fused_vs_nvfp4_fa2_speedup",
+        "target_ms_for_2x",
+        "gap_to_target_ms",
+        "passes_2x",
+        "splits",
+        "split_kv_len",
+    ]
+    with summary_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=summary_fieldnames)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    with md_path.open("w") as f:
+        f.write("| group | q | kv | fused | nvfp4_fa2 | fp8_fa2 | bf16_fa2 | speedup vs nvfp4 | cosine | pass |\n")
+        f.write("|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n")
+        for row in summary_rows:
+            fp8_ms = row["fp8_fa2_ms"]
+            bf16_ms = row["bf16_fa2_ms"]
+            f.write(
+                f"| {row['group']} | {row['q']} | {row['kv']} | {row['fused_ms']:.6f} | "
+                f"{row['nvfp4_fa2_ms']:.6f} | "
+                f"{'-' if fp8_ms is None else f'{fp8_ms:.6f}'} | "
+                f"{'-' if bf16_ms is None else f'{bf16_ms:.6f}'} | "
+                f"{row['fused_vs_nvfp4_fa2_speedup']:.3f}x | "
+                f"{row['fused_cosine']:.6f} | "
+                f"{'yes' if row['passes_2x'] else 'no'} |\n"
+            )
+
+        failures = [row for row in rows if row.get("status") == "error"]
+        if failures:
+            f.write("\n## Failures\n\n")
+            f.write("| group | q | kv | kernel | error |\n")
+            f.write("|---:|---:|---:|---|---|\n")
+            for row in failures:
+                error = str(row.get("error", "")).splitlines()[0][:180]
+                f.write(
+                    f"| {row['group']} | {row['q']} | {row['kv']} | "
+                    f"{row['kernel']} | {error} |\n"
+                )
+
+
+def error_row(
+    *,
+    cell: Cell,
+    kernel: str,
+    command: list[str],
+    fused_output_group_span: int,
+    error: Exception,
+) -> dict[str, Any]:
+    return {
+        "q": cell.q_len,
+        "kv": cell.kv_len,
+        "d": cell.head_dim,
+        "group": cell.group,
+        "kernel": kernel,
+        "fused_output_group_span": (
+            fused_output_group_span if kernel == "sm120_fused" else None
+        ),
+        "min_ms": None,
+        "mean_ms": None,
+        "cosine": None,
+        "splits": None,
+        "split_kv_len": None,
+        "storage_bytes": None,
+        "status": "error",
+        "error": str(error),
+        "command": " ".join(command),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, default=0)
@@ -302,6 +508,7 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--timeout-sec", type=int, default=900)
     parser.add_argument("--fused-split-kv-len", type=int, default=6656)
+    parser.add_argument("--fused-output-group-span", type=int, default=2)
     parser.add_argument(
         "--q-lens",
         type=str,
@@ -337,7 +544,13 @@ def main() -> None:
         raise ValueError(f"unknown kernels: {unknown}")
     cells = build_cells(args)
 
-    rows: list[dict[str, Any]] = []
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    prefix = (
+        Path(args.output_prefix)
+        if args.output_prefix
+        else root / "reports" / f"d256_hillclimb_{stamp}"
+    )
+    rows: list[dict[str, Any]] = load_jsonl_rows(prefix)
     for cell in cells:
         for kernel in kernels:
             command = (
@@ -345,18 +558,34 @@ def main() -> None:
                 if kernel == "sm120_fused"
                 else flashinfer_command(root, cell, args, kernel)
             )
-            data = run_json(command, env=env, timeout_sec=args.timeout_sec)
-            row = summarize(cell=cell, kernel=kernel, data=data, command=command)
+            try:
+                data = run_json(command, env=env, timeout_sec=args.timeout_sec)
+                row = summarize(
+                    cell=cell,
+                    kernel=kernel,
+                    data=data,
+                    command=command,
+                    fused_output_group_span=args.fused_output_group_span,
+                )
+                row["status"] = "ok"
+                row["error"] = None
+            except Exception as exc:
+                row = error_row(
+                    cell=cell,
+                    kernel=kernel,
+                    command=command,
+                    fused_output_group_span=args.fused_output_group_span,
+                    error=exc,
+                )
             rows.append(row)
+            append_row(row, prefix=prefix)
+            write_summary_reports(rows, prefix=prefix)
             print(json.dumps(row, sort_keys=True), flush=True)
-
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    prefix = (
-        Path(args.output_prefix)
-        if args.output_prefix
-        else root / "reports" / f"d256_hillclimb_{stamp}"
-    )
-    write_reports(rows, prefix=prefix)
+    write_summary_reports(rows, prefix=prefix)
+    print(f"wrote {report_paths(prefix)[0]}")
+    print(f"wrote {report_paths(prefix)[1]}")
+    print(f"wrote {report_paths(prefix)[2]}")
+    print(f"wrote {report_paths(prefix)[3]}")
 
 
 if __name__ == "__main__":

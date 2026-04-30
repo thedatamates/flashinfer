@@ -1,0 +1,6 @@
+{"cosine": 0.9911053776741028, "logits_row_skew": 1, "mean_ms": 0.28406399488449097, "min_ms": 0.28406399488449097, "status": "ok", "storage_bytes": 50176}
+{"cosine": 0.99112868309021, "logits_row_skew": 3, "mean_ms": 0.23126399517059326, "min_ms": 0.23126399517059326, "status": "ok", "storage_bytes": 50176}
+{"cosine": 0.9911249279975891, "logits_row_skew": 4, "mean_ms": 0.21503999829292297, "min_ms": 0.21503999829292297, "status": "ok", "storage_bytes": 50176}
+{"cosine": 0.9911112189292908, "logits_row_skew": 5, "mean_ms": 0.22598400712013245, "min_ms": 0.22598400712013245, "status": "ok", "storage_bytes": 50176}
+{"cosine": 0.9911098480224609, "logits_row_skew": 6, "mean_ms": 0.22969600558280945, "min_ms": 0.22969600558280945, "status": "ok", "storage_bytes": 50176}
+{"cosine": 0.991119384765625, "logits_row_skew": 7, "mean_ms": 0.22713600099086761, "min_ms": 0.22713600099086761, "status": "ok", "storage_bytes": 50176}

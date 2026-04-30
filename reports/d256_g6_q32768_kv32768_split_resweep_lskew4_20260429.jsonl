@@ -1,0 +1,3 @@
+{"cosine": 0.9904171824455261, "mean_ms": 14.752287864685059, "min_ms": 14.752287864685059, "split_kv_len": 8192, "splits": 4, "status": "ok", "storage_bytes": 50176}
+{"cosine": 0.9903692603111267, "mean_ms": 14.087743759155273, "min_ms": 14.087743759155273, "split_kv_len": 16384, "splits": 2, "status": "ok", "storage_bytes": 50176}
+{"cosine": 0.9904506206512451, "mean_ms": 13.667200088500977, "min_ms": 13.667200088500977, "split_kv_len": 32768, "splits": 1, "status": "ok", "storage_bytes": 50176}
