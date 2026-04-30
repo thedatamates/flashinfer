@@ -11719,6 +11719,23 @@ post-P-reuse D512 port: 1.2936 ms
 cosine: 0.9900
 ```
 
+Smoke cell baseline comparison:
+
+```text
+q=512 kv=8192 group=4
+fused D512: 1.2936 ms
+nvfp4 FA2:  0.6168 ms
+fp8 FA2:    0.6420 ms
+```
+
+Interpretation:
+
+```text
+The D512 fused kernel is not the short-q dispatch choice. The win zone from
+this backport is high-q / long-context global attention. Use the smoke cell for
+correctness and build validation, not as a D512 optimization target.
+```
+
 BF16 FA2 note:
 
 ```text
