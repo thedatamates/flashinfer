@@ -11739,3 +11739,46 @@ softmax change: the decisive D512 lever is reusing the staged P fragment across
 the span4 PV accumulators. The focused long-context cells now beat NVFP4 FA2 by
 1.88x-3.36x and FP8 FA2 by 2.02x-3.30x.
 ```
+
+## D512 Split-KV Policy Check After P-Reuse
+
+Question:
+
+```text
+At q=32768/group=4, the kernel already has 1024 q-tiles, so split-KV may be
+unnecessary combine traffic at long KV. Check whether split_kv_len=32768 should
+remain the focused default.
+```
+
+Result:
+
+```text
+q=32768 group=4 D=512 output_group_span=4
+
+kv      split_kv_len  fused ms  cosine
+32768   8192          37.2623   0.9928
+32768   16384         36.6353   0.9928
+32768   32768         36.7411   0.9928
+
+65536   16384         74.5914   0.9870
+65536   32768         73.7090   0.9870
+65536   65536         74.5500   0.9870
+
+131072  16384         157.4026  0.9909
+131072  32768         154.4947  0.9909
+131072  65536         156.9540  0.9909
+131072  131072        156.8894  0.9909
+
+262144  16384         326.3318  0.9898
+262144  32768         321.1207  0.9898
+262144  65536         331.6680  0.9898
+262144  262144        334.0772  0.9898
+```
+
+Decision:
+
+```text
+Keep split_kv_len=32768 as the D512 focused default. split_kv_len=16384 is only
+noise-level faster on the shortest 32K cell and loses at longer KV. No-split is
+not better once KV grows.
+```
