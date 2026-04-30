@@ -12053,3 +12053,468 @@ D512 active split-KV smoke:
   q=512 kv=8192 group=8 reuse4
   finite=true cosine=0.98977 min_ms=1.3083
 ```
+
+## D128 Specialization: Focus Set And Starting Point
+
+Active focus cells for D128 specialization:
+
+```text
+q=32768 kv=32768  group=8   anchor
+q=32768 kv=65536  group=8
+q=32768 kv=131072 group=8
+q=32768 kv=262144 group=8
+
+q=32768 kv=131072 group=4
+q=32768 kv=131072 group=12
+q=32768 kv=131072 group=16
+
+q=512   kv=8192   group=8   smoke
+```
+
+Current D128 translation unit status before native specialization:
+
+```text
+file: benchmarks/sm120_nvfp4_cutlass_fused_attention_d128.cu
+role schedule: softmax0=1, softmax1=1, mma=8, load=1, epilogue=1
+total warps: 12
+storage: 96256 bytes
+shared-memory margin: 5120 bytes
+```
+
+This confirms the D128 file is still carrying the old large shared-storage
+scaffold. It is correct enough to benchmark, but not D128-native: it still uses
+the full 96 KiB storage footprint and cannot reach 2 CTAs/SM.
+
+Smoke before D128 specialization:
+
+```text
+q=512 kv=8192 group=8 split_kv_len=8192 output_group_span=1
+finite=true
+cosine=0.9916909
+min_ms=0.979712
+storage=96256 bytes
+```
+
+Next step is a streamed focus baseline against `nvfp4_fa2`, `fp8_fa2`, and
+`bf16_fa2`, then D128-native structural work. Primary expected levers are:
+
+```text
+compact D128 shared storage
+single output-group path only
+remove the second softmax warp / ordering machinery if D128 softmax throughput allows
+reduce tile/pipeline state enough to target 2 CTAs/SM
+retune split-KV length after storage and role reductions land
+```
+
+## D128 Slice 1: Backport D256 Role Pattern
+
+Ported the settled D256 role/softmax structure into the D128 specialization:
+
+```text
+M partition:              128
+K tile:                   128
+softmax ownership:        MMA-owned
+softmax threads per row:  2
+softmax warps:            0
+role warps:               mma=8, load=1, epilogue=1
+total warps:              10
+storage:                  92160 bytes
+shared-memory margin:     9216 bytes
+```
+
+This slice removes the separate softmax warp pair and the old two-stage
+softmax handoff from the active D128 path. It keeps D128 as a single
+output-group path (`output_group_span=1`), so there is no D512-style
+column-group cycle or P-fragment reuse to optimize.
+
+Correctness stayed stable. Focus-set lift versus the scaffold baseline:
+
+```text
+| group | q     | kv     | before fused | after fused | lift  | nvfp4_fa2 | after speedup | cosine   |
+|------:|------:|-------:|-------------:|------------:|------:|----------:|--------------:|---------:|
+| 4     | 32768 | 131072 | 99.316       | 37.139      | 2.67x | 42.495    | 1.14x         | 0.991741 |
+| 8     | 512   | 8192   | 0.979        | 0.373       | 2.62x | 0.125     | 0.34x         | 0.991697 |
+| 8     | 32768 | 32768  | 46.264       | 18.643      | 2.48x | 12.127    | 0.65x         | 0.990112 |
+| 8     | 32768 | 65536  | 97.969       | 37.030      | 2.65x | 34.653    | 0.94x         | 0.991861 |
+| 8     | 32768 | 131072 | 205.156      | 75.374      | 2.72x | 82.431    | 1.09x         | 0.990365 |
+| 8     | 32768 | 262144 | 416.870      | 157.049     | 2.65x | 183.515   | 1.17x         | 0.990574 |
+| 12    | 32768 | 131072 | 313.984      | 117.470     | 2.67x | 128.393   | 1.09x         | 0.993173 |
+| 16    | 32768 | 131072 | 415.420      | 157.943     | 2.63x | 170.720   | 1.08x         | 0.987426 |
+```
+
+The port is a real structural win, but it is not the final D128-native kernel:
+storage is still 92 KiB, so the path remains 1 CTA/SM, and the shorter focus
+cells still trail NVFP4 FA2. Next lever is split-KV policy on the high-q focus
+cells: with q=32768 there is already abundant Q-tile parallelism, so excessive
+split count and combine traffic may be the next large avoidable overhead.
+
+## D128 Slice 2: M64 Native Partition And Logits Alias Diagnosis
+
+Read the D256 kernel end to end before continuing the D128 port. The important
+D256 structural facts are:
+
+```text
+D256 production tile:              M64 x N128 x K128
+softmax ownership:                 MMA-owned
+softmax threads per row:           4
+P storage:                         single buffer
+QK head chunks:                    2
+logits storage:                    aliases QK-B when it fits
+P storage/scales:                  alias QK-A / QK-SFA after Q is register resident
+```
+
+Porting the same M64 partition to D128 exposed a correctness bug when logits
+were allowed to alias QK-B:
+
+```text
+D128 M64 + QK-B logits alias:
+  storage:                         50176 bytes
+  q=512 kv=8192 group=8:           cosine=0.0, huge output error
+```
+
+Disabling only the QK-B/logits alias restored correctness:
+
+```text
+D128 M64 + explicit BF16 logits:
+  storage:                         66560 bytes
+  q=512 kv=8192 group=8:           cosine=0.991697, min_ms=0.140032
+  q=32768 kv=32768 group=8:        cosine=0.990060, min_ms=11.807712
+  q=32768 kv=131072 group=8:       cosine=0.990284, min_ms=47.535263
+```
+
+Diagnosis:
+
+```text
+M64 D128 BF16 logits size:          64 * 128 * 2 = 16384 bytes
+M64 D128 QK-B storage total:        2 K stages * 8192 bytes = 16384 bytes
+```
+
+So the old alias uses the entire QK-B region, not one inactive stage. The load
+role can prefetch next K into the alternate QK-B stage while current-tile
+logits still occupy the full QK-B region. D256 avoided this specific failure
+mode with a different K-chunk/lifetime structure (`qk_head_chunks=2`), but
+D128 has `qk_head_chunks=1`, so the alias lifetime is invalid.
+
+Current correct D128 state is therefore M64 with explicit logits. It is already
+~2.6x faster than the M128 role-port slice and wins long focus cells versus
+NVFP4 FA2, but the explicit 16 KiB logits buffer keeps storage at 66.5 KiB and
+prevents the 2-CTA/SM target. The next structural lever is removing or shrinking
+the logits handoff without reintroducing the QK-B lifetime collision.
+
+K64 was tested as a possible storage escape hatch:
+
+```text
+D128 M64 x N128 x K64 + explicit BF16 logits:
+  storage:                         63488 bytes
+  q=512 kv=8192 group=8:           cosine=0.991697, min_ms=0.168320
+  q=32768 kv=32768 group=8:        cosine=0.990060, min_ms=12.973856
+```
+
+Rejected for now. K64 is correct, but it still does not reach 2 CTAs/SM and it
+regresses both the smoke and anchor cells versus K128 (`0.140 ms` and
+`11.81 ms`). The extra K pass costs more than the modest storage reduction buys.
+
+Also tested 2-thread row softmax on the correct M64/K128 path:
+
+```text
+D128 M64 x N128 x K128 + explicit logits + 2 softmax threads/row:
+  q=512 kv=8192 group=8:           cosine=0.991697, min_ms=0.156832
+  q=32768 kv=32768 group=8:        cosine=0.990060, min_ms=13.155488
+```
+
+Rejected. The 2-thread row split reduces participating softmax lanes but doubles
+per-lane column work and regresses both smoke and anchor. Keep the D256-style
+4-thread row split for D128.
+
+Logits row skew was retuned on the explicit-logits M64/K128 path:
+
+```text
+skew=0 smoke q=512 kv=8192 group=8:  min_ms=0.163680
+skew=8 smoke q=512 kv=8192 group=8:  min_ms=0.162272
+skew=4 current reference:            min_ms=0.140032
+```
+
+Rejected skew 0 and 8. Keep `SM120_D128_LOGITS_ROW_SKEW=4`.
+
+Direct MMA epilogue was retested for D128:
+
+```text
+D128 M64/K128 + explicit logits + direct epilogue:
+  q=512 kv=8192 group=8:           cosine=0.991697, min_ms=0.150208
+  q=32768 kv=32768 group=8:        cosine=0.990060, min_ms=12.169760
+```
+
+Rejected. The dedicated epilogue role remains faster (`0.140 ms` smoke,
+`11.81 ms` anchor), matching the D256 conclusion.
+
+Cleanup: removed the D128 direct-epilogue compile-time switch and deleted the
+direct-store branch/helper. The dedicated epilogue role is now the only D128
+output path. Smoke after cleanup:
+
+```text
+q=512 kv=8192 group=8: cosine=0.991697, min_ms=0.140064
+```
+
+Follow-up cleanup: removed the inactive Softmax0/Softmax1 PipelineAsync
+storage, ordered softmax barrier, old softmax-role branch, and settled
+MMA-owned-softmax compile-time switches from the D128 file. The active D128
+role stack is now MMA + Load + Epilogue only. Smoke after cleanup:
+
+```text
+q=512 kv=8192 group=8: storage=66560 bytes, cosine=0.991697, min_ms=0.141216
+q=32768 kv=32768 group=8: storage=66560 bytes, cosine=0.990060, min_ms=11.868736
+```
+
+This did not change the shared-memory limiter; the remaining structural lever
+is still the explicit 16 KiB BF16 logits handoff.
+
+Follow-up cleanup: made D128 span1-only. D128 has exactly one 128-wide output
+group, so the reuse2/reuse4 wrappers, span2/span4 kernel instantiations, and
+extra PV accumulator declarations were deleted from the D128 translation unit.
+
+```text
+resource usage: active stage kernel REG 168 -> 167
+q=512 kv=8192 group=8: storage=66560 bytes, cosine=0.991697, min_ms=0.142208
+q=32768 kv=32768 group=8: storage=66560 bytes, cosine=0.990060, min_ms=11.852992
+```
+
+This is cleanup and compile-surface reduction, not a material runtime win. It
+does not change the conclusion: D128 high-q remains limited by the explicit
+BF16 logits handoff and 1-CTA/SM shared-memory footprint.
+
+C-fragment ownership check for a possible direct accumulator-to-P path:
+
+```text
+row 0 owners:
+  tid 0:   cols 0,1,8,9,32,33,40,41,64,65,72,73,96,97,104,105
+  tid 1:   cols 2,3,10,11,34,35,42,43,66,67,74,75,98,99,106,107
+  tid 2:   cols 4,5,12,13,36,37,44,45,68,69,76,77,100,101,108,109
+  tid 3:   cols 6,7,14,15,38,39,46,47,70,71,78,79,102,103,110,111
+  tid 128: cols 16,17,24,25,48,49,56,57,80,81,88,89,112,113,120,121
+  tid 129: cols 18,19,26,27,50,51,58,59,82,83,90,91,114,115,122,123
+  tid 130: cols 20,21,28,29,52,53,60,61,84,85,92,93,116,117,124,125
+  tid 131: cols 22,23,30,31,54,55,62,63,86,87,94,95,118,119,126,127
+```
+
+The direct path is structurally possible because each owner has paired columns,
+but row reductions cross eight threads and two warpgroups, and scale-group max
+crosses four owner threads. It needs a small row/group scratch or atomics, not
+just a local register transform.
+
+Important lifetime constraint: with the current single P buffer, the mainloop
+must run PV(previous tile) before softmax/P(current tile) overwrites P. A direct
+QK-accumulator-to-P path therefore requires either:
+
+```text
+1. reorder the loop to PV(previous) -> QK(current) -> direct softmax/P(current), or
+2. add a second P buffer so QK(current) -> direct softmax/P(current) can happen
+   before PV(previous).
+```
+
+Option 2 adds P storage and works against the 2-CTA target. Option 1 is the
+next real structural rewrite if we continue chasing removal of the BF16 logits
+handoff.
+
+Follow-up cleanup: removed the rejected QK-B logits alias switches and branches.
+D128 now always uses explicit BF16 logits storage, so the invalid full-QK-B and
+per-stage alias paths cannot be accidentally re-enabled.
+
+```text
+q=512 kv=8192 group=8: storage=66560 bytes, cosine=0.991697, min_ms=0.141120
+```
+
+Attempted a safe QK-B/logits alias variant to recover the 2-CTA storage target:
+duplicate each D128 K tile into both QK-B pipeline stages and release both
+stages after MMA-owned softmax consumed logits. This was intended to prevent
+next-K prefetch from colliding with logits while keeping storage at ~50 KiB.
+
+Result: rejected. The variant hung at runtime on the smoke cell, indicating the
+manual duplicate-stage protocol violated the CUTLASS TMA pipeline state
+contract. Reverted to explicit logits. A correct 2-CTA path still needs either
+register-resident logits/P staging or a proper pipeline-level rewrite, not a
+local duplicate-stage hack.
+
+NCU profile for the current correct M64/K128 explicit-logits anchor:
+
+```text
+cell: q=32768 kv=32768 group=8 split_kv_len=32768
+report: reports/ncu_d128_m64_k128_anchor_20260430.ncu-rep
+wall in profiled run:                 11.93 ms
+shared memory per block:              66.56 KiB
+occupancy limit:                      shared memory = 1 CTA/SM
+issue slots busy:                     45.55%
+tensor pipe active:                   24.0%
+mem busy:                             49.95%
+L1/TEX hit rate:                      99.43%
+L2 hit rate:                          99.67%
+local/shared spilling:                0
+active warps / scheduler:             2.50
+eligible warps / scheduler:           0.65
+no eligible cycles:                   53.70%
+top per-issue stalls:
+  wait                                1.17
+  sleeping                            0.87
+  short scoreboard                    0.48
+  math pipe throttle                  0.44
+  not selected                        0.40
+  MIO throttle                        0.36
+  barrier                             0.19
+  long scoreboard                     0.16
+```
+
+Interpretation: this is no longer the old barrier-dominated profile. The kernel
+is primarily occupancy/eligibility limited by the 66.5 KiB shared-memory
+footprint; memory hits are excellent, there are no spills, and tensor pipe is
+reasonably active for a single-CTA/SM D128 path. The next large lever remains
+storage reduction to 2 CTAs/SM, specifically removing the explicit 16 KiB BF16
+logits handoff without corrupting K prefetch.
+
+M32 was attempted as an explicit-logits path that could fit 2 CTAs/SM without
+QK-B aliasing. It is not currently available through the CUTLASS cooperative
+SM120 block-scaled mainloop:
+
+```text
+error: Cooperative kernel requires Tile Size to be greater than or equal to 128
+along the M-dimension, except SM120 block-scaled kernels also support M=64.
+```
+
+Even after adapting the epilogue tile from 64x32 to 32x32, the cooperative
+kernel rejects M32. Reverted to M64. If M32 is needed later, it requires a
+CUTLASS-side extension analogous to the earlier M64 enablement, not a local
+attention-kernel change.
+
+After the CUTLASS M32 extension landed, M32 was retested:
+
+```text
+D128 M32 x N128 x K128 + explicit BF16 logits:
+  storage:                         53248 bytes
+  q=512 kv=8192 group=8:           cosine=0.991697, min_ms=0.106272
+  q=32768 kv=32768 group=8:        cosine=0.990060, min_ms=15.270496
+
+D128 M32 x N128 x K128 + per-stage QK-B logits alias:
+  storage:                         45056 bytes
+  q=512 kv=8192 group=8:           cosine=0.991697, min_ms=0.107392
+  q=32768 kv=32768 group=8:        cosine=0.990061, min_ms=15.360256
+```
+
+The per-stage QK-B alias is correct for M32 because one BF16 logits tile is 8
+KiB and fits inside one QK-B pipeline stage. This is different from M64, where
+one logits tile is 16 KiB and spans both K stages.
+
+NCU for M32 per-stage alias:
+
+```text
+report:                            reports/ncu_d128_m32_stage_alias_anchor_20260430.ncu-rep
+shared memory per block:            45.06 KiB
+registers per thread allocated:     168
+occupancy limiter:                  registers = 1 block
+active warps / scheduler:           2.50
+eligible warps / scheduler:         0.43
+issue slots busy:                   36.12%
+tensor pipe active:                 under-utilized
+```
+
+So M32 solves the shared-memory footprint but does not unlock 2 CTAs/SM because
+register allocation remains the limiter. A `-maxrregcount=96` probe preserved
+correctness but did not improve wall time (`q=32768 kv=32768 group=8` remained
+~15.36 ms). Rejected M32 for the high-q D128 path. It may still be useful later
+as a small-q dispatch variant, since it beats M64 on the smoke cell, but the
+current high-throughput focus path returns to M64/K128 explicit logits.
+
+N64 was tested as a D128-native alternative to reduce QK/logits/P state while
+keeping M64:
+
+```text
+D128 M64 x N64 x K128:
+  q=512 kv=8192 group=8 smoke: illegal instruction at runtime
+```
+
+Rejected. The shape compiles after relaxing the local softmax assertion, but it
+does not execute correctly with the current CUTLASS SM120 block-scaled
+collective/epilogue binding. Reverted to N128.
+
+## D128 Split-KV Policy Retune
+
+Retuned split-KV after the M64/K128 explicit-logits path landed. For high-q
+D128 there are already enough Q tiles to saturate the device, so split-KV mostly
+adds combine traffic.
+
+```text
+q=32768 group=8
+kv=65536:   split=65536   23.149 ms
+kv=131072:  split=131072  46.270 ms
+             split=65536  47.038 ms
+             split=32768  47.752 ms
+kv=262144:  split=262144 100.200 ms
+             split=131072 101.010 ms
+             split=65536 101.771 ms
+             split=32768 102.756 ms
+
+q=32768 kv=131072
+group=4:   split=131072 23.470 ms, split=65536 23.549 ms, split=32768 23.959 ms
+group=12:  split=131072 72.455 ms, split=65536 74.022 ms, split=32768 75.001 ms
+group=16:  split=131072 101.019 ms, split=65536 102.766 ms, split=32768 103.849 ms
+```
+
+Decision: for high-q D128 focus cells, use no split (`split_kv_len = kv_len`).
+Split-KV remains a decode/small-q lever, not a high-throughput prefill lever.
+
+## D128 Rejected Probe: FP8 Logits Staging
+
+Tested replacing the intermediate BF16 logits tile with signed E4M3 byte
+storage. The motivation was to halve QK->softmax smem traffic and make M64
+logits fit inside the two QK-B stages:
+
+```text
+D128 M64 x N128 x K128 + E4M3 logits:
+  storage:                         50176 bytes
+  q=512 kv=8192 group=8:           cosine=0.991750, min_ms=0.154592
+  q=32768 kv=32768 group=8:        cosine=0.990118, min_ms=12.876128
+
+Baseline M64 explicit BF16 logits:
+  storage:                         66560 bytes
+  q=512 kv=8192 group=8:           min_ms ~= 0.139712
+  q=32768 kv=32768 group=8:        min_ms ~= 11.845
+```
+
+Correctness held, but both smoke and anchor regressed. The conversion cost and
+loss of BF16 logit precision outweigh the reduced smem footprint. Reverted.
+This means the next meaningful D128 lever is not narrower logit storage; it is
+removing the QK-logits smem handoff entirely or reducing role/barrier overhead
+around the existing BF16 handoff.
+
+## D128 Rejected Probe: Second P Buffer Scheduling
+
+Tested the bounded form of the second-P-buffer option. The change set:
+
+```text
+kSm120D128SinglePBuffer = false
+mainloop order:
+  QK(current) -> softmax/P(current) -> PV(previous)
+```
+
+This materializes a separate P1 data/scale buffer and uses tile parity to avoid
+overwriting `P(previous)` before PV consumes it. It does not implement direct
+QK-accumulator-to-P packing; it only tests whether the extra P buffer removes a
+profitable scheduling dependency in the current BF16-logits path.
+
+Results on 2026-04-30:
+
+```text
+D128 M64 x N128 x K128, second P buffer:
+  storage:                         77824 bytes
+  storage margin:                  23552 bytes
+  q=512 kv=8192 group=8:           cosine=0.991697, min_ms=0.177728
+  q=32768 kv=32768 group=8:        cosine=0.990060, min_ms=13.690624
+
+Baseline single P buffer:
+  storage:                         66560 bytes
+  q=512 kv=8192 group=8:           min_ms ~= 0.141120
+  q=32768 kv=32768 group=8:        min_ms ~= 11.852992
+```
+
+Decision: reject and revert. The extra P buffer costs 11,264 bytes in the real
+layout and regresses both smoke and anchor. The ordering freedom alone is not a
+win. A future direct accumulator-to-P path must use the single-buffer reordered
+loop (`PV(previous) -> QK(current) -> direct softmax/P(current)`) or prove a
+separate benefit large enough to justify the extra shared-memory footprint.
