@@ -11782,3 +11782,58 @@ Keep split_kv_len=32768 as the D512 focused default. split_kv_len=16384 is only
 noise-level faster on the shortest 32K cell and loses at longer KV. No-split is
 not better once KV grows.
 ```
+
+## D512 Output-Group Span And Post-P-Reuse NCU
+
+Output span check on the weakest D512 focused cell:
+
+```text
+D=512 q=32768 kv=32768 group=4 split_kv_len=32768
+
+span1: 62.3594 ms
+span2: 43.1676 ms
+span4: 37.1393 ms
+```
+
+Decision:
+
+```text
+Keep span4 for D512/group4. The P-fragment reuse change makes span4 the clear
+winner despite the larger accumulator footprint.
+```
+
+Post-P-reuse NCU profile:
+
+```text
+shape: D=512 q=32768 kv=32768 group=4 split_kv_len=32768 span4
+report: /tmp/ncu_d512_anchor_preuse.ncu-rep
+
+duration under ncu:                 37.9 ms
+memory throughput:                  73.2%
+DRAM throughput:                    37.7%
+L2 throughput:                      73.2%
+L2 hit rate:                        99.8%
+compute throughput:                 28.1%
+tensor pipe active:                 17.0%
+issue active:                       14.6%
+active warps / scheduler:           2.51
+eligible warps / scheduler:         0.20
+local/shared spilling requests:     0
+
+top warp stalls:
+  long scoreboard:                  4.07 inst
+  sleeping:                         3.28 inst
+  wait:                             1.96 inst
+  LG throttle:                      1.34 inst
+  short scoreboard:                 1.23 inst
+  barrier:                          0.62 inst
+```
+
+Interpretation:
+
+```text
+The D512 kernel is no longer primarily barrier-bound after P reuse. It is now
+limited by memory/L2 pressure and low eligible warp count, with no register
+spills. Further D512 wins should target memory traffic/layout and the remaining
+QK logits/P staging handoff, not split-KV or output-span policy.
+```
