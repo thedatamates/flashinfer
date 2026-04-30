@@ -11854,3 +11854,130 @@ limited by memory/L2 pressure and low eligible warp count, with no register
 spills. Further D512 wins should target memory traffic/layout and the remaining
 QK logits/P staging handoff, not split-KV or output-span policy.
 ```
+
+## D512 180-Cell Hillclimb Sweep
+
+Run:
+
+```text
+date: 2026-04-30
+report prefix: reports/d512_hillclimb_180cell_20260430
+head_dim: 512
+q: 128, 256, 512, 1024, 2048, 4096
+kv: 8192, 32768, 65536, 131072, 262144
+group: 2, 4, 6, 8, 12, 16
+kernels: sm120_fused, nvfp4_fa2, fp8_fa2, bf16_fa2
+fused split_kv_len: 32768
+fused output_group_span: 4
+CUDA_HOME: /usr/local/cuda-13.2
+CUTLASS_ROOT: /home/josh/tdm/cutlass
+```
+
+Artifacts:
+
+```text
+reports/d512_hillclimb_180cell_20260430.jsonl
+reports/d512_hillclimb_180cell_20260430.csv
+reports/d512_hillclimb_180cell_20260430.summary.csv
+reports/d512_hillclimb_180cell_20260430.md
+reports/d512_hillclimb_180cell_20260430.run.log
+```
+
+Completion:
+
+```text
+kernel rows: 720 / 720
+summary cells: 180 / 180
+ok rows: 540
+error rows: 180
+```
+
+All error rows are BF16 FA2 invalid-configuration failures at D512:
+
+```text
+Invalid configuration:
+NUM_MMA_Q=1 NUM_MMA_D_QK=32 NUM_MMA_D_VO=32 NUM_MMA_KV=1
+NUM_WARPS_Q=4 NUM_WARPS_KV=1
+```
+
+Overall fused-vs-NVFP4-FA2 result:
+
+```text
+fused beats nvfp4_fa2: 119 / 180 cells
+fused passes 2x gate:   98 / 180 cells
+median speedup:         2.37x
+min speedup:            0.068x
+max speedup:            5.99x
+```
+
+Rollup by group:
+
+```text
+group  cells  median  min     max     beats  passes_2x
+2      30     0.866   0.068   4.843   11     7
+4      30     1.768   0.124   4.907   16     13
+6      30     2.371   0.181   5.984   21     16
+8      30     2.690   0.234   4.929   21     18
+12     30     2.946   0.348   5.987   25     21
+16     30     3.626   0.467   4.944   25     23
+```
+
+Rollup by q:
+
+```text
+q     cells  median  beats  passes_2x
+128   30     0.449   6      2
+256   30     0.871   11     6
+512   30     1.757   19     13
+1024  30     3.418   25     21
+2048  30     3.872   28     27
+4096  30     3.840   30     29
+```
+
+Gemma4-relevant D512 group=8 slice:
+
+```text
+q     kv      fused_ms  nvfp4_fa2_ms  fp8_fa2_ms  speedup  passes_2x
+128   8192    1.285     0.340         0.344       0.26x    no
+128   32768   4.872     1.138         1.167       0.23x    no
+128   65536   4.887     2.203         2.274       0.45x    no
+128   131072  4.907     4.336         4.454       0.88x    no
+128   262144  4.918     8.687         8.799       1.77x    no
+256   8192    1.293     0.624         0.640       0.48x    no
+256   32768   4.876     2.267         2.359       0.47x    no
+256   65536   4.891     4.420         4.613       0.90x    no
+256   131072  4.912     8.803         9.173       1.79x    no
+256   262144  5.262     17.645        18.266      3.35x    yes
+512   8192    1.295     1.254         1.322       0.97x    no
+512   32768   4.889     4.764         5.028       0.97x    no
+512   65536   4.904     9.414         9.987       1.92x    no
+512   131072  5.211     18.822        19.995      3.61x    yes
+512   262144  11.415    37.763        39.814      3.31x    yes
+1024  8192    1.312     2.822         3.006       2.15x    yes
+1024  32768   4.898     11.439        12.259      2.34x    yes
+1024  65536   5.282     22.778        24.623      4.31x    yes
+1024  131072  11.464    45.954        49.529      4.01x    yes
+1024  262144  18.984    91.989        98.854      4.85x    yes
+2048  8192    1.417     5.307         5.672       3.74x    yes
+2048  32768   5.315     22.569        24.268      4.25x    yes
+2048  65536   11.358    45.577        48.821      4.01x    yes
+2048  131072  18.959    91.434        99.068      4.82x    yes
+2048  262144  38.015    187.388       199.010     4.93x    yes
+4096  8192    3.030     7.302         7.627       2.41x    yes
+4096  32768   11.491    34.133        35.718      2.97x    yes
+4096  65536   18.762    70.307        73.093      3.75x    yes
+4096  131072  37.877    149.667       147.728     3.95x    yes
+4096  262144  78.581    308.563       305.534     3.93x    yes
+```
+
+Interpretation:
+
+```text
+The D512 fused kernel is not a small-q dispatch path. It loses broadly at
+q=128/256 and is marginal around q=512 at shorter KV.
+
+The D512 fused kernel is a high-q / long-context path. For the Gemma4 group=8
+slice it passes the 2x gate for every q>=1024 cell and for the longer q=512
+cells. The strongest production-relevant region is q>=1024, where speedups are
+2.15x to 4.93x against NVFP4 FA2 and correctness cosines stay around 0.989-0.993.
+```
