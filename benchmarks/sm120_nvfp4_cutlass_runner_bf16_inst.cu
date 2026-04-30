@@ -1,5 +1,5 @@
 // Local BF16 instantiations for the SM120 NVFP4 CUTLASS runner used by
-// sm120_nvfp4_cutlass_fused_attention.cu. FlashInfer's normal Python path
+// sm120_nvfp4_cutlass_fused_attention_d512.cu. FlashInfer's normal Python path
 // generates these TUs through its JIT cache; this standalone extension needs
 // the same concrete launchers linked directly.
 

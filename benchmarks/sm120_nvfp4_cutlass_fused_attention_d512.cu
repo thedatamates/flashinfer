@@ -26,6 +26,9 @@
 #include <flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h>
 #include <flashinfer/mma.cuh>
 
+#include "sm120_nvfp4_paged_adapter.cuh"
+#include "sm120_nvfp4_paged_attention_bridge.cuh"
+
 namespace {
 
 constexpr int kQLen = 512;
@@ -373,14 +376,18 @@ __device__ __forceinline__ uint8_t smem_fp4_debug_code(uint8_t code,
 
 __global__ void quantize_q_rowmajor_kernel(const __nv_bfloat16* q,
                                            uint8_t* q_packed,
-                                           uint8_t* q_scales) {
+                                           uint8_t* q_scales,
+                                           int rows,
+                                           int head_dim,
+                                           int packed_head_dim,
+                                           int scale_cols) {
   const int row = blockIdx.x;
   const int scale_col = threadIdx.x;
-  if (row >= kQRows || scale_col >= kScaleCols) {
+  if (row >= rows || scale_col >= scale_cols) {
     return;
   }
 
-  const int base = row * kHeadDim + scale_col * 16;
+  const int base = row * head_dim + scale_col * 16;
   float max_abs = 0.0f;
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
@@ -388,7 +395,7 @@ __global__ void quantize_q_rowmajor_kernel(const __nv_bfloat16* q,
   }
 
   const uint8_t scale_byte = fp32_to_e4m3_byte(fmaxf(max_abs / 6.0f, 1.0e-8f));
-  q_scales[row * kScaleCols + scale_col] = scale_byte;
+  q_scales[row * scale_cols + scale_col] = scale_byte;
   const float scale = fmaxf(e4m3_byte_to_fp32(scale_byte), 1.0e-8f);
 
 #pragma unroll
@@ -397,7 +404,7 @@ __global__ void quantize_q_rowmajor_kernel(const __nv_bfloat16* q,
     const float x1 = __bfloat162float(q[base + 2 * pair + 1]) / scale;
     const uint8_t c0 = nearest_e2m1_code(x0);
     const uint8_t c1 = nearest_e2m1_code(x1);
-    q_packed[row * kPackedHeadDim + scale_col * 8 + pair] =
+    q_packed[row * packed_head_dim + scale_col * 8 + pair] =
         static_cast<uint8_t>(c0 | (c1 << 4));
   }
 }
@@ -803,6 +810,12 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     int kv_tile_start,
     int num_kv_tiles,
     int total_kv_tiles,
+    int q_len,
+    int group_size,
+    int kv_len_tokens,
+    int causal,
+    int sliding_window,
+    float logits_soft_cap,
     int out_group_idx,
     int out_stride_cols,
     float* split_m,
@@ -1436,6 +1449,35 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         return row * kCutlassTileN + skewed_col;
       }
     };
+    auto score_is_valid = [&](int row, int col, int tile) {
+      const int global_q_row = effective_q_tile * kCutlassTileM + row;
+      if (global_q_row >= q_len * group_size) {
+        return false;
+      }
+      const int q_token = global_q_row / group_size;
+      const int q_pos = kv_len_tokens - q_len + q_token;
+      const int kv_pos =
+          (effective_kv_tile_start + tile) * kCutlassTileN + col;
+      if (kv_pos >= kv_len_tokens) {
+        return false;
+      }
+      if (causal && kv_pos > q_pos) {
+        return false;
+      }
+      if (sliding_window > 0 && kv_pos < q_pos - sliding_window + 1) {
+        return false;
+      }
+      return true;
+    };
+    auto transform_score = [&](float logit, int row, int col, int tile) {
+      if (!score_is_valid(row, col, tile)) {
+        return -INFINITY;
+      }
+      if (logits_soft_cap > 0.0f) {
+        logit = logits_soft_cap * tanhf(logit / logits_soft_cap);
+      }
+      return logit;
+    };
     const bool mma_softmax_row_owner =
         qk_mma_thread_idx < kCutlassTileM * kSoftmaxThreadsPerRow;
     const int mma_softmax_row =
@@ -1473,10 +1515,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         tile_m =
             fmaxf(tile_m, __shfl_xor_sync(kSoftmaxGroupMask, tile_m, 2));
       }
-      const float next_m = fmaxf(mma_running_m, tile_m);
+      const bool tile_has_values = tile_m != -INFINITY;
+      const float next_m = tile_has_values ? fmaxf(mma_running_m, tile_m)
+                                           : mma_running_m;
       const float old_scale =
           mma_running_l == 0.0f ? 0.0f : __expf(mma_running_m - next_m);
-      const float tile_scale = __expf(tile_m - next_m);
+      const float tile_scale =
+          tile_has_values ? __expf(tile_m - next_m) : 0.0f;
       float tile_l_scaled_local = 0.0f;
 #pragma unroll
       for (int scale_group = col_begin / 16;
@@ -1490,7 +1535,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           const float logit = __bfloat162float(
               smem_logits_stage[logits_smem_index(mma_softmax_row,
                                                   local_col + i)]);
-          const float p_scaled = __expf(logit - tile_m) * tile_scale;
+          const float p_scaled =
+              tile_has_values ? __expf(logit - tile_m) * tile_scale : 0.0f;
           tile_l_scaled_local += p_scaled;
           vec_max = fmaxf(vec_max, p_scaled);
           p_vals[i] = p_scaled;
@@ -1638,7 +1684,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const int row = int(cute::get<0>(coord));
         const int col = int(cute::get<1>(coord));
         if (row < kCutlassTileM && col < kCutlassTileN) {
-          const float logit = qk_accum(i) * qk_scale;
+          const float logit =
+              transform_score(qk_accum(i) * qk_scale, row, col, tile);
           smem_logits_stage[logits_smem_index(row, col)] =
               __float2bfloat16(logit);
         }
@@ -1785,11 +1832,12 @@ __global__ void sm120_nvfp4_splitkv_combine_kernel(
 #pragma unroll 1
     for (int split = 0; split < num_splits; ++split) {
       const int stats_idx = split * q_rows + row;
-      const float correction = __expf(split_m[stats_idx] - global_m);
+      const float correction =
+          finite_f32(global_m) ? __expf(split_m[stats_idx] - global_m) : 0.0f;
       split_weights[split] = correction;
       global_l += correction * split_l[stats_idx];
     }
-    const float inv_global_l = 1.0f / fmaxf(global_l, 1.0e-20f);
+    const float inv_global_l = global_l > 0.0f ? 1.0f / global_l : 0.0f;
 #pragma unroll 1
     for (int split = 0; split < num_splits; ++split) {
       split_weights[split] *= inv_global_l;
@@ -1940,17 +1988,21 @@ void quantize_q_rowmajor(torch::Tensor q,
   check_tensor(q, "q", torch::kBFloat16);
   check_tensor(q_packed, "q_packed", torch::kUInt8);
   check_tensor(q_scales, "q_scales", torch::kUInt8);
-  TORCH_CHECK(q.sizes() == torch::IntArrayRef({kQLen, kGroup, kHeadDim}),
-              "q must have shape [512, 8, 512]");
-  TORCH_CHECK(q_packed.sizes() == torch::IntArrayRef({kQRows, kPackedHeadDim}),
-              "q_packed must have shape [4096, 256]");
-  TORCH_CHECK(q_scales.sizes() == torch::IntArrayRef({kQRows, kScaleCols}),
-              "q_scales must have shape [4096, 32]");
-  quantize_q_rowmajor_kernel<<<kQRows, kScaleCols, 0,
+  TORCH_CHECK(q.dim() == 2 || q.dim() == 3,
+              "q must have shape [rows, D] or [q_len, group, D]");
+  const int64_t q_rows64 = q.dim() == 3 ? q.size(0) * q.size(1) : q.size(0);
+  const int64_t head_dim64 = q.dim() == 3 ? q.size(2) : q.size(1);
+  TORCH_CHECK(head_dim64 == kHeadDim, "q head_dim must be ", kHeadDim);
+  TORCH_CHECK(q_packed.sizes() ==
+                  torch::IntArrayRef({q_rows64, kPackedHeadDim}),
+              "q_packed must have shape [q_rows, D/2]");
+  TORCH_CHECK(q_scales.size(0) >= q_rows64 && q_scales.size(1) == kScaleCols,
+              "q_scales must have shape [>= q_rows, D/16]");
+  quantize_q_rowmajor_kernel<<<static_cast<int>(q_rows64), kScaleCols, 0,
                                at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const __nv_bfloat16*>(q.data_ptr<at::BFloat16>()),
-      q_packed.data_ptr<uint8_t>(),
-      q_scales.data_ptr<uint8_t>());
+      q_packed.data_ptr<uint8_t>(), q_scales.data_ptr<uint8_t>(),
+      static_cast<int>(q_rows64), kHeadDim, kPackedHeadDim, kScaleCols);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2195,6 +2247,7 @@ void sm120_nvfp4_qkv_online_register_q_stage(torch::Tensor q_packed,
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
       static_cast<int>(q_tile), static_cast<int>(kv_tile_start),
       static_cast<int>(num_kv_tiles), kKvLen / kCutlassTileN,
+      kQLen, kGroup, kKvLen, 0, -1, 0.0f,
       static_cast<int>(out_group_idx), kCutlassTileN, nullptr, nullptr, 0, 0);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -2294,8 +2347,9 @@ void sm120_nvfp4_qkv_online_register_q_full_grid(torch::Tensor q_packed,
       qk_params, pv_params,
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha), 0, 0,
-      kKvLen / kCutlassTileN, kKvLen / kCutlassTileN, 0, kHeadDim, nullptr,
-      nullptr, 0, 0);
+      kKvLen / kCutlassTileN, kKvLen / kCutlassTileN,
+      kQLen, kGroup, kKvLen, 0, -1, 0.0f,
+      0, kHeadDim, nullptr, nullptr, 0, 0);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -2314,7 +2368,13 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
     torch::Tensor workspace,
     double qk_alpha,
     double pv_alpha,
-    int64_t split_kv_tiles) {
+    int64_t split_kv_tiles,
+    int64_t q_len,
+    int64_t group_size,
+    int64_t kv_len_tokens,
+    bool causal,
+    int64_t sliding_window,
+    double logits_soft_cap) {
   static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
                     kOutputGroupSpan == 4,
                 "SM120 split-KV wrapper currently supports span 1, 2, or 4");
@@ -2364,6 +2424,14 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
                   torch::IntArrayRef({head_dim64, prob_scale_cols64}),
               "v_pv_scales must have shape [D, kv_len/16]");
   TORCH_CHECK(split_kv_tiles > 0, "split_kv_tiles must be positive");
+  TORCH_CHECK(q_len > 0, "q_len must be positive");
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  TORCH_CHECK(q_len * group_size <= q_rows64,
+              "q_len * group_size must not exceed physical q rows");
+  TORCH_CHECK(kv_len_tokens > 0 && kv_len_tokens <= kv_len64,
+              "kv_len_tokens must be positive and not exceed physical K/V length");
+  TORCH_CHECK(sliding_window == -1 || sliding_window > 0,
+              "sliding_window must be -1 or positive");
   const int q_rows = static_cast<int>(q_rows64);
   const int head_dim = static_cast<int>(head_dim64);
   const int kv_len = static_cast<int>(kv_len64);
@@ -2447,7 +2515,11 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
       qk_params, pv_params,
       reinterpret_cast<__nv_bfloat16*>(partial.data_ptr<at::BFloat16>()),
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha), 0, 0,
-      static_cast<int>(split_kv_tiles), total_kv_tiles, 0, head_dim,
+      static_cast<int>(split_kv_tiles), total_kv_tiles,
+      static_cast<int>(q_len), static_cast<int>(group_size),
+      static_cast<int>(kv_len_tokens), causal ? 1 : 0,
+      static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
+      0, head_dim,
       split_m.data_ptr<float>(), split_l.data_ptr<float>(), q_rows,
       q_rows * head_dim);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -2477,11 +2549,18 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
     torch::Tensor workspace,
     double qk_alpha,
     double pv_alpha,
-    int64_t split_kv_tiles) {
+    int64_t split_kv_tiles,
+    int64_t q_len,
+    int64_t group_size,
+    int64_t kv_len_tokens,
+    bool causal,
+    int64_t sliding_window,
+    double logits_soft_cap) {
   sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<1>(
       q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
       partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-      split_kv_tiles);
+      split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
+      sliding_window, logits_soft_cap);
 }
 
 void sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
@@ -2499,6 +2578,12 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
     double qk_alpha,
     double pv_alpha,
     int64_t split_kv_tiles,
+    int64_t q_len,
+    int64_t group_size,
+    int64_t kv_len_tokens,
+    bool causal,
+    int64_t sliding_window,
+    double logits_soft_cap,
     int requested_output_group_span) {
   const int64_t head_dim64 = q_packed.size(1) * 2;
   const int available_groups = static_cast<int>(head_dim64 / kCutlassTileN);
@@ -2507,17 +2592,20 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
     sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<4>(
         q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
         partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-        split_kv_tiles);
+        split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
+        sliding_window, logits_soft_cap);
   } else if (span >= 2) {
     sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<2>(
         q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
         partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-        split_kv_tiles);
+        split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
+        sliding_window, logits_soft_cap);
   } else {
     sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl<1>(
         q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
         partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-        split_kv_tiles);
+        split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
+        sliding_window, logits_soft_cap);
   }
 }
 
@@ -2535,11 +2623,18 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid(
     torch::Tensor workspace,
     double qk_alpha,
     double pv_alpha,
-    int64_t split_kv_tiles) {
+    int64_t split_kv_tiles,
+    int64_t q_len,
+    int64_t group_size,
+    int64_t kv_len_tokens,
+    bool causal,
+    int64_t sliding_window,
+    double logits_soft_cap) {
   sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
       q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
       partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-      split_kv_tiles, 2);
+      split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
+      sliding_window, logits_soft_cap, 2);
 }
 
 void sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid(
@@ -2556,11 +2651,115 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid(
     torch::Tensor workspace,
     double qk_alpha,
     double pv_alpha,
-    int64_t split_kv_tiles) {
+    int64_t split_kv_tiles,
+    int64_t q_len,
+    int64_t group_size,
+    int64_t kv_len_tokens,
+    bool causal,
+    int64_t sliding_window,
+    double logits_soft_cap) {
   sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
       q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
       partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-      split_kv_tiles, 4);
+      split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
+      sliding_window, logits_soft_cap, 4);
+}
+
+void sm120_nvfp4_paged_qkv_online_register_q_splitkv_full_grid(
+    torch::Tensor q_packed,
+    torch::Tensor q_scales,
+    torch::Tensor k_pages,
+    torch::Tensor k_sf_pages,
+    torch::Tensor v_pages_pv,
+    torch::Tensor v_sf_pages_pv,
+    torch::Tensor block_table,
+    torch::Tensor k_dense_scratch,
+    torch::Tensor k_sf_dense_scratch,
+    torch::Tensor v_pv_dense_scratch,
+    torch::Tensor v_pv_sf_dense_scratch,
+    torch::Tensor partial,
+    torch::Tensor split_m,
+    torch::Tensor split_l,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    double qk_alpha,
+    double pv_alpha,
+    int64_t kv_head,
+    int64_t split_kv_tiles,
+    int64_t q_len,
+    int64_t group_size,
+    int64_t kv_len_tokens,
+    bool causal,
+    int64_t sliding_window,
+    double logits_soft_cap,
+    int64_t output_group_span) {
+  auto run_dense = [](torch::Tensor q_packed, torch::Tensor q_scales,
+                      torch::Tensor k_packed, torch::Tensor k_scales,
+                      torch::Tensor v_pv_packed, torch::Tensor v_pv_scales,
+                      torch::Tensor partial, torch::Tensor split_m,
+                      torch::Tensor split_l, torch::Tensor out,
+                      torch::Tensor workspace, double qk_alpha,
+                      double pv_alpha, int64_t split_kv_tiles, int64_t q_len,
+                      int64_t group_size, int64_t kv_len_tokens, bool causal,
+                      int64_t sliding_window, double logits_soft_cap,
+                      int64_t output_group_span) {
+    sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
+        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
+        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
+        split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
+        sliding_window, logits_soft_cap, static_cast<int>(output_group_span));
+  };
+  sm120_nvfp4_paged_bridge::paged_qkv_attention_single(
+      q_packed, q_scales, k_pages, k_sf_pages, v_pages_pv, v_sf_pages_pv,
+      block_table, k_dense_scratch, k_sf_dense_scratch, v_pv_dense_scratch,
+      v_pv_sf_dense_scratch, partial, split_m, split_l, out, workspace,
+      qk_alpha, pv_alpha, kv_head, split_kv_tiles, q_len, group_size,
+      kv_len_tokens, causal, sliding_window, logits_soft_cap,
+      output_group_span, run_dense);
+}
+
+void sm120_nvfp4_varlen_paged_qkv_online_register_q_splitkv_full_grid(
+    torch::Tensor q_packed,
+    torch::Tensor q_scales,
+    torch::Tensor k_pages,
+    torch::Tensor k_sf_pages,
+    torch::Tensor v_pages_pv,
+    torch::Tensor v_sf_pages_pv,
+    torch::Tensor block_tables,
+    torch::Tensor cu_seqlens_q,
+    torch::Tensor kv_lens,
+    torch::Tensor out,
+    torch::Tensor workspace,
+    double qk_alpha,
+    double pv_alpha,
+    int64_t kv_head,
+    int64_t group_size,
+    int64_t split_kv_tiles,
+    bool causal,
+    int64_t sliding_window,
+    double logits_soft_cap,
+    int64_t output_group_span) {
+  auto run_dense = [](torch::Tensor q_packed, torch::Tensor q_scales,
+                      torch::Tensor k_packed, torch::Tensor k_scales,
+                      torch::Tensor v_pv_packed, torch::Tensor v_pv_scales,
+                      torch::Tensor partial, torch::Tensor split_m,
+                      torch::Tensor split_l, torch::Tensor out,
+                      torch::Tensor workspace, double qk_alpha,
+                      double pv_alpha, int64_t split_kv_tiles, int64_t q_len,
+                      int64_t group_size, int64_t kv_len_tokens, bool causal,
+                      int64_t sliding_window, double logits_soft_cap,
+                      int64_t output_group_span) {
+    sm120_nvfp4_qkv_online_register_q_splitkv_dispatch(
+        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
+        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
+        split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
+        sliding_window, logits_soft_cap, static_cast<int>(output_group_span));
+  };
+  sm120_nvfp4_paged_bridge::varlen_paged_qkv_attention(
+      q_packed, q_scales, k_pages, k_sf_pages, v_pages_pv, v_sf_pages_pv,
+      block_tables, cu_seqlens_q, kv_lens, out, workspace, qk_alpha, pv_alpha,
+      kv_head, group_size, split_kv_tiles, causal, sliding_window,
+      logits_soft_cap, output_group_span, run_dense);
 }
 
 RunnerConfig runner_config_from_tactic(int64_t tactic) {
@@ -2876,6 +3075,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid",
         &sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid,
         "SM120 NVFP4 split-KV online-softmax full Shape-B tile grid reusing P across four output groups");
+  m.def("sm120_nvfp4_gather_paged_kv_to_dense_pv",
+        &sm120_nvfp4_paged_adapter::gather_paged_kv_to_dense_pv,
+        "Gather one paged NVFP4 K/V head into dense K and PV-ready V operands");
+  m.def("sm120_nvfp4_paged_qkv_online_register_q_splitkv_full_grid",
+        &sm120_nvfp4_paged_qkv_online_register_q_splitkv_full_grid,
+        "SM120 NVFP4 paged-KV bridge into the dense split-KV fused attention kernel");
+  m.def("sm120_nvfp4_varlen_paged_qkv_online_register_q_splitkv_full_grid",
+        &sm120_nvfp4_varlen_paged_qkv_online_register_q_splitkv_full_grid,
+        "SM120 NVFP4 varlen paged-KV bridge into the dense split-KV fused attention kernel");
   m.def("cutlass_runner_fp4_gemm", &cutlass_runner_fp4_gemm,
         "FlashInfer SM120 CUTLASS FP4 GEMM runner smoke hook");
   m.def("cutlass_sm120_blockscaled_collective_metadata",

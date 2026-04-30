@@ -40,6 +40,73 @@ def quantize_cutlass(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch
     return packed, block_scale, scale
 
 
+def make_paged_adapter_inputs_from_dense(
+    k_dense: torch.Tensor,
+    k_sf_dense: torch.Tensor,
+    v_pv_dense: torch.Tensor,
+    v_pv_sf_dense: torch.Tensor,
+    *,
+    page_size: int,
+    shuffle_pages: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if page_size != 16:
+        raise ValueError("paged adapter currently supports page_size=16")
+    kv_len, packed_dim = k_dense.shape
+    head_dim = packed_dim * 2
+    scale_dim = head_dim // 16
+    if kv_len % page_size != 0:
+        raise ValueError("kv_len must be divisible by page_size")
+    num_pages = kv_len // page_size
+
+    k_pages_logical = k_dense.view(num_pages, page_size, 1, packed_dim).contiguous()
+    k_sf_pages_logical = k_sf_dense.view(
+        num_pages, page_size, 1, scale_dim
+    ).contiguous()
+
+    dense_v_bytes = v_pv_dense.view(torch.uint8).view(head_dim, num_pages, page_size // 2)
+    dense_v_bytes = dense_v_bytes.permute(1, 2, 0).contiguous()
+    v_nibbles = torch.empty(
+        (num_pages, page_size, head_dim), device=k_dense.device, dtype=torch.uint8
+    )
+    v_nibbles[:, 0::2, :] = dense_v_bytes & 0x0F
+    v_nibbles[:, 1::2, :] = (dense_v_bytes >> 4) & 0x0F
+    v_pages_logical = (
+        v_nibbles[..., 0::2] | (v_nibbles[..., 1::2] << 4)
+    ).unsqueeze(2).contiguous()
+
+    v_sf_pages_logical_u8 = torch.empty(
+        (num_pages, page_size, 1, scale_dim),
+        device=k_dense.device,
+        dtype=torch.uint8,
+    )
+    dense_v_sf_u8 = v_pv_sf_dense.view(torch.uint8)
+    for d in range(head_dim):
+        v_sf_pages_logical_u8[:, d // scale_dim, 0, d % scale_dim] = dense_v_sf_u8[
+            d, :
+        ]
+    v_sf_pages_logical = v_sf_pages_logical_u8.view(v_pv_sf_dense.dtype)
+
+    if shuffle_pages:
+        physical_for_logical = torch.randperm(num_pages, device=k_dense.device)
+        block_table = physical_for_logical.to(torch.int32)
+        k_pages = torch.empty_like(k_pages_logical)
+        k_sf_pages = torch.empty_like(k_sf_pages_logical)
+        v_pages = torch.empty_like(v_pages_logical)
+        v_sf_pages = torch.empty_like(v_sf_pages_logical)
+        k_pages[physical_for_logical] = k_pages_logical
+        k_sf_pages[physical_for_logical] = k_sf_pages_logical
+        v_pages[physical_for_logical] = v_pages_logical
+        v_sf_pages[physical_for_logical] = v_sf_pages_logical
+    else:
+        block_table = torch.arange(num_pages, device=k_dense.device, dtype=torch.int32)
+        k_pages = k_pages_logical
+        k_sf_pages = k_sf_pages_logical
+        v_pages = v_pages_logical
+        v_sf_pages = v_sf_pages_logical
+
+    return k_pages, k_sf_pages, v_pages, v_sf_pages, block_table
+
+
 def make_shape_inputs(
     device: torch.device,
     *,
@@ -108,8 +175,8 @@ def build_extension(head_dim: int = HEAD_DIM):
         source_name = "sm120_nvfp4_cutlass_fused_attention_d256.cu"
         extension_name = "sm120_nvfp4_cutlass_fused_attention_d256_ext"
     elif head_dim == 512:
-        source_name = "sm120_nvfp4_cutlass_fused_attention.cu"
-        extension_name = "sm120_nvfp4_cutlass_fused_attention_ext"
+        source_name = "sm120_nvfp4_cutlass_fused_attention_d512.cu"
+        extension_name = "sm120_nvfp4_cutlass_fused_attention_d512_ext"
     else:
         raise ValueError("head_dim must be one of {128, 256, 512}")
     return load(
@@ -157,6 +224,13 @@ def main() -> None:
     parser.add_argument("--kv-len", type=int, default=32768)
     parser.add_argument("--head-dim", type=int, default=HEAD_DIM)
     parser.add_argument("--group", type=int, default=GROUP)
+    parser.add_argument("--causal", action="store_true")
+    parser.add_argument("--sliding-window", type=int, default=-1)
+    parser.add_argument("--logits-soft-cap", type=float, default=0.0)
+    parser.add_argument("--paged-adapter-check", action="store_true")
+    parser.add_argument("--paged-adapter-shuffle-pages", action="store_true")
+    parser.add_argument("--paged-bridge-check", action="store_true")
+    parser.add_argument("--varlen-paged-bridge-check", action="store_true")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeat", type=int, default=50)
     args = parser.parse_args()
@@ -265,6 +339,79 @@ def main() -> None:
         v_pv_cutlass, v_pv_cutlass_scales, v_pv_cutlass_global = quantize_cutlass(
             v_ref_f32.T.contiguous().to(torch.bfloat16)
         )
+        k_cutlass_original = k_cutlass
+        k_cutlass_scales_original = k_cutlass_scales
+        v_pv_cutlass_original = v_pv_cutlass
+        v_pv_cutlass_scales_original = v_pv_cutlass_scales
+        paged_inputs = None
+        if (
+            args.paged_adapter_check
+            or args.paged_bridge_check
+            or args.varlen_paged_bridge_check
+        ):
+            paged_inputs = make_paged_adapter_inputs_from_dense(
+                k_cutlass_original,
+                k_cutlass_scales_original,
+                v_pv_cutlass_original,
+                v_pv_cutlass_scales_original,
+                page_size=16,
+                shuffle_pages=bool(args.paged_adapter_shuffle_pages),
+            )
+        adapter_result: dict[str, object] = {}
+        if args.paged_adapter_check:
+            (
+                k_pages,
+                k_sf_pages,
+                v_pages_pv,
+                v_sf_pages_pv,
+                block_table,
+            ) = paged_inputs
+            k_dense_from_pages = torch.empty_like(k_cutlass)
+            k_sf_dense_from_pages = torch.empty_like(k_cutlass_scales)
+            v_pv_dense_from_pages = torch.empty_like(v_pv_cutlass)
+            v_pv_sf_dense_from_pages = torch.empty_like(v_pv_cutlass_scales)
+            ext.sm120_nvfp4_gather_paged_kv_to_dense_pv(
+                k_pages,
+                k_sf_pages,
+                v_pages_pv,
+                v_sf_pages_pv,
+                block_table,
+                k_dense_from_pages,
+                k_sf_dense_from_pages,
+                v_pv_dense_from_pages,
+                v_pv_sf_dense_from_pages,
+                0,
+                args.kv_len,
+            )
+            torch.cuda.synchronize()
+            adapter_result = {
+                "paged_adapter_check": True,
+                "paged_adapter_shuffle_pages": bool(
+                    args.paged_adapter_shuffle_pages
+                ),
+                "paged_adapter_k_equal": bool(
+                    torch.equal(k_dense_from_pages, k_cutlass)
+                ),
+                "paged_adapter_k_sf_equal": bool(
+                    torch.equal(
+                        k_sf_dense_from_pages.view(torch.uint8),
+                        k_cutlass_scales.view(torch.uint8),
+                    )
+                ),
+                "paged_adapter_v_equal": bool(
+                    torch.equal(v_pv_dense_from_pages, v_pv_cutlass)
+                ),
+                "paged_adapter_v_sf_equal": bool(
+                    torch.equal(
+                        v_pv_sf_dense_from_pages.view(torch.uint8),
+                        v_pv_cutlass_scales.view(torch.uint8),
+                    )
+                ),
+            }
+            k_cutlass = k_dense_from_pages
+            k_cutlass_scales = k_sf_dense_from_pages
+            v_pv_cutlass = v_pv_dense_from_pages
+            v_pv_cutlass_scales = v_pv_sf_dense_from_pages
         qk_alpha = 1.0 / (q_cutlass_global * k_cutlass_global)
         pv_alpha = 1.0 / v_pv_cutlass_global
         workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
@@ -296,23 +443,121 @@ def main() -> None:
                 else "sm120_qkv_online_register_q_splitkv_full_grid"
             )
         )
-        splitkv_fn(
-            q_cutlass,
-            q_cutlass_scales,
-            k_cutlass,
-            k_cutlass_scales,
-            v_pv_cutlass,
-            v_pv_cutlass_scales,
-            partial,
-            split_m,
-            split_l,
-            out,
-            workspace,
-            float(qk_alpha.item()),
-            float(pv_alpha.item()),
-            split_kv_tiles,
-        )
+
+        def run_splitkv() -> None:
+            splitkv_fn(
+                q_cutlass,
+                q_cutlass_scales,
+                k_cutlass,
+                k_cutlass_scales,
+                v_pv_cutlass,
+                v_pv_cutlass_scales,
+                partial,
+                split_m,
+                split_l,
+                out,
+                workspace,
+                float(qk_alpha.item()),
+                float(pv_alpha.item()),
+                split_kv_tiles,
+                args.q_len,
+                args.group,
+                args.kv_len,
+                bool(args.causal),
+                args.sliding_window,
+                float(args.logits_soft_cap),
+            )
+
+        run_splitkv()
         torch.cuda.synchronize()
+        bridge_result: dict[str, object] = {}
+        output_group_span = (
+            4
+            if args.sm120_qkv_online_splitkv_reuse4_full_grid_bench
+            else (2 if args.sm120_qkv_online_splitkv_reuse2_full_grid_bench else 1)
+        )
+        if args.paged_bridge_check or args.varlen_paged_bridge_check:
+            (
+                k_pages,
+                k_sf_pages,
+                v_pages_pv,
+                v_sf_pages_pv,
+                block_table,
+            ) = paged_inputs
+        if args.paged_bridge_check:
+            paged_out = torch.empty_like(out)
+            paged_partial = torch.empty_like(partial)
+            paged_split_m = torch.empty_like(split_m)
+            paged_split_l = torch.empty_like(split_l)
+            k_dense_scratch = torch.empty_like(k_cutlass_original)
+            k_sf_dense_scratch = torch.empty_like(k_cutlass_scales_original)
+            v_pv_dense_scratch = torch.empty_like(v_pv_cutlass_original)
+            v_pv_sf_dense_scratch = torch.empty_like(v_pv_cutlass_scales_original)
+            ext.sm120_nvfp4_paged_qkv_online_register_q_splitkv_full_grid(
+                q_cutlass,
+                q_cutlass_scales,
+                k_pages,
+                k_sf_pages,
+                v_pages_pv,
+                v_sf_pages_pv,
+                block_table,
+                k_dense_scratch,
+                k_sf_dense_scratch,
+                v_pv_dense_scratch,
+                v_pv_sf_dense_scratch,
+                paged_partial,
+                paged_split_m,
+                paged_split_l,
+                paged_out,
+                workspace,
+                float(qk_alpha.item()),
+                float(pv_alpha.item()),
+                0,
+                split_kv_tiles,
+                args.q_len,
+                args.group,
+                args.kv_len,
+                bool(args.causal),
+                args.sliding_window,
+                float(args.logits_soft_cap),
+                output_group_span,
+            )
+            torch.cuda.synchronize()
+            bridge_result.update(
+                compare("paged_bridge_vs_dense", paged_out, out)
+            )
+        if args.varlen_paged_bridge_check:
+            varlen_out = torch.empty_like(out)
+            cu_seqlens_q = torch.tensor(
+                [0, args.q_len], device=device, dtype=torch.int32
+            )
+            kv_lens = torch.tensor([args.kv_len], device=device, dtype=torch.int32)
+            ext.sm120_nvfp4_varlen_paged_qkv_online_register_q_splitkv_full_grid(
+                q_cutlass,
+                q_cutlass_scales,
+                k_pages,
+                k_sf_pages,
+                v_pages_pv,
+                v_sf_pages_pv,
+                block_table.view(1, -1).contiguous(),
+                cu_seqlens_q,
+                kv_lens,
+                varlen_out,
+                workspace,
+                float(qk_alpha.item()),
+                float(pv_alpha.item()),
+                0,
+                args.group,
+                split_kv_tiles,
+                bool(args.causal),
+                args.sliding_window,
+                float(args.logits_soft_cap),
+                output_group_span,
+            )
+            torch.cuda.synchronize()
+            bridge_result.update(
+                compare("varlen_paged_bridge_vs_dense", varlen_out, out)
+            )
 
         tactic = min(2, int(metadata["runner_tactic_count"]) - 1)
         qk_ref = torch.empty(
@@ -329,7 +574,27 @@ def main() -> None:
             tactic,
         )
         torch.cuda.synchronize()
-        probs = torch.softmax(qk_ref.float() / math.sqrt(args.head_dim), dim=-1)
+        scores = qk_ref.float() / math.sqrt(args.head_dim)
+        if args.logits_soft_cap > 0.0:
+            scores = args.logits_soft_cap * torch.tanh(
+                scores / args.logits_soft_cap
+            )
+        if args.causal or args.sliding_window > 0:
+            ref_rows = qk_ref.shape[0]
+            row = torch.arange(ref_rows, device=device)
+            q_pos = args.kv_len - args.q_len + row // args.group
+            kv_pos = torch.arange(args.kv_len, device=device)
+            mask = torch.ones(
+                (ref_rows, args.kv_len), dtype=torch.bool, device=device
+            )
+            if args.causal:
+                mask &= kv_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+            if args.sliding_window > 0:
+                mask &= kv_pos.unsqueeze(0) >= (
+                    q_pos.unsqueeze(1) - args.sliding_window + 1
+                )
+            scores = scores.masked_fill(~mask, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
         exact_ref = torch.matmul(probs.float(), v_ref_f32[:, :128].float())
         result = {
             splitkv_name: True,
@@ -337,6 +602,9 @@ def main() -> None:
             "kv_len": args.kv_len,
             "head_dim": args.head_dim,
             "group": args.group,
+            "causal": bool(args.causal),
+            "sliding_window": args.sliding_window,
+            "logits_soft_cap": args.logits_soft_cap,
             "output_shape": list(out.shape),
             "partial_shape": list(partial.shape),
             "splits": num_splits,
@@ -346,24 +614,11 @@ def main() -> None:
                 "sm120_qkv_load_collective_storage_margin_bytes"
             ],
         }
+        result.update(adapter_result)
+        result.update(bridge_result)
         result.update(compare("splitkv_full_grid_first_tile_vs_exact", out[:128, :128], exact_ref))
         result[f"bench_{splitkv_name}"] = event_ms(
-            lambda: splitkv_fn(
-                q_cutlass,
-                q_cutlass_scales,
-                k_cutlass,
-                k_cutlass_scales,
-                v_pv_cutlass,
-                v_pv_cutlass_scales,
-                partial,
-                split_m,
-                split_l,
-                out,
-                workspace,
-                float(qk_alpha.item()),
-                float(pv_alpha.item()),
-                split_kv_tiles,
-            ),
+            run_splitkv,
             warmup=args.warmup,
             repeat=args.repeat,
         )

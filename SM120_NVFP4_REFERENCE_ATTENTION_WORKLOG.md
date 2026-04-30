@@ -12712,3 +12712,456 @@ D512 smoke:
   mean_abs=0.000335312, max_abs=0.001747830
   min_ms=1.302048
 ```
+
+## Integration Phase: Score Semantics Milestone
+
+2026-04-30T15:57:16-05:00
+
+The active D128/D256/D512 fused benchmark kernels were still dense score
+kernels: contiguous K/V operands, no paged-KV indirection, no ragged scheduling,
+and the split-KV harness reference used plain dense softmax. The next production
+integration phase starts by making score semantics explicit before changing the
+load scheduler.
+
+Implemented across all three specializations:
+
+```text
+stage-kernel parameters:
+  q_len
+  group_size
+  kv_len_tokens
+  causal
+  sliding_window
+  logits_soft_cap
+```
+
+Score transform in QK:
+
+```text
+if score is outside the active causal/sliding window:
+  score = -inf
+else if logits_soft_cap > 0:
+  score = logits_soft_cap * tanh(score / logits_soft_cap)
+```
+
+The online softmax path now handles fully masked tile chunks without generating
+NaNs by treating their contribution as zero. Split-KV combine also handles
+fully masked split rows by assigning zero weight instead of evaluating
+`exp(-inf - -inf)`.
+
+Harness changes:
+
+```text
+--causal
+--sliding-window
+--logits-soft-cap
+```
+
+The PyTorch reference applies the same score transform before softmax.
+
+Validation:
+
+```text
+static checks:
+  git diff --check: pass
+  python py_compile benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py: pass
+
+D128 dense smoke:
+  q=512 kv=8192 group=8 split_kv_len=8192
+  finite=true, cosine=0.991697
+  mean_abs=0.000358316, max_abs=0.001803321
+  min_ms=0.283584
+
+D256 dense smoke:
+  q=512 kv=8192 group=6 span=2 split_kv_len=8192
+  finite=true, cosine=0.991516
+  mean_abs=0.000338966, max_abs=0.001632325
+  min_ms=0.342112
+
+D512 dense smoke:
+  q=512 kv=8192 group=4 span=4 split_kv_len=8192
+  finite=true, cosine=0.990005
+  mean_abs=0.000335312, max_abs=0.001747830
+  min_ms=2.084896
+
+D128 causal + sliding + softcap smoke:
+  sliding_window=1024, logits_soft_cap=50.0
+  finite=true, cosine=0.994457
+  mean_abs=0.000988853, max_abs=0.005020801
+  min_ms=0.266336
+
+D256 causal + sliding + softcap smoke:
+  sliding_window=1024, logits_soft_cap=50.0
+  finite=true, cosine=0.990931
+  mean_abs=0.000954257, max_abs=0.005854895
+  min_ms=0.326912
+
+D512 causal + sliding + softcap smoke:
+  sliding_window=1024, logits_soft_cap=50.0
+  finite=true, cosine=0.988548
+  mean_abs=0.000950641, max_abs=0.005102105
+  min_ms=1.994720
+```
+
+Remaining production integration work:
+
+```text
+1. Paged KV:
+   current K/V loads use dense CUTLASS TMA descriptors, where `kv_tile` maps
+   directly to a contiguous 128-token tile. vLLM page tables break that
+   assumption. The next structural load path must either issue per-page loads
+   into the existing smem layout or gather pages into dense/PV-ready staging.
+
+2. Variable-length batches:
+   current grid maps blockIdx.x directly to a dense q tile and blockIdx.z to a
+   uniform split-KV range. Ragged batches need a tile schedule mapping each CTA
+   to `(sequence, q_tile, split, output_group)` plus per-sequence q/kv lengths.
+
+3. Production V layout:
+   the benchmark path currently feeds PV with a V operand already arranged for
+   the block-scaled PV GEMM. A paged serving path must either store V in that
+   PV-ready layout or transform page-major V into the PV operand layout during
+   the paged load/gather stage.
+```
+
+## Integration Phase: Paged Adapter Milestone
+
+2026-04-30T16:06:28-05:00
+
+Added a shared paged adapter hook used by the D128/D256/D512 benchmark
+extensions:
+
+```text
+benchmarks/sm120_nvfp4_paged_adapter.cuh
+```
+
+Exported binding:
+
+```text
+sm120_nvfp4_gather_paged_kv_to_dense_pv(
+  k_pages, k_sf_pages,
+  v_pages_pv, v_sf_pages_pv,
+  block_table,
+  k_dense, k_sf_dense,
+  v_pv_dense, v_pv_sf_dense,
+  kv_head,
+  kv_len
+)
+```
+
+Scope:
+
+```text
+- page_size=16
+- one sequence
+- one KV head
+- K source layout:       [num_pages, 16, H_kv, D/2]
+- K scale source layout: [num_pages, 16, H_kv, D/16]
+- V source layout:       page-major PV-layout NVFP4 bytes
+- V scale source layout: page-major PV-layout scale sidecar
+- dense output K:        [kv_len, D/2]
+- dense output K scales: [kv_len, D/16]
+- dense output V/PV:     [D, kv_len/2]
+- dense output V scales: [D, kv_len/16]
+```
+
+This is not yet the final production load path. It is a correctness bridge from
+vLLM-style block-table pages to the existing dense TMA operands. It lets us
+validate page-table indirection and the V PV-layout transpose independently
+before replacing the in-kernel dense TMA K/V load helpers.
+
+Harness additions:
+
+```text
+--paged-adapter-check
+--paged-adapter-shuffle-pages
+```
+
+The harness now constructs physical pages from the dense CUTLASS operands,
+optionally shuffles physical page order, gathers through the adapter, verifies
+byte-identical reconstruction, then runs the fused attention kernel using the
+gathered operands.
+
+Validation with shuffled physical pages plus causal/sliding/softcap:
+
+```text
+D128:
+  q=512 kv=8192 group=8 split_kv_len=8192
+  paged_adapter_k_equal=true
+  paged_adapter_k_sf_equal=true
+  paged_adapter_v_equal=true
+  paged_adapter_v_sf_equal=true
+  finite=true, cosine=0.994457
+  min_ms=0.266080
+
+D256:
+  q=512 kv=8192 group=6 span=2 split_kv_len=8192
+  paged_adapter_k_equal=true
+  paged_adapter_k_sf_equal=true
+  paged_adapter_v_equal=true
+  paged_adapter_v_sf_equal=true
+  finite=true, cosine=0.990931
+  min_ms=0.321312
+
+D512:
+  q=512 kv=8192 group=4 span=4 split_kv_len=8192
+  paged_adapter_k_equal=true
+  paged_adapter_k_sf_equal=true
+  paged_adapter_v_equal=true
+  paged_adapter_v_sf_equal=true
+  finite=true, cosine=0.988548
+  min_ms=1.993952
+```
+
+Next structural step:
+
+```text
+Move the same page-table mapping from the pre-gather adapter into the load role:
+  dense load_k_chunk(kv_tile, k_outer)
+    -> paged load over the 8 physical 16-token pages in that 128-token tile
+
+  dense load_v_group_span(kv_tile)
+    -> paged V/PV load over the same physical pages and output-column groups
+
+The final version should avoid materializing dense K/V operands in global
+memory. The adapter remains useful as an oracle and fallback while the in-kernel
+gather path is being built.
+```
+
+## Integration Phase: Direct Paged Producer Probe
+
+2026-04-30T17:12:00-05:00
+
+Tried moving the page-table mapping directly into the D256 load role by having
+the load warp write paged K/V data into the existing CUTLASS QK/PV shared-memory
+operand tensors and then manually completing the `PipelineTmaAsync`
+transaction barrier.
+
+Result:
+
+```text
+D256 q=512 kv=8192 group=6 span=2
+causal=true sliding_window=1024 logits_soft_cap=50.0
+adapter reconstruction: byte-identical
+direct in-kernel paged producer cosine: 0.934877
+```
+
+A second version removed sub-byte write races by writing packed bytes/atomic
+nibbles through the CUTLASS smem layout. It still failed correctness:
+
+```text
+direct in-kernel paged producer cosine: 0.942942
+```
+
+Conclusion:
+
+```text
+The page-table data and PV page conversion are correct; the failing piece is the
+manual producer convention for CUTLASS SM120 block-scaled shared-memory operands.
+The direct paged producer path was removed from callable code rather than left
+as a broken experiment.
+```
+
+Current shippable correctness path:
+
+```text
+paged pages + block_table
+  -> sm120_nvfp4_gather_paged_kv_to_dense_pv
+  -> existing dense fused D128/D256/D512 kernels
+```
+
+Validation after removing the broken direct producer entry point:
+
+```text
+D128 q=512 kv=8192 group=8:
+  adapter equality: all true
+  finite=true cosine=0.994457 min_ms=0.265920
+
+D256 q=512 kv=8192 group=6:
+  adapter equality: all true
+  finite=true cosine=0.990931 min_ms=0.318272
+
+D512 q=512 kv=8192 group=4:
+  adapter equality: all true
+  finite=true cosine=0.988548 min_ms=1.998336
+```
+
+Next production integration step:
+
+```text
+Lift the adapter bridge into a production-facing wrapper with explicit scratch
+tensors/workspace, then add ragged-batch scheduling around that wrapper. Keep
+the direct in-kernel paged producer as a future optimization only after porting
+the exact CUTLASS TMA partition_D producer convention instead of re-deriving it.
+```
+
+## Integration Phase: Paged/Varlen Bridge Wrappers
+
+2026-04-30T17:55:00-05:00
+
+Implemented the production-facing bridge layer around the existing dense fused
+D128/D256/D512 kernels.
+
+New shared files:
+
+```text
+benchmarks/sm120_nvfp4_paged_adapter.cuh
+benchmarks/sm120_nvfp4_paged_attention_bridge.cuh
+```
+
+New extension entry points in all three specialization translation units:
+
+```text
+sm120_nvfp4_paged_qkv_online_register_q_splitkv_full_grid
+sm120_nvfp4_varlen_paged_qkv_online_register_q_splitkv_full_grid
+```
+
+Current production-correct path:
+
+```text
+paged NVFP4 K/V pages + block table
+  -> gather one KV-head group to dense K and PV-ready V scratch
+  -> dense SM120 NVFP4 fused split-KV attention kernel
+```
+
+The bridge is explicit about scratch ownership:
+
+```text
+single-sequence wrapper:
+  caller provides K scratch, K-scale scratch, PV-layout V scratch,
+  PV-layout V-scale scratch, partial output, split_m, split_l, out, workspace
+
+varlen wrapper:
+  caller provides q/q_scales, paged K/V tensors, block_tables,
+  cu_seqlens_q, kv_lens, out, workspace
+  wrapper allocates per-sequence dense K/V scratch and split-KV scratch
+```
+
+This is semantically correct but not the final fastest load path. It avoids
+materializing impossible production assumptions in the kernel while leaving the
+direct in-kernel paged producer for a later `partition_D`-based port.
+
+Important contract changes:
+
+```text
+physical q rows may be padded to the kernel tile-M multiple
+logical q_len * group_size <= physical q rows
+
+physical KV length may be padded to the kernel tile-N multiple
+logical kv_len_tokens <= physical KV length
+
+the kernel masks padded Q rows and padded KV tokens before softmax
+```
+
+This contract is required for ragged production batches because vLLM requests
+are not guaranteed to land on 64/128-row/tile boundaries.
+
+Validation:
+
+```text
+D128 q=512 kv=8192 group=8 causal sliding_window=1024 softcap=50:
+  paged adapter equality: all true
+  paged bridge vs dense: mean_abs=0, max_abs=0, cosine=1.0
+  varlen paged bridge vs dense: mean_abs=0, max_abs=0, cosine=1.0
+  exact-ref cosine=0.994457
+
+D256 q=512 kv=8192 group=6 causal sliding_window=1024 softcap=50:
+  paged adapter equality: all true
+  paged bridge vs dense: mean_abs=0, max_abs=0, cosine=1.0000001
+  varlen paged bridge vs dense: mean_abs=0, max_abs=0, cosine=1.0000001
+  exact-ref cosine=0.990931
+
+D512 q=512 kv=8192 group=4 causal sliding_window=1024 softcap=50:
+  paged adapter equality: all true
+  paged bridge vs dense: mean_abs=0, max_abs=0, cosine=1.0000001
+  varlen paged bridge vs dense: mean_abs=0, max_abs=0, cosine=1.0000001
+  exact-ref cosine=0.988548
+```
+
+Ragged edge-case validation:
+
+```text
+D256 q_len=513 group=6:
+  logical q rows: 3078
+  physical q rows: 3136
+
+logical KV: 8208
+physical KV: 8320
+
+varlen paged bridge vs manually padded dense kernel:
+  finite=true
+  mean_abs=0
+  max_abs=0
+  cosine=0.99999994
+```
+
+Current limitations:
+
+```text
+- The varlen bridge is single-KV-head-group scoped; integration must call it per
+  KV head group or add a higher-level head loop.
+- The bridge allocates per-sequence scratch internally. That is acceptable for
+  semantic integration but should be replaced with caller-managed workspace
+  before performance tuning.
+- Decode-sized q rows still use the padded prefill kernel path. The existing
+  XQA/decode policy remains the likely fast path for q=1.
+- Direct in-kernel paged loads remain blocked on porting the CUTLASS
+  partition_D producer convention exactly.
+```
+
+## Integration Phase: Dynamic BF16 Q Quantization
+
+2026-04-30T18:10:00-05:00
+
+The production bridge cannot rely on Python-only `flashinfer.nvfp4_quantize` for
+Q packing because vLLM hands attention BF16 Q. The in-extension
+`quantize_q_rowmajor` entry point is now shape-generic for the active
+specializations:
+
+```text
+accepted q shapes:
+  [rows, D]
+  [q_len, group, D]
+
+supported D:
+  128, 256, 512 via the matching specialization extension
+```
+
+The quantizer writes row-major NVFP4 Q and e4m3 group scales for the local
+fused kernel. It uses direct per-block scales, so the attention wrapper's
+`qk_alpha` for this path should compensate the K global scale but not a Q
+global scale. The benchmark path that uses `flashinfer.nvfp4_quantize` for Q
+still uses `qk_alpha = 1 / (q_global * k_global)`.
+
+Validation:
+
+```text
+D256 dynamic quantizer:
+  q_len=513 group=6 D=256
+  q_rows=3078
+  finite=true
+  mean_abs=0.017862
+  cosine=0.995469 vs BF16 Q
+
+D256 paged/varlen bridge after quantizer change:
+  paged bridge vs dense: mean_abs=0, max_abs=0, cosine=1.0000001
+  varlen paged bridge vs dense: mean_abs=0, max_abs=0, cosine=1.0000001
+  exact-ref cosine=0.990931
+```
+
+## Integration Phase: Specialization File Naming
+
+2026-04-30T18:18:00-05:00
+
+Matched the D512 benchmark/prototype filename to the D128/D256 specialization
+pattern:
+
+```text
+benchmarks/sm120_nvfp4_cutlass_fused_attention_d128.cu
+benchmarks/sm120_nvfp4_cutlass_fused_attention_d256.cu
+benchmarks/sm120_nvfp4_cutlass_fused_attention_d512.cu
+```
+
+The unsuffixed D512 name was a prototype artifact from when D512 was the only
+specialization. Production naming still needs to move out of `benchmarks/` and
+follow FlashInfer's operation/backend/arch convention.
