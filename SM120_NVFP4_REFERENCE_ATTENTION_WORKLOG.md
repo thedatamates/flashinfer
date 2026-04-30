@@ -11433,3 +11433,152 @@ latency lever.
 ```
 ```
 ```
+
+## D256 Small-M CUTLASS Padded-SFA Contract Fix
+
+Problem:
+
+```text
+After rebuilding against /home/josh/tdm/cutlass commit 24312f57, the D=256
+span2 fused stage kernel launched with CUDA illegal-instruction errors. CUTLASS
+standalone tests and the embedded CutlassFp4GemmRunner hook still passed, so the
+failure was in the custom fused-attention integration, not in the CUTLASS GEMM
+primitive.
+```
+
+Root cause:
+
+```text
+The small-M CUTLASS patch makes M=64 block-scaled kernels use padded SFA
+storage. The cooperative collective handles this by:
+
+  load side:     gSFA_mkl(..., broadcast_m(m_coord), ...)
+  consumer side: sSFA_full(make_coord(_, m_coord % SFA_M_Ratio), _, _)
+
+The span2 custom mainloop was still using the pre-small-M convention:
+
+  load side:     gSFA_mkl(..., effective_q_tile, ...)
+  consumer side: qk_sSFA(_, _, stage) / p_sSFA(_, _, stage)
+
+That is valid for M=128 but violates the patched M=64 CUTLASS SFA contract.
+```
+
+Fix:
+
+```text
+benchmarks/sm120_nvfp4_cutlass_fused_attention_d256.cu
+
+  - Q/SFA TMA source now uses the same broadcast_m layout as CUTLASS.
+  - Q SFA smem consumers slice by effective_q_tile % SFA_M_Ratio before
+    partition_fragment_SFA and SFA smem->register copies.
+  - P/PV SFA smem consumers and producers use the same padded-M slice, so the
+    softmax-generated P scales are staged where the PV MMA reads them.
+```
+
+Isolation:
+
+```text
+embedded CutlassFp4GemmRunner in the same extension:
+  runner_ok True
+
+span1 fused after fix, q=512 kv=8192 group=6:
+  0.200096 ms, cosine 0.991516
+
+span2 fused after fix, q=512 kv=8192 group=6:
+  0.219488 ms, cosine 0.991518
+```
+
+Focused four-cell sanity after fix:
+
+```text
+report:
+  reports/d256_group6_q32768_sanity_postopt_20260429.*
+
+q=32768, group=6, split_kv_len=32768, output_group_span=2
+
+kv       splits  fused ms   nvfp4 FA2 ms  fp8 FA2 ms   bf16 FA2 ms  speedup vs nvfp4  cosine
+32768    1       13.2364    23.4410       20.8888      14.2584      1.771x            0.990854
+65536    2       26.4188    70.3964       62.3308      42.0538      2.665x            0.992301
+131072   4       52.6747    172.5565      154.6562     102.8168     3.276x            0.991109
+262144   8       114.5021   372.6373      337.2659     228.4874     3.254x            0.991433
+```
+
+Conclusion:
+
+```text
+The rebuilt D=256 span2 kernel is operational again against the patched CUTLASS
+small-M branch. The fix also improves the four focused cells by roughly 3-4%
+versus the clean pre-rebuild checkpoint while preserving cosine around 0.991.
+Proceed with the postopt sweep only after this SFA-contract fix is retained.
+```
+
+## D256 Expanded Postopt Sweep vs Prior Baseline
+
+Report files:
+
+```text
+reports/d256_hillclimb_postopt_20260429.jsonl
+reports/d256_hillclimb_postopt_20260429.csv
+reports/d256_hillclimb_postopt_20260429.summary.csv
+reports/d256_hillclimb_postopt_20260429.md
+reports/d256_hillclimb_lift_vs_prior_baseline.md
+```
+
+Sweep matrix:
+
+```text
+D=256
+q_len:  {128, 256, 512, 1024, 2048, 4096}
+kv_len: {8192, 32768, 65536, 131072, 262144}
+group:  {2, 4, 6, 8, 12, 16}
+kernels per cell: sm120_fused, nvfp4_fa2, fp8_fa2, bf16_fa2
+```
+
+Operating point:
+
+```text
+tile=64x128x128
+output_group_span=2
+SM120_D256_LOGITS_ROW_SKEW=4
+CUTLASS_ROOT=/home/josh/tdm/cutlass
+split_kv_len=6656
+warmup=1
+repeat=3
+```
+
+Coverage and gate result:
+
+```text
+cells compared against prior baseline:       180 / 180
+regressions vs prior fused baseline:         0
+low-lift cells by 0-5% threshold:            0
+postopt cells beating nvfp4_fa2:             163 / 180
+postopt cells passing 2x gate vs nvfp4_fa2:  150 / 180
+```
+
+Per-group rollup:
+
+```text
+group  cells  median fused delta  median speedup vs nvfp4_fa2  beats nvfp4  passes 2x
+2      30     -76.5%              2.66x                         23           19
+4      30     -76.6%              2.96x                         26           23
+6      30     -76.5%              3.09x                         28           26
+8      30     -76.5%              3.19x                         28           26
+12     30     -76.2%              3.32x                         29           28
+16     30     -76.4%              3.25x                         29           28
+```
+
+Interpretation:
+
+```text
+The role-pipeline/row-skew/SFA-contract postopt state is a broad structural
+lift over the prior D=256 fused baseline, not a narrow win on the focused
+cells. Every cell improved by roughly 75-78% versus the prior fused baseline.
+
+The remaining misses are concentrated in small-q / short-kv launch-dominated
+cells. The larger-q and long-context cells that motivated this D=256 path are
+the win zone and usually clear the 2x nvfp4_fa2 gate.
+
+The full per-cell delta table is in:
+  reports/d256_hillclimb_lift_vs_prior_baseline.md
+```

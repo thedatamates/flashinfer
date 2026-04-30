@@ -93,6 +93,7 @@ def build_extension(head_dim: int = HEAD_DIM):
     extra_cuda_cflags = [
         "-std=c++17",
         "-O3",
+        "-DNDEBUG",
         "-lineinfo",
         "--use_fast_math",
         "--expt-relaxed-constexpr",
@@ -149,7 +150,7 @@ def build_extension(head_dim: int = HEAD_DIM):
             str(cutlass_root / "tools" / "util" / "include"),
         ],
         extra_cuda_cflags=extra_cuda_cflags,
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cflags=["-O3", "-std=c++17", "-DNDEBUG"],
         verbose=False,
     )
 

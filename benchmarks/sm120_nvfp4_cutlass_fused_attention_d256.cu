@@ -2947,14 +2947,24 @@ __device__ __forceinline__ void cutlass_qk_tma_q_register_stage(
     FrgTensorA& q_frag,
     FrgTensorSFA& q_scale_frag,
     int thread_idx,
+    int m_coord,
     typename CutlassCollectiveMainloop::TensorStorage& shared_tensors) {
   using namespace cute;
 
   Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()),
                           typename CutlassCollectiveMainloop::SmemLayoutA{});
-  Tensor sSFA = make_tensor(
+  Tensor sSFA_full = make_tensor(
       make_smem_ptr(shared_tensors.smem_SFA.begin()),
       typename CutlassCollectiveMainloop::SmemLayoutSFA{});
+  Tensor sSFA = [&]() {
+    if constexpr (!CutlassCollectiveMainloop::PadSFA_M) {
+      return sSFA_full;
+    } else {
+      return sSFA_full(
+          make_coord(_, m_coord % CutlassCollectiveMainloop::SFA_M_Ratio),
+          _, _);
+    }
+  }();
 
   auto tiled_mma = typename CutlassCollectiveMainloop::TiledMma{};
   CutlassCollectiveMainloop collective;
@@ -3279,6 +3289,16 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto qk_sSFA = cute::make_tensor(
       cute::make_smem_ptr(storage.qk_tensors.smem_SFA.begin()),
       typename CutlassCollectiveMainloop::SmemLayoutSFA{});
+  auto qk_sSFA_m = [&]() {
+    if constexpr (!CutlassCollectiveMainloop::PadSFA_M) {
+      return qk_sSFA;
+    } else {
+      return qk_sSFA(
+          cute::make_coord(cute::_, effective_q_tile %
+                                       CutlassCollectiveMainloop::SFA_M_Ratio),
+          cute::_, cute::_);
+    }
+  }();
   auto qk_sSFB = cute::make_tensor(
       cute::make_smem_ptr(storage.qk_tensors.smem_SFB.begin()),
       typename CutlassCollectiveMainloop::SmemLayoutSFB{});
@@ -3320,7 +3340,14 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto load_q_chunk = [&](int k_outer) {
     if (is_load && lane_predicate) {
       auto gA = qk_gA_mkl(_, _, effective_q_tile, _, 0);
-      auto gSFA = qk_gSFA_mkl(_, _, effective_q_tile, _, 0);
+      auto broadcast_m = cute::make_layout(
+          cute::make_shape(
+              cute::Int<CutlassCollectiveMainloop::SFA_M_Ratio>{},
+              cute::Int<cute::numeric_limits<int>::max()>{}),
+          cute::make_stride(
+              cute::_0{},
+              cute::Int<CutlassCollectiveMainloop::SFA_M_Ratio>{}));
+      auto gSFA = qk_gSFA_mkl(_, _, broadcast_m(effective_q_tile), _, 0);
       auto tAgA = qk_block_tma_a.partition_S(gA);
       auto tAgSFA = qk_block_tma_sfa.partition_S(gSFA);
       auto k_tile_iter = cute::make_coord_iterator(
@@ -3440,6 +3467,28 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                               ? p_smem_sfa0
                               : storage.p_smem_SFA1.begin()),
       typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFA{});
+  auto p_sSFA0_m = [&]() {
+    if constexpr (!CutlassCollectiveMainloopK128Stage2::PadSFA_M) {
+      return p_sSFA0;
+    } else {
+      return p_sSFA0(
+          cute::make_coord(
+              cute::_,
+              effective_q_tile % CutlassCollectiveMainloopK128Stage2::SFA_M_Ratio),
+          cute::_, cute::_);
+    }
+  }();
+  auto p_sSFA1_m = [&]() {
+    if constexpr (!CutlassCollectiveMainloopK128Stage2::PadSFA_M) {
+      return p_sSFA1;
+    } else {
+      return p_sSFA1(
+          cute::make_coord(
+              cute::_,
+              effective_q_tile % CutlassCollectiveMainloopK128Stage2::SFA_M_Ratio),
+          cute::_, cute::_);
+    }
+  }();
 
   auto consume_and_store_output_span = [&](int store_thread_idx) {
 #pragma unroll
@@ -3528,10 +3577,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     auto q_frag1 =
         qk_thread_mma.partition_fragment_A(qk_sA(_, _, cute::Int<0>{}));
     auto q_scale_frag0 =
-        qk_collective.partition_fragment_SFA(qk_sSFA(_, _, cute::Int<0>{}),
+        qk_collective.partition_fragment_SFA(qk_sSFA_m(_, _, cute::Int<0>{}),
                                              qk_thread_mma);
     auto q_scale_frag1 =
-        qk_collective.partition_fragment_SFA(qk_sSFA(_, _, cute::Int<0>{}),
+        qk_collective.partition_fragment_SFA(qk_sSFA_m(_, _, cute::Int<0>{}),
                                              qk_thread_mma);
     auto v_frag =
         pv_thread_mma.partition_fragment_B(pv_sB(_, _, cute::Int<0>{}));
@@ -3548,11 +3597,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         pv_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
     cutlass_qk_tma_q_register_stage(
         q_pipeline, q_pipe_read, q_frag0, q_scale_frag0, qk_mma_thread_idx,
-        storage.qk_tensors);
+        effective_q_tile, storage.qk_tensors);
     if (qk_head_chunks > 1) {
       cutlass_qk_tma_q_register_stage(
           q_pipeline, q_pipe_read, q_frag1, q_scale_frag1, qk_mma_thread_idx,
-          storage.qk_tensors);
+          effective_q_tile, storage.qk_tensors);
     }
     cute::clear(pv_accum0);
     if constexpr (kOutputGroupSpan >= 2) {
@@ -3896,10 +3945,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       const __nv_bfloat16* smem_logits_stage =
           (tile & 1) == 0 ? smem_logits0 : smem_logits1;
       if ((tile & 1) == 0) {
-        mma_stage_probability_row(p_sA0, p_sSFA0, smem_logits_stage, tile,
+        mma_stage_probability_row(p_sA0, p_sSFA0_m, smem_logits_stage, tile,
                                   final_tile);
       } else {
-        mma_stage_probability_row(p_sA1, p_sSFA1, smem_logits_stage, tile,
+        mma_stage_probability_row(p_sA1, p_sSFA1_m, smem_logits_stage, tile,
                                   final_tile);
       }
       cutlass::arch::NamedBarrier::sync(
@@ -4069,9 +4118,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         }
       }
       if ((tile & 1) == 0) {
-        pv_gemm_p_stage(pv_accum, p_sA0, p_sSFA0);
+        pv_gemm_p_stage(pv_accum, p_sA0, p_sSFA0_m);
       } else {
-        pv_gemm_p_stage(pv_accum, p_sA1, p_sSFA1);
+        pv_gemm_p_stage(pv_accum, p_sA1, p_sSFA1_m);
       }
       pv_release_v_stage();
       if (final_tile) {
@@ -4122,9 +4171,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       };
 
       if ((tile & 1) == 0) {
-        run_with_p_stage(p_sA0, p_sSFA0);
+        run_with_p_stage(p_sA0, p_sSFA0_m);
       } else {
-        run_with_p_stage(p_sA1, p_sSFA1);
+        run_with_p_stage(p_sA1, p_sSFA1_m);
       }
     };
 
@@ -4269,9 +4318,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const float tile_scale = __expf(tile_m - next_m);
         const float tile_l_scaled =
             (tile & 1) == 0
-                ? stage_probability_row(p_sA0, p_sSFA0, smem_logits0,
+                ? stage_probability_row(p_sA0, p_sSFA0_m, smem_logits0,
                                         owned_row, tile_m, tile_scale)
-                : stage_probability_row(p_sA1, p_sSFA1, smem_logits1,
+                : stage_probability_row(p_sA1, p_sSFA1_m, smem_logits1,
                                         owned_row, tile_m, tile_scale);
         running_l[row_slot] =
             running_l[row_slot] * old_scale + tile_l_scaled;
