@@ -11582,3 +11582,47 @@ the win zone and usually clear the 2x nvfp4_fa2 gate.
 The full per-cell delta table is in:
   reports/d256_hillclimb_lift_vs_prior_baseline.md
 ```
+
+## D256 Group 16 KV=1024 Q Sweep
+
+Report files:
+
+```text
+reports/d256_group16_kv1024_q_sweep_20260430.jsonl
+reports/d256_group16_kv1024_q_sweep_20260430.csv
+reports/d256_group16_kv1024_q_sweep_20260430.summary.csv
+reports/d256_group16_kv1024_q_sweep_20260430.md
+```
+
+Sweep:
+
+```text
+D=256
+group=16
+kv_len=1024
+q_len={1024,4096,8192,16384,32768}
+split_kv_len=6656
+output_group_span=2
+warmup=1
+repeat=3
+```
+
+Result:
+
+```text
+q      fused ms  nvfp4 FA2 ms  fp8 FA2 ms  bf16 FA2 ms  speedup vs nvfp4  cosine    2x gate
+1024   0.0868    0.1490        0.1322      0.0942       1.72x             0.9920    no
+4096   0.2197    0.5241        0.4531      0.3129       2.39x             0.9917    yes
+8192   0.3895    0.9785        0.8932      0.6034       2.51x             0.9882    yes
+16384  0.7621    2.0936        1.8812      1.2108       2.75x             0.9901    yes
+32768  1.4905    4.2177        3.8021      2.4235       2.83x             0.9909    yes
+```
+
+Interpretation:
+
+```text
+At group=16 and kv=1024, the D256 fused kernel beats nvfp4_fa2 for all tested
+q values. The 2x gate starts at q=4096. q=1024 wins by 1.72x but remains below
+the 2x target, which is consistent with launch/short-KV overhead dominating the
+lowest-q cell.
+```
