@@ -11710,6 +11710,15 @@ q      kv      fused ms  nvfp4 FA2 ms  fp8 FA2 ms  speedup vs nvfp4  cosine
 32768  262144  321.1207  1078.7087     1059.6572   3.36x             0.9898
 ```
 
+Smoke cell after P-fragment reuse:
+
+```text
+q=512 kv=8192 group=4 split_kv_len=8192
+pre-P-reuse D512 port: 3.5696 ms
+post-P-reuse D512 port: 1.2936 ms
+cosine: 0.9900
+```
+
 BF16 FA2 note:
 
 ```text
