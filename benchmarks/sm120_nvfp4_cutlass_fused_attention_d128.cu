@@ -45,10 +45,9 @@ constexpr int kTileN = 16;
 constexpr int kCutlassTileM = 64;
 constexpr int kCutlassTileN = 128;
 constexpr int kCutlassTileK = 128;
-constexpr bool kSm120D128SinglePBuffer = true;
-constexpr int kSm120D128MinBlocksPerSm = 1;
-constexpr int kSm120D128LogitsRowSkew = 4;
-constexpr int kSm120D128SoftmaxThreadsPerRow = 4;
+constexpr int kMinBlocksPerSm = 1;
+constexpr int kLogitsRowSkew = 4;
+constexpr int kSoftmaxThreadsPerRow = 4;
 constexpr int kQkTileN = kCutlassTileN;
 constexpr int kOutputTileN = 128;
 constexpr int kCutlassTileK128 = 128;
@@ -201,101 +200,6 @@ using CutlassGemmKernel =
 using CutlassGemm =
     cutlass::gemm::device::GemmUniversalAdapter<CutlassGemmKernel>;
 
-template <typename ThreadBlockShape, typename StageCountTag = void>
-struct Sm120Fp4CollectiveTraits {
-  using CollectiveEpilogue =
-      typename cutlass::epilogue::collective::CollectiveBuilder<
-          cutlass::arch::Sm120,
-          cutlass::arch::OpClassTensorOp,
-          ThreadBlockShape,
-          CutlassClusterShape,
-          cutlass::epilogue::collective::EpilogueTileAuto,
-          float,
-          float,
-          CutlassElementC,
-          cutlass::layout::RowMajor,
-          128 / cutlass::sizeof_bits<CutlassElementD>::value,
-          CutlassElementD,
-          cutlass::layout::RowMajor,
-          128 / cutlass::sizeof_bits<CutlassElementD>::value,
-          cutlass::epilogue::TmaWarpSpecialized,
-          CutlassFusionOperation>::CollectiveOp;
-  using MainloopStageCount = std::conditional_t<
-      std::is_void_v<StageCountTag>,
-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-          sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      StageCountTag>;
-  using CollectiveMainloop =
-      typename cutlass::gemm::collective::CollectiveBuilder<
-          cutlass::arch::Sm120,
-          cutlass::arch::OpClassBlockScaledTensorOp,
-          CutlassElementAB,
-          cutlass::layout::RowMajor,
-          32,
-          CutlassElementAB,
-          cutlass::layout::ColumnMajor,
-          32,
-          float,
-          ThreadBlockShape,
-          CutlassClusterShape,
-          MainloopStageCount,
-          cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
-  using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<CutlassProblemShape,
-                                           CollectiveMainloop,
-                                           CollectiveEpilogue,
-                                           cutlass::gemm::StaticPersistentScheduler>;
-};
-
-using Sm120Fp4Tile128x128x128 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_128, cute::_128, cute::_128>>;
-using Sm120Fp4Tile128x128x256 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_128, cute::_128, cute::_256>>;
-using Sm120Fp4Tile256x128x128 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_256, cute::_128, cute::_128>>;
-using Sm120Fp4Tile64x128x256 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_128, cute::_256>>;
-using Sm120Fp4Tile64x128x128 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_128, cute::_128>>;
-using Sm120Fp4Tile64x128x64 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_128, cute::_64>>;
-using Sm120Fp4Tile128x128x64 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_128, cute::_128, cute::_64>>;
-using Sm120Fp4Tile64x64x128 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_64, cute::_128>>;
-using Sm120Fp4Tile64x256x128 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_256, cute::_128>>;
-using Sm120Fp4Tile128x128x128Stage2 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_128, cute::_128, cute::_128>,
-                             cutlass::gemm::collective::StageCount<2>>;
-using Sm120Fp4Tile128x128x256Stage2 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_128, cute::_128, cute::_256>,
-                             cutlass::gemm::collective::StageCount<2>>;
-using Sm120Fp4Tile64x128x256Stage2 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_128, cute::_256>,
-                             cutlass::gemm::collective::StageCount<2>>;
-using Sm120Fp4Tile64x128x128Stage2 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_128, cute::_128>,
-                             cutlass::gemm::collective::StageCount<2>>;
-using Sm120Fp4Tile64x128x64Stage2 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_128, cute::_64>,
-                             cutlass::gemm::collective::StageCount<2>>;
-using Sm120Fp4Tile128x128x64Stage2 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_128, cute::_128, cute::_64>,
-                             cutlass::gemm::collective::StageCount<2>>;
-using Sm120Fp4Tile64x64x128Stage2 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_64, cute::_128>,
-                             cutlass::gemm::collective::StageCount<2>>;
-using Sm120Fp4Tile64x256x128Stage2 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_64, cute::_256, cute::_128>,
-                             cutlass::gemm::collective::StageCount<2>>;
-using Sm120Fp4Tile256x128x128Stage2 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_256, cute::_128, cute::_128>,
-                             cutlass::gemm::collective::StageCount<2>>;
-using CutlassCollectiveMainloopM64K256 =
-    typename Sm120Fp4Tile64x128x256::CollectiveMainloop;
-using CutlassCollectiveMainloopM64K128 =
-    typename Sm120Fp4Tile64x128x128::CollectiveMainloop;
 using CutlassThreadBlockShapeK128 =
     cute::Shape<cute::Int<kCutlassTileM>,
                 cute::Int<kOutputTileN>,
@@ -392,10 +296,6 @@ using Sm120Nvfp4PStorage0 = std::conditional_t<
     kSm120Nvfp4AliasP0InQkA,
     Sm120Nvfp4EmptyStorage,
     Sm120Nvfp4AlignedByteStorage<kSm120Nvfp4PvPStageBytes, 1024>>;
-using Sm120Nvfp4PStorage1 = std::conditional_t<
-    kSm120D128SinglePBuffer,
-    Sm120Nvfp4EmptyStorage,
-    Sm120Nvfp4AlignedByteStorage<kSm120Nvfp4PvPStageBytes, 1024>>;
 
 struct Sm120Nvfp4QkvLoadCollectiveStorage {
   alignas(128) typename CutlassCollectiveMainloop::TensorStorage qk_tensors;
@@ -421,15 +321,7 @@ struct Sm120Nvfp4QkvLoadCollectiveStorage {
       cute::ArrayEngine<
           cutlass::float_ue4m3_t,
           cute::cosize_v<typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFA>>>
-      p_smem_SFA0;
-  Sm120Nvfp4PStorage1 p_smem_A1;
-  alignas(16) std::conditional_t<
-      kSm120D128SinglePBuffer,
-      Sm120Nvfp4EmptyStorage,
-      cute::ArrayEngine<
-          cutlass::float_ue4m3_t,
-          cute::cosize_v<typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFA>>>
-      p_smem_SFA1;
+	      p_smem_SFA0;
   alignas(16) Sm120Nvfp4MainloopPipelineStorage role_pipeline_storage;
   alignas(16) float global_m[kCutlassTileM];
   alignas(16) float global_l[kCutlassTileM];
@@ -1079,9 +971,9 @@ __device__ __forceinline__ void sm120_epilogue_store_bf16_tile(
 }
 
 template <int kOutputGroupSpan>
-__global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount,
-                             kSm120D128MinBlocksPerSm)
-void sm120_nvfp4_qkv_online_register_q_stage_kernel(
+	__global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount,
+	                             kMinBlocksPerSm)
+	void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128Stage2::Params const pv_params,
     __nv_bfloat16* out_group,
@@ -1244,7 +1136,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   // blocked; A/SFA are free after Q is resident and hold two compact P stages.
   __nv_bfloat16* smem_logits0 =
       reinterpret_cast<__nv_bfloat16*>(storage.logits_smem.data);
-  __nv_bfloat16* smem_logits1 = smem_logits0;
   __nv_bfloat16* smem_epilogue_o = smem_logits0;
   auto qk_sSFA = cute::make_tensor(
       cute::make_smem_ptr(storage.qk_tensors.smem_SFA.begin()),
@@ -1401,45 +1292,24 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   } else {
     p_smem_sfa0 = storage.p_smem_SFA0.begin();
   }
-  auto p_sA0 = cute::make_tensor(
-      cute::make_smem_ptr(cute::recast_ptr<PvSmemAllocA>(
-          p_smem_a0_bytes)),
-      typename CutlassCollectiveMainloopK128Stage2::SmemLayoutA{});
-  auto p_sA1 = cute::make_tensor(
-      cute::make_smem_ptr(cute::recast_ptr<PvSmemAllocA>(
-          kSm120D128SinglePBuffer ? p_smem_a0_bytes
-                                    : storage.p_smem_A1.data)),
-      typename CutlassCollectiveMainloopK128Stage2::SmemLayoutA{});
-  auto p_sSFA0 = cute::make_tensor(
-      cute::make_smem_ptr(p_smem_sfa0),
-      typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFA{});
-  auto p_sSFA1 = cute::make_tensor(
-      cute::make_smem_ptr(kSm120D128SinglePBuffer
-                              ? p_smem_sfa0
-                              : storage.p_smem_SFA1.begin()),
-      typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFA{});
-  auto p_sSFA0_m = [&]() {
-    if constexpr (!CutlassCollectiveMainloopK128Stage2::PadSFA_M) {
-      return p_sSFA0;
+	  auto p_sA0 = cute::make_tensor(
+	      cute::make_smem_ptr(cute::recast_ptr<PvSmemAllocA>(
+	          p_smem_a0_bytes)),
+	      typename CutlassCollectiveMainloopK128Stage2::SmemLayoutA{});
+	  auto p_sSFA0 = cute::make_tensor(
+	      cute::make_smem_ptr(p_smem_sfa0),
+	      typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFA{});
+	  auto p_sSFA0_m = [&]() {
+	    if constexpr (!CutlassCollectiveMainloopK128Stage2::PadSFA_M) {
+	      return p_sSFA0;
     } else {
       return p_sSFA0(
           cute::make_coord(
               cute::_,
               effective_q_tile % CutlassCollectiveMainloopK128Stage2::SFA_M_Ratio),
-          cute::_, cute::_);
-    }
-  }();
-  auto p_sSFA1_m = [&]() {
-    if constexpr (!CutlassCollectiveMainloopK128Stage2::PadSFA_M) {
-      return p_sSFA1;
-    } else {
-      return p_sSFA1(
-          cute::make_coord(
-              cute::_,
-              effective_q_tile % CutlassCollectiveMainloopK128Stage2::SFA_M_Ratio),
-          cute::_, cute::_);
-    }
-  }();
+	          cute::_, cute::_);
+	    }
+	  }();
 
   auto consume_and_store_output_span = [&](int store_thread_idx) {
 #pragma unroll
@@ -1696,31 +1566,25 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       pv_gemm_loaded_p(accum, pv_tCrA, pv_tCrSFA);
     };
 
-    auto pv_cC = cute::make_identity_tensor(
-        cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
-    auto pv_tCcC = pv_thread_mma.partition_C(pv_cC);
-    static_assert(kCutlassTileN == 128,
-                  "D128 MMA-owned softmax currently assumes 128 score columns");
-    static_assert(kSm120D128SoftmaxThreadsPerRow == 2 ||
-                  kSm120D128SoftmaxThreadsPerRow == 4);
-    static_assert((kCutlassTileN & (kCutlassTileN - 1)) == 0,
-                  "logits row skew assumes power-of-two score tile width");
-    auto logits_smem_index = [](int row, int col) {
-      if constexpr (kSm120D128LogitsRowSkew == 0) {
-        return row * kCutlassTileN + col;
-      } else {
-        const int skewed_col =
-            (col + (row & 0x0f) * kSm120D128LogitsRowSkew) &
-            (kCutlassTileN - 1);
-        return row * kCutlassTileN + skewed_col;
-      }
-    };
-    const bool mma_softmax_row_owner =
-        qk_mma_thread_idx < kCutlassTileM * kSm120D128SoftmaxThreadsPerRow;
-    const int mma_softmax_row =
-        qk_mma_thread_idx / kSm120D128SoftmaxThreadsPerRow;
-    const int mma_softmax_row_lane =
-        qk_mma_thread_idx & (kSm120D128SoftmaxThreadsPerRow - 1);
+	    auto pv_cC = cute::make_identity_tensor(
+	        cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+	    auto pv_tCcC = pv_thread_mma.partition_C(pv_cC);
+	    static_assert(kCutlassTileN == 128,
+	                  "D128 MMA-owned softmax currently assumes 128 score columns");
+	    static_assert(kSoftmaxThreadsPerRow == 4);
+	    static_assert((kCutlassTileN & (kCutlassTileN - 1)) == 0,
+	                  "logits row skew assumes power-of-two score tile width");
+	    auto logits_smem_index = [](int row, int col) {
+	      const int skewed_col =
+	          (col + (row & 0x0f) * kLogitsRowSkew) & (kCutlassTileN - 1);
+	      return row * kCutlassTileN + skewed_col;
+	    };
+	    const bool mma_softmax_row_owner =
+	        qk_mma_thread_idx < kCutlassTileM * kSoftmaxThreadsPerRow;
+	    const int mma_softmax_row =
+	        qk_mma_thread_idx / kSoftmaxThreadsPerRow;
+	    const int mma_softmax_row_lane =
+	        qk_mma_thread_idx & (kSoftmaxThreadsPerRow - 1);
     float mma_running_m = -INFINITY;
     float mma_running_l = 0.0f;
 
@@ -1730,9 +1594,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       if (!mma_softmax_row_owner) {
         return;
       }
-      constexpr unsigned kSoftmaxGroupMask = 0xffffffffu;
-      constexpr int kColsPerSoftmaxThread =
-          kCutlassTileN / kSm120D128SoftmaxThreadsPerRow;
+	      constexpr unsigned kSoftmaxGroupMask = 0xffffffffu;
+	      constexpr int kColsPerSoftmaxThread =
+	          kCutlassTileN / kSoftmaxThreadsPerRow;
       const int col_begin = mma_softmax_row_lane * kColsPerSoftmaxThread;
       float tile_m_local = -INFINITY;
 #pragma unroll
@@ -1742,16 +1606,12 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const float logit = __bfloat162float(
             smem_logits_stage[logits_smem_index(mma_softmax_row, col)]);
         tile_m_local = fmaxf(tile_m_local, logit);
-      }
-      float tile_m = tile_m_local;
-      if constexpr (kSm120D128SoftmaxThreadsPerRow >= 2) {
-        tile_m =
-            fmaxf(tile_m, __shfl_xor_sync(kSoftmaxGroupMask, tile_m, 1));
-      }
-      if constexpr (kSm120D128SoftmaxThreadsPerRow >= 4) {
-        tile_m =
-            fmaxf(tile_m, __shfl_xor_sync(kSoftmaxGroupMask, tile_m, 2));
-      }
+	      }
+	      float tile_m = tile_m_local;
+	      tile_m = fmaxf(tile_m,
+	                     __shfl_xor_sync(kSoftmaxGroupMask, tile_m, 1));
+	      tile_m = fmaxf(tile_m,
+	                     __shfl_xor_sync(kSoftmaxGroupMask, tile_m, 2));
       const float next_m = fmaxf(mma_running_m, tile_m);
       const float old_scale =
           mma_running_l == 0.0f ? 0.0f : __expf(mma_running_m - next_m);
@@ -1827,16 +1687,12 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           *dst6 = static_cast<uint8_t>(packed_hi >> 16);
           *dst7 = static_cast<uint8_t>(packed_hi >> 24);
         }
-      }
-      float tile_l_scaled = tile_l_scaled_local;
-      if constexpr (kSm120D128SoftmaxThreadsPerRow >= 2) {
-        tile_l_scaled +=
-            __shfl_xor_sync(kSoftmaxGroupMask, tile_l_scaled, 1);
-      }
-      if constexpr (kSm120D128SoftmaxThreadsPerRow >= 4) {
-        tile_l_scaled +=
-            __shfl_xor_sync(kSoftmaxGroupMask, tile_l_scaled, 2);
-      }
+	      }
+	      float tile_l_scaled = tile_l_scaled_local;
+	      tile_l_scaled +=
+	          __shfl_xor_sync(kSoftmaxGroupMask, tile_l_scaled, 1);
+	      tile_l_scaled +=
+	          __shfl_xor_sync(kSoftmaxGroupMask, tile_l_scaled, 2);
       mma_running_l = mma_running_l * old_scale + tile_l_scaled;
       mma_running_m = next_m;
       if (mma_softmax_row_lane == 0) {
@@ -1852,15 +1708,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       cutlass::arch::NamedBarrier::sync(
           CutlassCollectiveMainloop::ThreadCount,
           cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-      const __nv_bfloat16* smem_logits_stage =
-          (tile & 1) == 0 ? smem_logits0 : smem_logits1;
-      if ((tile & 1) == 0) {
-        mma_stage_probability_row(p_sA0, p_sSFA0_m, smem_logits_stage, tile,
-                                  final_tile);
-      } else {
-        mma_stage_probability_row(p_sA1, p_sSFA1_m, smem_logits_stage, tile,
-                                  final_tile);
-      }
+	      const __nv_bfloat16* smem_logits_stage = smem_logits0;
+	      mma_stage_probability_row(p_sA0, p_sSFA0_m, smem_logits_stage, tile,
+	                                final_tile);
       cutlass::arch::NamedBarrier::sync(
           CutlassCollectiveMainloop::ThreadCount,
           cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
@@ -1894,8 +1744,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     };
 
     auto run_qk_tile = [&](int tile) {
-      __nv_bfloat16* smem_logits_stage =
-          (tile & 1) == 0 ? smem_logits0 : smem_logits1;
+      __nv_bfloat16* smem_logits_stage = smem_logits0;
       auto qk_accum = cute::partition_fragment_C(
           qk_tiled_mma, cute::take<0, 2>(CutlassThreadBlockShape{}));
       cute::clear(qk_accum);
@@ -1935,11 +1784,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           pv_accum(i) *= storage.old_scale_stage[tile & 1][row];
         }
       }
-      if ((tile & 1) == 0) {
-        pv_gemm_p_stage(pv_accum, p_sA0, p_sSFA0_m);
-      } else {
-        pv_gemm_p_stage(pv_accum, p_sA1, p_sSFA1_m);
-      }
+	      pv_gemm_p_stage(pv_accum, p_sA0, p_sSFA0_m);
       pv_release_v_stage();
       if (final_tile) {
         const float pv_base_scale = pv_alpha / kProbGlobalScale;
@@ -2901,69 +2746,6 @@ void cutlass_active_tile_fp4_gemm(torch::Tensor a_packed,
               "active-tile CUTLASS GEMM run failed");
 }
 
-template <typename Traits>
-pybind11::dict cutlass_tile_shape_metadata(const char* name,
-                                           int tile_m,
-                                           int tile_n,
-                                           int tile_k) {
-  using Mainloop = typename Traits::CollectiveMainloop;
-  using Epilogue = typename Traits::CollectiveEpilogue;
-  using Kernel = typename Traits::GemmKernel;
-  constexpr int64_t kSm120OptinSmemBytes = 99ll << 10;
-  const int64_t tensor_storage =
-      static_cast<int64_t>(sizeof(typename Mainloop::TensorStorage));
-  const int64_t score_scratch =
-      static_cast<int64_t>(tile_m) * tile_n * sizeof(float);
-  const int64_t p_packed =
-      static_cast<int64_t>(tile_m) * (tile_k / 2);
-  const int64_t p_scales =
-      static_cast<int64_t>(tile_m) * (tile_k / 16);
-  const int64_t row_state =
-      5 * static_cast<int64_t>(tile_m) * sizeof(float);
-  const int64_t scaffold_storage =
-      std::max(tensor_storage, score_scratch) + p_packed + p_scales +
-      row_state;
-
-  pybind11::dict d;
-  d["name"] = name;
-  d["tile_m"] = tile_m;
-  d["tile_n"] = tile_n;
-  d["tile_k"] = tile_k;
-  d["thread_count"] = Mainloop::ThreadCount;
-  d["mainloop_stages"] =
-      static_cast<int64_t>(Mainloop::DispatchPolicy::Stages);
-  d["scale_vec_size"] = Mainloop::TiledMma::SFVecSize;
-  d["gemm_kernel_block_threads"] =
-      static_cast<int64_t>(Kernel::get_block_shape().x);
-  d["gemm_kernel_shared_storage_bytes"] =
-      static_cast<int64_t>(Kernel::SharedStorageSize);
-  d["mainloop_tensor_storage_bytes"] = tensor_storage;
-  d["mainloop_shared_storage_bytes"] =
-      static_cast<int64_t>(sizeof(typename Mainloop::SharedStorage));
-  d["epilogue_shared_storage_bytes"] =
-      static_cast<int64_t>(sizeof(typename Epilogue::SharedStorage));
-  d["score_scratch_bytes"] = score_scratch;
-  d["score_fits_in_tensor_storage"] = tensor_storage >= score_scratch;
-  d["p_packed_bytes"] = p_packed;
-  d["p_scales_bytes"] = p_scales;
-  d["row_state_bytes"] = row_state;
-  d["scaffold_storage_min_bytes"] = scaffold_storage;
-  d["sm120_optin_smem_bytes"] = kSm120OptinSmemBytes;
-  d["mainloop_tensor_storage_margin_2cta_bytes"] =
-      (kSm120OptinSmemBytes / 2) - tensor_storage;
-  d["mainloop_shared_storage_margin_2cta_bytes"] =
-      (kSm120OptinSmemBytes / 2) -
-      static_cast<int64_t>(sizeof(typename Mainloop::SharedStorage));
-  d["gemm_kernel_shared_storage_margin_2cta_bytes"] =
-      (kSm120OptinSmemBytes / 2) -
-      static_cast<int64_t>(Kernel::SharedStorageSize);
-  d["scaffold_storage_margin_2cta_bytes"] =
-      (kSm120OptinSmemBytes / 2) - scaffold_storage;
-  d["scaffold_storage_margin_bytes"] =
-      kSm120OptinSmemBytes - scaffold_storage;
-  return d;
-}
-
 pybind11::dict cutlass_sm120_blockscaled_collective_metadata() {
   pybind11::dict d;
   d["arch"] = "sm120";
@@ -3076,21 +2858,7 @@ pybind11::dict cutlass_sm120_blockscaled_collective_metadata() {
   qkv_storage_layout["p_smem_SFA0_bytes"] =
       static_cast<int64_t>(
           sizeof(decltype(((Sm120Nvfp4QkvLoadCollectiveStorage*)nullptr)
-                              ->p_smem_SFA0)));
-  qkv_storage_layout["p_smem_A1_offset"] =
-      static_cast<int64_t>(
-          offsetof(Sm120Nvfp4QkvLoadCollectiveStorage, p_smem_A1));
-  qkv_storage_layout["p_smem_A1_bytes"] =
-      static_cast<int64_t>(
-          sizeof(decltype(((Sm120Nvfp4QkvLoadCollectiveStorage*)nullptr)
-                              ->p_smem_A1)));
-  qkv_storage_layout["p_smem_SFA1_offset"] =
-      static_cast<int64_t>(
-          offsetof(Sm120Nvfp4QkvLoadCollectiveStorage, p_smem_SFA1));
-  qkv_storage_layout["p_smem_SFA1_bytes"] =
-      static_cast<int64_t>(
-          sizeof(decltype(((Sm120Nvfp4QkvLoadCollectiveStorage*)nullptr)
-                              ->p_smem_SFA1)));
+	                              ->p_smem_SFA0)));
   qkv_storage_layout["role_pipeline_storage_offset"] =
       static_cast<int64_t>(
           offsetof(Sm120Nvfp4QkvLoadCollectiveStorage,
@@ -3169,35 +2937,6 @@ pybind11::dict cutlass_sm120_blockscaled_collective_metadata() {
   role_schedule["epilogue_warp"] =
       static_cast<int64_t>(kSm120Nvfp4FmhaWarpEpilogue);
   d["sm120_role_schedule"] = role_schedule;
-  pybind11::dict tile_variants;
-  tile_variants["128x128x128"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile128x128x128Stage2>(
-          "128x128x128", 128, 128, 128);
-  tile_variants["128x128x256"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile128x128x256Stage2>(
-          "128x128x256", 128, 128, 256);
-  tile_variants["64x128x256"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile64x128x256Stage2>(
-          "64x128x256", 64, 128, 256);
-  tile_variants["64x128x128"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile64x128x128Stage2>(
-          "64x128x128", 64, 128, 128);
-  tile_variants["64x128x64"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile64x128x64Stage2>(
-          "64x128x64", 64, 128, 64);
-  tile_variants["128x128x64"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile128x128x64Stage2>(
-          "128x128x64", 128, 128, 64);
-  tile_variants["64x64x128"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile64x64x128Stage2>(
-          "64x64x128", 64, 64, 128);
-  tile_variants["64x256x128"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile64x256x128Stage2>(
-          "64x256x128", 64, 256, 128);
-  tile_variants["256x128x128"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile256x128x128Stage2>(
-          "256x128x128", 256, 128, 128);
-  d["tile_variants"] = tile_variants;
   auto smem_layout_a = typename CutlassCollectiveMainloop::SmemLayoutA{};
   auto smem_layout_b = typename CutlassCollectiveMainloop::SmemLayoutB{};
   pybind11::list a_offsets;

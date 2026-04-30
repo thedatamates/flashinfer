@@ -12518,3 +12518,197 @@ layout and regresses both smoke and anchor. The ordering freedom alone is not a
 win. A future direct accumulator-to-P path must use the single-buffer reordered
 loop (`PV(previous) -> QK(current) -> direct softmax/P(current)`) or prove a
 separate benefit large enough to justify the extra shared-memory footprint.
+
+## D128 Rejected Probe: Naive Direct Accumulator-To-P
+
+Tested a single-P-buffer direct-P prototype that keeps the storage footprint
+unchanged by reusing the old BF16 logits allocation as reduction scratch. The
+loop order was changed to:
+
+```text
+tile 0:      QK(0) -> direct softmax/P(0)
+tile n > 0:  PV(n - 1) -> QK(n) -> direct softmax/P(n)
+final:       PV(last)
+```
+
+The QK C-fragment values stayed in registers and were used to:
+
+```text
+1. write per-row/owner partial maxima into scratch
+2. reduce row max from scratch
+3. recompute probabilities and write per-row sums / per-group maxima
+4. reduce row sum and group maxima from scratch
+5. recompute probabilities again and pack P directly to PV smem layout
+```
+
+Correctness held, but performance collapsed:
+
+```text
+D128 M64 x N128 x K128, naive direct-P:
+  storage:                         66560 bytes
+  q=512 kv=8192 group=8:           cosine=0.991696, min_ms=0.633152
+  q=32768 kv=32768 group=8:        cosine=0.990092, min_ms=51.480801
+
+Baseline BF16-logits handoff:
+  storage:                         66560 bytes
+  q=512 kv=8192 group=8:           min_ms ~= 0.141120
+  q=32768 kv=32768 group=8:        min_ms ~= 11.852992
+```
+
+Decision: reject and revert. This validates the owner mapping well enough for
+correctness, but the naive implementation adds too many scratch round trips,
+barriers, and duplicate `expf` work. Removing the BF16 logits handoff is still a
+possible lever, but it needs a different algorithm: row/group reductions must be
+warpgroup-local or fused into the existing softmax ownership pattern, not built
+as a scratch-heavy accumulator-owner pass.
+
+## D128 Post-Hillclimb Cleanup
+
+After stopping the D128 hill-climb, cleaned the D128 specialization translation
+unit for the next phase. Removed code that represented settled or rejected
+experiments:
+
+```text
+- second-P-buffer storage and parity branches
+- D128 experiment-switch names for single-P, row-skew, and softmax-thread count
+- zero-skew / two-thread-softmax conditionals from the active path
+- stale CUTLASS tile-variant metadata matrix from the M/N/K sweep
+- stale `smem_logits1` alias; D128 uses one BF16 logits scratch tile
+```
+
+Kept the active D128 kernel path, atom-level debug/correctness entry points,
+split-KV wrapper, and active metadata that the bench harness still uses.
+
+Validation after cleanup:
+
+```text
+q=512 kv=8192 group=8:
+  storage=66560 bytes, cosine=0.991697, min_ms=0.141888
+
+q=32768 kv=32768 group=8:
+  storage=66560 bytes, cosine=0.990060, min_ms=11.579968
+```
+
+The cleanup does not change shared-memory footprint or correctness. Runtime is
+within expected noise and slightly better than the previous anchor measurement.
+
+## D128 180-Cell Post-Cleanup Matrix
+
+Ran the D128 expanded matrix after the D128 post-hillclimb cleanup with the
+active D128 fused kernel:
+
+```text
+q_len:  128, 256, 512, 1024, 2048, 4096
+kv_len: 8192, 32768, 65536, 131072, 262144
+group:  2, 4, 6, 8, 12, 16
+kernel columns: sm120_fused, nvfp4_fa2, fp8_fa2, bf16_fa2
+split_kv_len: 32768
+output_group_span: 1
+```
+
+Artifacts:
+
+```text
+reports/d128_hillclimb_180cell_20260430.jsonl
+reports/d128_hillclimb_180cell_20260430.csv
+reports/d128_hillclimb_180cell_20260430.summary.csv
+reports/d128_hillclimb_180cell_20260430.md
+reports/d128_hillclimb_180cell_20260430.run.log
+```
+
+Run status:
+
+```text
+summary rows:              180 / 180
+error rows:                0
+min fused cosine:          0.989452
+cells beating nvfp4_fa2:   119 / 180
+cells passing 2x gate:     37 / 180
+```
+
+Per-group rollup versus NVFP4 FA2:
+
+```text
+group  cells  wins  pass_2x  median_speedup  max_speedup
+2      30     11    0        0.769           1.985
+4      30     16    3        1.449           2.456
+6      30     21    5        1.176           3.042
+8      30     21    8        1.550           2.460
+12     30     25    10       1.456           3.050
+16     30     25    11       1.862           2.455
+```
+
+Best cells remain high-q / long-context. Top observed speedups:
+
+```text
+q=2048 kv=262144 group=12: fused=9.147 ms,  nvfp4_fa2=27.901 ms, speedup=3.050x
+q=4096 kv=262144 group=6:  fused=9.154 ms,  nvfp4_fa2=27.843 ms, speedup=3.042x
+q=2048 kv=131072 group=12: fused=4.808 ms,  nvfp4_fa2=13.907 ms, speedup=2.892x
+q=4096 kv=131072 group=6:  fused=4.812 ms,  nvfp4_fa2=13.859 ms, speedup=2.880x
+```
+
+Worst cells are small-q / short-to-mid context, where launch/split overhead and
+fixed fused-kernel cost dominate. This confirms the D128 kernel is useful in the
+same regime as D256/D512: sufficiently large query tiles and long contexts, not
+small-q cells.
+
+## D256/D512 Post-Hillclimb Cleanup
+
+Cleaned the D256 and D512 specialization translation units to match the D128
+post-hillclimb cleanup pattern. Removed settled or rejected experiment code from
+the active source:
+
+```text
+D256 removed:
+- settled D256 experiment constants/branches:
+  direct MMA epilogue, single softmax warp, MMA-owned softmax,
+  single-P-buffer switch, min-blocks override, logits-row-skew switch,
+  softmax-threads switch
+- separate softmax-role score pipeline:
+  PipelineS, OrderedSequenceBarrier, pipeline_mma_s0/s1 state,
+  score-stage acquire/commit helpers, and the old `is_softmax` branch
+- direct epilogue helper/branch
+- stale CUTLASS tile-variant metadata matrix from the M/N/K sweep
+
+D512 removed:
+- settled D512 experiment constants/branches:
+  MMA-owned softmax, min-blocks override, logits-row-skew switch,
+  softmax-threads switch
+- separate softmax-role score pipeline:
+  PipelineS, OrderedSequenceBarrier, pipeline_mma_s0/s1 state,
+  score-stage acquire/commit helpers, and the old `is_softmax` branch
+- stale CUTLASS tile-variant metadata matrix
+```
+
+Kept the active production paths:
+
+```text
+D256: M64 x N128 x K128, reuse2-capable split-KV path, MMA-owned softmax,
+      single P buffer, dedicated epilogue role
+D512: M128 x N128 x K256, reuse4-capable split-KV path, MMA-owned softmax,
+      dedicated epilogue role
+```
+
+Validation after cleanup:
+
+```text
+static checks:
+  git diff --check: pass
+  python py_compile:
+    benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py: pass
+    benchmarks/bench_sm120_d256_hillclimb.py: pass
+
+D256 smoke:
+  q=512 kv=8192 group=6 span=2 split_kv_len=8192
+  storage=50176 bytes, margin=51200 bytes
+  finite=true, cosine=0.991516
+  mean_abs=0.000338807, max_abs=0.001601808
+  min_ms=0.206304
+
+D512 smoke:
+  q=512 kv=8192 group=4 span=4 split_kv_len=8192
+  storage=96256 bytes, margin=5120 bytes
+  finite=true, cosine=0.990005
+  mean_abs=0.000335312, max_abs=0.001747830
+  min_ms=1.302048
+```

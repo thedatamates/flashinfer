@@ -40,10 +40,9 @@ constexpr int kTileN = 16;
 constexpr int kCutlassTileM = 128;
 constexpr int kCutlassTileN = 128;
 constexpr int kCutlassTileK = 256;
-constexpr bool kSm120D512MmaOwnsSoftmax = true;
-constexpr int kSm120D512LogitsRowSkew = 4;
-constexpr int kSm120D512SoftmaxThreadsPerRow = 2;
-constexpr int kSm120D512MinBlocksPerSm = 1;
+constexpr int kMinBlocksPerSm = 1;
+constexpr int kLogitsRowSkew = 4;
+constexpr int kSoftmaxThreadsPerRow = 2;
 constexpr int kCutlassTileK128 = 128;
 constexpr int kDebugHead = 0;
 constexpr int kProbPackedCols = kKvLen / 2;
@@ -70,10 +69,8 @@ enum class Sm120Nvfp4FmhaRole : int {
   Count = 7,
 };
 
-constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 =
-    kSm120D512MmaOwnsSoftmax ? 0 : 1;
-constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 =
-    kSm120D512MmaOwnsSoftmax ? 0 : 1;
+constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 = 0;
+constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsCorrection = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsMma = 8;
 constexpr int kSm120Nvfp4FmhaNumWarpsLoad = 1;
@@ -94,35 +91,12 @@ constexpr int kSm120Nvfp4FmhaNumWarps =
 constexpr int kSm120Nvfp4FmhaThreadCount =
     kSm120Nvfp4FmhaNumWarps * cutlass::NumThreadsPerWarp;
 constexpr int kSm120Nvfp4FmhaOutputThreadCount =
-    (kSm120Nvfp4FmhaNumWarpsEpilogue > 0
-         ? kSm120Nvfp4FmhaNumWarpsEpilogue
-         : kSm120Nvfp4FmhaNumWarpsLoad) *
-    cutlass::NumThreadsPerWarp;
-constexpr int kSm120Nvfp4FmhaSoftmaxThreadCount =
-    (kSm120Nvfp4FmhaNumWarpsSoftmax0 +
-     kSm120Nvfp4FmhaNumWarpsSoftmax1) *
-    cutlass::NumThreadsPerWarp;
-constexpr int kSm120Nvfp4FmhaSoftmaxGroupThreadCount =
-    (kSm120Nvfp4FmhaNumWarpsSoftmax0 > 0
-         ? kSm120Nvfp4FmhaNumWarpsSoftmax0
-         : 1) *
-    cutlass::NumThreadsPerWarp;
-static_assert(kSm120D512MmaOwnsSoftmax ||
-              kSm120Nvfp4FmhaNumWarpsSoftmax0 ==
-              kSm120Nvfp4FmhaNumWarpsSoftmax1);
+    kSm120Nvfp4FmhaNumWarpsEpilogue * cutlass::NumThreadsPerWarp;
 constexpr int kSm120Nvfp4FmhaMmaSoftmaxThreadCount =
-    kSm120Nvfp4FmhaNumWarpsMma * cutlass::NumThreadsPerWarp +
-    kSm120Nvfp4FmhaSoftmaxThreadCount;
+    kSm120Nvfp4FmhaNumWarpsMma * cutlass::NumThreadsPerWarp;
 constexpr int kSm120Nvfp4FmhaMmaSoftmaxLoadThreadCount =
     kSm120Nvfp4FmhaMmaSoftmaxThreadCount +
     kSm120Nvfp4FmhaNumWarpsLoad * cutlass::NumThreadsPerWarp;
-constexpr uint32_t kSm120Nvfp4BarrierSoftmax0Internal = 0;
-constexpr uint32_t kSm120Nvfp4BarrierSoftmax1Internal = 1;
-constexpr uint32_t kSm120Nvfp4BarrierSoftmaxInternal =
-    kSm120Nvfp4BarrierSoftmax0Internal;
-constexpr uint32_t kSm120Nvfp4BarrierMmaSoftmax =
-    kSm120Nvfp4BarrierSoftmax1Internal;
-constexpr uint32_t kSm120Nvfp4BarrierSoftmaxMma = 2;
 constexpr uint32_t kSm120Nvfp4BarrierSoftmaxCorrection = 3;
 constexpr uint32_t kSm120Nvfp4BarrierCorrectionSoftmax = 4;
 constexpr uint32_t kSm120Nvfp4BarrierSoftmax0OnlineReady = 5;
@@ -162,22 +136,6 @@ __device__ __forceinline__ int sm120_nvfp4_fmha_mma_thread_idx(
   return (warp_idx - kSm120Nvfp4FmhaWarpMmaBegin) *
              cutlass::NumThreadsPerWarp +
          lane_idx;
-}
-
-__device__ __forceinline__ int sm120_nvfp4_fmha_softmax_thread_idx(
-    int thread_idx) {
-  return thread_idx - kSm120Nvfp4FmhaWarpSoftmax0Begin *
-                          cutlass::NumThreadsPerWarp;
-}
-
-__device__ __forceinline__ int sm120_nvfp4_fmha_softmax_group_thread_idx(
-    int thread_idx,
-    Sm120Nvfp4FmhaRole role) {
-  const int group_warp_begin =
-      role == Sm120Nvfp4FmhaRole::Softmax1
-          ? kSm120Nvfp4FmhaWarpSoftmax1Begin
-          : kSm120Nvfp4FmhaWarpSoftmax0Begin;
-  return thread_idx - group_warp_begin * cutlass::NumThreadsPerWarp;
 }
 
 using Fp4MmaAtom =
@@ -238,55 +196,6 @@ using CutlassGemmKernel =
 using CutlassGemm =
     cutlass::gemm::device::GemmUniversalAdapter<CutlassGemmKernel>;
 
-template <typename ThreadBlockShape>
-struct Sm120Fp4CollectiveTraits {
-  using CollectiveEpilogue =
-      typename cutlass::epilogue::collective::CollectiveBuilder<
-          cutlass::arch::Sm120,
-          cutlass::arch::OpClassTensorOp,
-          ThreadBlockShape,
-          CutlassClusterShape,
-          cutlass::epilogue::collective::EpilogueTileAuto,
-          float,
-          float,
-          CutlassElementC,
-          cutlass::layout::RowMajor,
-          128 / cutlass::sizeof_bits<CutlassElementD>::value,
-          CutlassElementD,
-          cutlass::layout::RowMajor,
-          128 / cutlass::sizeof_bits<CutlassElementD>::value,
-          cutlass::epilogue::TmaWarpSpecialized,
-          CutlassFusionOperation>::CollectiveOp;
-  using CollectiveMainloop =
-      typename cutlass::gemm::collective::CollectiveBuilder<
-          cutlass::arch::Sm120,
-          cutlass::arch::OpClassBlockScaledTensorOp,
-          CutlassElementAB,
-          cutlass::layout::RowMajor,
-          32,
-          CutlassElementAB,
-          cutlass::layout::ColumnMajor,
-          32,
-          float,
-          ThreadBlockShape,
-          CutlassClusterShape,
-          cutlass::gemm::collective::StageCountAutoCarveout<
-              static_cast<int>(
-                  sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
-  using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<CutlassProblemShape,
-                                           CollectiveMainloop,
-                                           CollectiveEpilogue,
-                                           cutlass::gemm::StaticPersistentScheduler>;
-};
-
-using Sm120Fp4Tile128x128x128 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_128, cute::_128, cute::_128>>;
-using Sm120Fp4Tile128x128x256 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_128, cute::_128, cute::_256>>;
-using Sm120Fp4Tile256x128x128 =
-    Sm120Fp4CollectiveTraits<cute::Shape<cute::_256, cute::_128, cute::_128>>;
 using CutlassThreadBlockShapeK128 =
     cute::Shape<cute::_128, cute::_128, cute::_128>;
 using CutlassCollectiveMainloopK128Stage2 =
@@ -308,7 +217,7 @@ using CutlassGemmKernelK128Stage2 =
     cutlass::gemm::kernel::GemmUniversal<
         CutlassProblemShape,
         CutlassCollectiveMainloopK128Stage2,
-        typename Sm120Fp4Tile128x128x128::CollectiveEpilogue,
+        CutlassCollectiveEpilogue,
         cutlass::gemm::StaticPersistentScheduler>;
 using CutlassGemmK128Stage2 =
     cutlass::gemm::device::GemmUniversalAdapter<CutlassGemmKernelK128Stage2>;
@@ -320,16 +229,10 @@ using RunnerEpilogueSchedule = flashinfer::gemm::EpilogueScheduleType;
 using RunnerClusterShape = flashinfer::gemm::ClusterShape;
 using RunnerFp4Type = flashinfer::gemm::FP4GemmType;
 
-using Sm120Nvfp4PipelineS = cutlass::PipelineAsync<1>;
 using Sm120Nvfp4PipelineE = cutlass::PipelineAsync<1>;
-using Sm120Nvfp4OrderBarrierSoftmax =
-    cutlass::OrderedSequenceBarrier<1, 2>;
 
 struct Sm120Nvfp4MainloopPipelineStorage {
-  alignas(16) typename Sm120Nvfp4PipelineS::SharedStorage mma_s0;
-  alignas(16) typename Sm120Nvfp4PipelineS::SharedStorage mma_s1;
   alignas(16) typename Sm120Nvfp4PipelineE::SharedStorage corr_epi;
-  alignas(16) typename Sm120Nvfp4OrderBarrierSoftmax::SharedStorage order_s01;
 };
 
 struct Sm120Nvfp4QkLoadCollectiveStorage {
@@ -889,8 +792,7 @@ __device__ __forceinline__ void sm120_epilogue_store_bf16_tile(
 }
 
 template <int kOutputGroupSpan>
-__global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount,
-                             kSm120D512MinBlocksPerSm)
+__global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount, kMinBlocksPerSm)
 void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128Stage2::Params const pv_params,
@@ -942,40 +844,17 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   const Sm120Nvfp4FmhaRole role = sm120_nvfp4_fmha_role_for_warp(warp_idx);
   const bool is_load = role == Sm120Nvfp4FmhaRole::Load;
   const bool is_mma = role == Sm120Nvfp4FmhaRole::Mma;
-  const bool is_softmax0 = role == Sm120Nvfp4FmhaRole::Softmax0;
-  const bool is_softmax1 = role == Sm120Nvfp4FmhaRole::Softmax1;
-  const bool is_softmax = role == Sm120Nvfp4FmhaRole::Softmax0 ||
-                          role == Sm120Nvfp4FmhaRole::Softmax1;
   const bool is_epilogue = role == Sm120Nvfp4FmhaRole::Epilogue;
   const int qk_mma_thread_idx =
       is_mma ? sm120_nvfp4_fmha_mma_thread_idx(thread_idx) : 0;
   const int pv_mma_thread_idx = qk_mma_thread_idx;
-  const int softmax_group_thread_idx =
-      is_softmax ? sm120_nvfp4_fmha_softmax_group_thread_idx(thread_idx, role)
-                 : 0;
   const int epilogue_thread_idx =
       is_epilogue
           ? thread_idx - kSm120Nvfp4FmhaWarpEpilogue * cutlass::NumThreadsPerWarp
           : 0;
   const int output_thread_idx = is_epilogue ? epilogue_thread_idx : lane_idx;
 
-  typename Sm120Nvfp4PipelineS::Params pipeline_mma_s0_params{};
-  typename Sm120Nvfp4PipelineS::Params pipeline_mma_s1_params{};
   typename Sm120Nvfp4PipelineE::Params pipeline_corr_epi_params{};
-  if (is_mma) {
-    pipeline_mma_s0_params.role =
-        Sm120Nvfp4PipelineS::ThreadCategory::Producer;
-    pipeline_mma_s1_params.role =
-        Sm120Nvfp4PipelineS::ThreadCategory::Producer;
-  }
-  if (!kSm120D512MmaOwnsSoftmax && is_softmax0) {
-    pipeline_mma_s0_params.role =
-        Sm120Nvfp4PipelineS::ThreadCategory::Consumer;
-  }
-  if (!kSm120D512MmaOwnsSoftmax && is_softmax1) {
-    pipeline_mma_s1_params.role =
-        Sm120Nvfp4PipelineS::ThreadCategory::Consumer;
-  }
   if (is_mma) {
     pipeline_corr_epi_params.role =
         Sm120Nvfp4PipelineE::ThreadCategory::Producer;
@@ -984,47 +863,18 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     pipeline_corr_epi_params.role =
         Sm120Nvfp4PipelineE::ThreadCategory::Consumer;
   }
-  pipeline_mma_s0_params.producer_arv_count = 1;
-  pipeline_mma_s1_params.producer_arv_count = 1;
-  pipeline_mma_s0_params.consumer_arv_count =
-      kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
-  pipeline_mma_s1_params.consumer_arv_count =
-      kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
   pipeline_corr_epi_params.producer_arv_count = 1;
   pipeline_corr_epi_params.consumer_arv_count =
       kSm120Nvfp4FmhaOutputThreadCount;
-  pipeline_mma_s0_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
-  pipeline_mma_s1_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
   pipeline_corr_epi_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
-  Sm120Nvfp4PipelineS pipeline_mma_s0(
-      storage.role_pipeline_storage.mma_s0, pipeline_mma_s0_params,
-      cute::true_type{});
-  Sm120Nvfp4PipelineS pipeline_mma_s1(
-      storage.role_pipeline_storage.mma_s1, pipeline_mma_s1_params,
-      cute::true_type{});
   Sm120Nvfp4PipelineE pipeline_corr_epi(
       storage.role_pipeline_storage.corr_epi, pipeline_corr_epi_params,
       cute::true_type{});
-  typename Sm120Nvfp4OrderBarrierSoftmax::Params order_s01_params{};
-  order_s01_params.group_id =
-      role == Sm120Nvfp4FmhaRole::Softmax1 ? 1 : 0;
-  order_s01_params.group_size = kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
-  order_s01_params.initializing_warp = kSm120Nvfp4FmhaWarpLoad;
-  Sm120Nvfp4OrderBarrierSoftmax order_s01(
-      storage.role_pipeline_storage.order_s01, order_s01_params);
 
   typename CutlassCollectiveMainloop::PipelineState k_pipe_release;
-  typename Sm120Nvfp4PipelineS::PipelineState pipeline_mma_s0_producer_state =
-      cutlass::make_producer_start_state<Sm120Nvfp4PipelineS>();
-  typename Sm120Nvfp4PipelineS::PipelineState pipeline_mma_s0_consumer_state;
-  typename Sm120Nvfp4PipelineS::PipelineState pipeline_mma_s1_producer_state =
-      cutlass::make_producer_start_state<Sm120Nvfp4PipelineS>();
-  typename Sm120Nvfp4PipelineS::PipelineState pipeline_mma_s1_consumer_state;
   typename Sm120Nvfp4PipelineE::PipelineState pipeline_corr_epi_producer_state =
       cutlass::make_producer_start_state<Sm120Nvfp4PipelineE>();
   typename Sm120Nvfp4PipelineE::PipelineState pipeline_corr_epi_consumer_state;
-  bool pipeline_mma_s0_acquired = false;
-  bool pipeline_mma_s1_acquired = false;
 
   if (is_load && lane_predicate) {
     CutlassCollectiveMainloop::prefetch_tma_descriptors(qk_params.mainloop);
@@ -1572,27 +1422,26 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     auto pv_tCcC = pv_thread_mma.partition_C(pv_cC);
     static_assert(kCutlassTileN == 128,
                   "D512 MMA-owned softmax currently assumes 128 score columns");
-    static_assert(kSm120D512SoftmaxThreadsPerRow == 1 ||
-                  kSm120D512SoftmaxThreadsPerRow == 2);
+    static_assert(kSoftmaxThreadsPerRow == 1 ||
+                  kSoftmaxThreadsPerRow == 2);
     static_assert((kCutlassTileN & (kCutlassTileN - 1)) == 0,
                   "logits row skew assumes power-of-two score tile width");
     auto logits_smem_index = [](int row, int col) {
-      if constexpr (kSm120D512LogitsRowSkew == 0) {
+      if constexpr (kLogitsRowSkew == 0) {
         return row * kCutlassTileN + col;
       } else {
         const int skewed_col =
-            (col + (row & 0x0f) * kSm120D512LogitsRowSkew) &
+            (col + (row & 0x0f) * kLogitsRowSkew) &
             (kCutlassTileN - 1);
         return row * kCutlassTileN + skewed_col;
       }
     };
     const bool mma_softmax_row_owner =
-        kSm120D512MmaOwnsSoftmax &&
-        qk_mma_thread_idx < kCutlassTileM * kSm120D512SoftmaxThreadsPerRow;
+        qk_mma_thread_idx < kCutlassTileM * kSoftmaxThreadsPerRow;
     const int mma_softmax_row =
-        qk_mma_thread_idx / kSm120D512SoftmaxThreadsPerRow;
+        qk_mma_thread_idx / kSoftmaxThreadsPerRow;
     const int mma_softmax_row_lane =
-        qk_mma_thread_idx & (kSm120D512SoftmaxThreadsPerRow - 1);
+        qk_mma_thread_idx & (kSoftmaxThreadsPerRow - 1);
     float mma_running_m = -INFINITY;
     float mma_running_l = 0.0f;
 
@@ -1604,7 +1453,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
       constexpr unsigned kSoftmaxGroupMask = 0xffffffffu;
       constexpr int kColsPerSoftmaxThread =
-          kCutlassTileN / kSm120D512SoftmaxThreadsPerRow;
+          kCutlassTileN / kSoftmaxThreadsPerRow;
       const int col_begin = mma_softmax_row_lane * kColsPerSoftmaxThread;
       float tile_m_local = -INFINITY;
 #pragma unroll
@@ -1616,11 +1465,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         tile_m_local = fmaxf(tile_m_local, logit);
       }
       float tile_m = tile_m_local;
-      if constexpr (kSm120D512SoftmaxThreadsPerRow >= 2) {
+      if constexpr (kSoftmaxThreadsPerRow >= 2) {
         tile_m =
             fmaxf(tile_m, __shfl_xor_sync(kSoftmaxGroupMask, tile_m, 1));
       }
-      if constexpr (kSm120D512SoftmaxThreadsPerRow >= 4) {
+      if constexpr (kSoftmaxThreadsPerRow >= 4) {
         tile_m =
             fmaxf(tile_m, __shfl_xor_sync(kSoftmaxGroupMask, tile_m, 2));
       }
@@ -1704,11 +1553,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         }
       }
       float tile_l_scaled = tile_l_scaled_local;
-      if constexpr (kSm120D512SoftmaxThreadsPerRow >= 2) {
+      if constexpr (kSoftmaxThreadsPerRow >= 2) {
         tile_l_scaled +=
             __shfl_xor_sync(kSoftmaxGroupMask, tile_l_scaled, 1);
       }
-      if constexpr (kSm120D512SoftmaxThreadsPerRow >= 4) {
+      if constexpr (kSoftmaxThreadsPerRow >= 4) {
         tile_l_scaled +=
             __shfl_xor_sync(kSoftmaxGroupMask, tile_l_scaled, 2);
       }
@@ -1741,58 +1590,14 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
     };
 
-    auto acquire_score_stages = [&]() {
-      if constexpr (kSm120D512MmaOwnsSoftmax) {
-        return;
-      }
-      if (!pipeline_mma_s0_acquired) {
-        pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
-      }
-      if (!pipeline_mma_s1_acquired) {
-        pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
-      }
-      pipeline_mma_s0_acquired = false;
-      pipeline_mma_s1_acquired = false;
-    };
-
-    auto commit_score_stages = [&]() {
-      if constexpr (kSm120D512MmaOwnsSoftmax) {
-        return;
-      }
-      cutlass::arch::NamedBarrier::sync(
-          CutlassCollectiveMainloop::ThreadCount,
-          cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-      if (qk_mma_thread_idx == 0) {
-        pipeline_mma_s0.producer_commit(pipeline_mma_s0_producer_state);
-        pipeline_mma_s1.producer_commit(pipeline_mma_s1_producer_state);
-      }
-      ++pipeline_mma_s0_producer_state;
-      ++pipeline_mma_s1_producer_state;
-    };
-
     auto release_k_chunk = [&]() {
       k_pipeline.consumer_release(k_pipe_release);
       ++k_pipe_release;
     };
 
-    auto wait_p_ready_and_release_k = [&]() {
-      if constexpr (kSm120D512MmaOwnsSoftmax) {
-        release_k_chunk();
-        if (qk_head_chunks > 1) {
-          release_k_chunk();
-        }
-      } else if (qk_head_chunks == 1) {
-        pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
-        pipeline_mma_s0_acquired = true;
-        pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
-        pipeline_mma_s1_acquired = true;
-        release_k_chunk();
-      } else {
-        pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
-        pipeline_mma_s0_acquired = true;
-        release_k_chunk();
-        pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
-        pipeline_mma_s1_acquired = true;
+    auto release_consumed_k_chunks = [&]() {
+      release_k_chunk();
+      if (qk_head_chunks > 1) {
         release_k_chunk();
       }
     };
@@ -1834,17 +1639,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const int col = int(cute::get<1>(coord));
         if (row < kCutlassTileM && col < kCutlassTileN) {
           const float logit = qk_accum(i) * qk_scale;
-          if constexpr (kSm120D512MmaOwnsSoftmax) {
-            smem_logits_stage[logits_smem_index(row, col)] =
-                __float2bfloat16(logit);
-          } else {
-            smem_logits_stage[row * kCutlassTileN + col] =
-                __float2bfloat16(logit);
-          }
+          smem_logits_stage[logits_smem_index(row, col)] =
+              __float2bfloat16(logit);
         }
       }
-
-      commit_score_stages();
     };
 
     auto run_pv_tile = [&](int tile, bool final_tile, auto& pv_accum) {
@@ -1933,7 +1731,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     };
 
     for (int tile = 0; tile < effective_num_kv_tiles; ++tile) {
-      acquire_score_stages();
       run_qk_tile(tile);
       if (tile > 0) {
         if constexpr (kOutputGroupSpan >= 2) {
@@ -1942,10 +1739,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           run_pv_tile(tile - 1, false, pv_accum0);
         }
       }
-      if constexpr (kSm120D512MmaOwnsSoftmax) {
-        mma_stage_softmax_tile(tile, tile == effective_num_kv_tiles - 1);
-      }
-      wait_p_ready_and_release_k();
+      mma_stage_softmax_tile(tile, tile == effective_num_kv_tiles - 1);
+      release_consumed_k_chunks();
     }
     run_pv_tile(effective_num_kv_tiles - 1, true, pv_accum0);
     if constexpr (kOutputGroupSpan >= 2) {
@@ -1954,122 +1749,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     if constexpr (kOutputGroupSpan == 4) {
       run_pv_tile(effective_num_kv_tiles - 1, true, pv_accum2);
       run_pv_tile(effective_num_kv_tiles - 1, true, pv_accum3);
-    }
-  } else if (is_softmax) {
-    auto wait_score_stage = [&]() {
-      if (is_softmax0) {
-        pipeline_mma_s0.consumer_wait(pipeline_mma_s0_consumer_state);
-      } else {
-        pipeline_mma_s1.consumer_wait(pipeline_mma_s1_consumer_state);
-      }
-    };
-
-    auto release_p_ready = [&]() {
-      if (is_softmax0) {
-        pipeline_mma_s0.consumer_release(pipeline_mma_s0_consumer_state);
-        ++pipeline_mma_s0_consumer_state;
-      } else {
-        pipeline_mma_s1.consumer_release(pipeline_mma_s1_consumer_state);
-        ++pipeline_mma_s1_consumer_state;
-      }
-    };
-
-    constexpr int kRowsPerSoftmaxRole = kCutlassTileM / 2;
-    const int row_begin = is_softmax1 ? kRowsPerSoftmaxRole : 0;
-    const int row_end = row_begin + kRowsPerSoftmaxRole;
-    float running_m[kRowsPerSoftmaxRole /
-                    kSm120Nvfp4FmhaSoftmaxGroupThreadCount];
-    float running_l[kRowsPerSoftmaxRole /
-                    kSm120Nvfp4FmhaSoftmaxGroupThreadCount];
-#pragma unroll
-    for (int row_slot = 0;
-         row_slot < kRowsPerSoftmaxRole /
-                        kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
-         ++row_slot) {
-      running_m[row_slot] = -INFINITY;
-      running_l[row_slot] = 0.0f;
-    }
-
-    auto stage_probability_row = [&](auto& p_sA, auto& p_sSFA,
-                                     const __nv_bfloat16* smem_logits_stage,
-                                     int row, float tile_m,
-                                     float tile_scale) {
-      float tile_l_scaled = 0.0f;
-#pragma unroll
-      for (int scale_group = 0; scale_group < kCutlassTileN / 16;
-           ++scale_group) {
-        const int local_col = scale_group * 16;
-        float vec_max = 0.0f;
-        float p_vals[16];
-#pragma unroll
-        for (int i = 0; i < 16; ++i) {
-          const float logit = __bfloat162float(
-              smem_logits_stage[row * kCutlassTileN + local_col + i]);
-          const float p_scaled = __expf(logit - tile_m) * tile_scale;
-          tile_l_scaled += p_scaled;
-          vec_max = fmaxf(vec_max, p_scaled);
-          p_vals[i] = p_scaled;
-        }
-
-        const float scale_value =
-            fmaxf(kProbGlobalScale * vec_max / 6.0f, 1.0e-8f);
-        const uint8_t scale_byte = fp32_to_e4m3_byte(scale_value);
-        p_sSFA(row, local_col, cute::Int<0>{}) = make_ue4m3_raw(scale_byte);
-        const float output_scale = kProbGlobalScale / scale_value;
-#pragma unroll
-        for (int pair = 0; pair < 8; ++pair) {
-          auto first_ref = p_sA(row, local_col + 2 * pair, cute::Int<0>{});
-          uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&first_ref);
-          *dst_byte = fp32_pair_to_e2m1_byte(
-              p_vals[2 * pair] * output_scale,
-              p_vals[2 * pair + 1] * output_scale);
-        }
-      }
-      return tile_l_scaled;
-    };
-
-    for (int tile = 0; tile < effective_num_kv_tiles; ++tile) {
-      wait_score_stage();
-      const __nv_bfloat16* smem_logits_stage =
-          (tile & 1) == 0 ? smem_logits0 : smem_logits1;
-#pragma unroll
-      for (int row_slot = 0;
-           row_slot < kRowsPerSoftmaxRole /
-                          kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
-           ++row_slot) {
-        const int owned_row =
-            row_begin + softmax_group_thread_idx +
-            row_slot * kSm120Nvfp4FmhaSoftmaxGroupThreadCount;
-        float tile_m = -INFINITY;
-#pragma unroll
-        for (int col = 0; col < kCutlassTileN; ++col) {
-          const float logit = __bfloat162float(
-              smem_logits_stage[owned_row * kCutlassTileN + col]);
-          tile_m = fmaxf(tile_m, logit);
-        }
-        const float next_m = fmaxf(running_m[row_slot], tile_m);
-        const float old_scale =
-            running_l[row_slot] == 0.0f
-                ? 0.0f
-                : __expf(running_m[row_slot] - next_m);
-        const float tile_scale = __expf(tile_m - next_m);
-        const float tile_l_scaled =
-            (tile & 1) == 0
-                ? stage_probability_row(p_sA0, p_sSFA0, smem_logits0,
-                                        owned_row, tile_m, tile_scale)
-                : stage_probability_row(p_sA1, p_sSFA1, smem_logits1,
-                                        owned_row, tile_m, tile_scale);
-        running_l[row_slot] =
-            running_l[row_slot] * old_scale + tile_l_scaled;
-        running_m[row_slot] = next_m;
-        storage.old_scale_stage[tile & 1][owned_row] = old_scale;
-        if (tile == effective_num_kv_tiles - 1) {
-          storage.global_m[owned_row] = running_m[row_slot];
-          storage.global_l[owned_row] = running_l[row_slot];
-        }
-      }
-      cutlass::arch::fence_view_async_shared();
-      release_p_ready();
     }
   } else if (is_epilogue) {
     consume_and_store_output_span(output_thread_idx);
@@ -2937,57 +2616,6 @@ void cutlass_runner_fp4_gemm(torch::Tensor a_packed,
               at::cuda::getCurrentCUDAStream());
 }
 
-template <typename Traits>
-pybind11::dict cutlass_tile_shape_metadata(const char* name,
-                                           int tile_m,
-                                           int tile_n,
-                                           int tile_k) {
-  using Mainloop = typename Traits::CollectiveMainloop;
-  using Epilogue = typename Traits::CollectiveEpilogue;
-  using Kernel = typename Traits::GemmKernel;
-  constexpr int64_t kSm120OptinSmemBytes = 99ll << 10;
-  const int64_t tensor_storage =
-      static_cast<int64_t>(sizeof(typename Mainloop::TensorStorage));
-  const int64_t score_scratch =
-      static_cast<int64_t>(tile_m) * tile_n * sizeof(float);
-  const int64_t p_packed =
-      static_cast<int64_t>(tile_m) * (tile_k / 2);
-  const int64_t p_scales =
-      static_cast<int64_t>(tile_m) * (tile_k / 16);
-  const int64_t row_state =
-      5 * static_cast<int64_t>(tile_m) * sizeof(float);
-  const int64_t scaffold_storage =
-      std::max(tensor_storage, score_scratch) + p_packed + p_scales +
-      row_state;
-
-  pybind11::dict d;
-  d["name"] = name;
-  d["tile_m"] = tile_m;
-  d["tile_n"] = tile_n;
-  d["tile_k"] = tile_k;
-  d["thread_count"] = Mainloop::ThreadCount;
-  d["scale_vec_size"] = Mainloop::TiledMma::SFVecSize;
-  d["gemm_kernel_block_threads"] =
-      static_cast<int64_t>(Kernel::get_block_shape().x);
-  d["gemm_kernel_shared_storage_bytes"] =
-      static_cast<int64_t>(Kernel::SharedStorageSize);
-  d["mainloop_tensor_storage_bytes"] = tensor_storage;
-  d["mainloop_shared_storage_bytes"] =
-      static_cast<int64_t>(sizeof(typename Mainloop::SharedStorage));
-  d["epilogue_shared_storage_bytes"] =
-      static_cast<int64_t>(sizeof(typename Epilogue::SharedStorage));
-  d["score_scratch_bytes"] = score_scratch;
-  d["score_fits_in_tensor_storage"] = tensor_storage >= score_scratch;
-  d["p_packed_bytes"] = p_packed;
-  d["p_scales_bytes"] = p_scales;
-  d["row_state_bytes"] = row_state;
-  d["scaffold_storage_min_bytes"] = scaffold_storage;
-  d["sm120_optin_smem_bytes"] = kSm120OptinSmemBytes;
-  d["scaffold_storage_margin_bytes"] =
-      kSm120OptinSmemBytes - scaffold_storage;
-  return d;
-}
-
 pybind11::dict cutlass_sm120_blockscaled_collective_metadata() {
   pybind11::dict d;
   d["arch"] = "sm120";
@@ -3017,8 +2645,8 @@ pybind11::dict cutlass_sm120_blockscaled_collective_metadata() {
   d["layout_sfb_bytes"] =
       static_cast<int64_t>(sizeof(typename CutlassCollectiveMainloop::LayoutSFB));
   constexpr int64_t kSm120OptinSmemBytes = 99ll << 10;
-  const int64_t qk_shared_bytes =
-      static_cast<int64_t>(sizeof(typename CutlassCollectiveMainloop::SharedStorage));  d["sm120_optin_smem_bytes"] = kSm120OptinSmemBytes;  d["sm120_qk_load_collective_storage_bytes"] =
+  d["sm120_optin_smem_bytes"] = kSm120OptinSmemBytes;
+  d["sm120_qk_load_collective_storage_bytes"] =
       static_cast<int64_t>(sizeof(Sm120Nvfp4QkLoadCollectiveStorage));
   d["sm120_qk_load_collective_storage_margin_bytes"] =
       kSm120OptinSmemBytes -
@@ -3034,13 +2662,8 @@ pybind11::dict cutlass_sm120_blockscaled_collective_metadata() {
           sizeof(typename CutlassCollectiveMainloopK128Stage2::PipelineStorage));
   d["sm120_role_pipeline_storage_bytes"] =
       static_cast<int64_t>(sizeof(Sm120Nvfp4MainloopPipelineStorage));
-  d["sm120_pipeline_s_storage_bytes"] =
-      static_cast<int64_t>(sizeof(typename Sm120Nvfp4PipelineS::SharedStorage));
   d["sm120_pipeline_e_storage_bytes"] =
       static_cast<int64_t>(sizeof(typename Sm120Nvfp4PipelineE::SharedStorage));
-  d["sm120_order_s01_storage_bytes"] =
-      static_cast<int64_t>(
-          sizeof(typename Sm120Nvfp4OrderBarrierSoftmax::SharedStorage));
   d["sm120_qkv_load_collective_storage_bytes"] =
       static_cast<int64_t>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
   d["sm120_qkv_load_collective_storage_margin_bytes"] =
@@ -3096,17 +2719,6 @@ pybind11::dict cutlass_sm120_blockscaled_collective_metadata() {
   role_schedule["epilogue_warp"] =
       static_cast<int64_t>(kSm120Nvfp4FmhaWarpEpilogue);
   d["sm120_role_schedule"] = role_schedule;
-  pybind11::dict tile_variants;
-  tile_variants["128x128x128"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile128x128x128>(
-          "128x128x128", 128, 128, 128);
-  tile_variants["128x128x256"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile128x128x256>(
-          "128x128x256", 128, 128, 256);
-  tile_variants["256x128x128"] =
-      cutlass_tile_shape_metadata<Sm120Fp4Tile256x128x128>(
-          "256x128x128", 256, 128, 128);
-  d["tile_variants"] = tile_variants;
   auto smem_layout_a = typename CutlassCollectiveMainloop::SmemLayoutA{};
   auto smem_layout_b = typename CutlassCollectiveMainloop::SmemLayoutB{};
   pybind11::list a_offsets;
