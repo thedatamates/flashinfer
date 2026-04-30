@@ -13165,3 +13165,77 @@ benchmarks/sm120_nvfp4_cutlass_fused_attention_d512.cu
 The unsuffixed D512 name was a prototype artifact from when D512 was the only
 specialization. Production naming still needs to move out of `benchmarks/` and
 follow FlashInfer's operation/backend/arch convention.
+
+## Integration Phase: Raw Launch Seam
+
+2026-04-30T18:45:00-05:00
+
+The benchmark extension wrappers are no longer the only callable boundary for
+the fused kernels. D128, D256, and D512 now have a lower-level raw CUDA launch
+function under the Torch wrapper:
+
+```text
+sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(...)
+```
+
+The raw launcher accepts device pointers, scalar launch parameters, workspace
+bytes, and a CUDA stream. It owns:
+
+```text
+- CUTLASS QK params initialization
+- CUTLASS PV params initialization
+- dynamic shared-memory attribute setup
+- split-KV stage kernel launch
+- split-KV combine launch when needed
+```
+
+The existing pybind/Torch wrapper now performs tensor validation and converts
+tensors to raw pointers before calling the raw launcher. This is the first
+production extraction step: the same raw launch interface can be moved under
+`include/flashinfer/attention/blackwell` and called by a TVM-FFI
+`csrc/fmha_nvfp4_sm120*.cu` wrapper without carrying `torch::Tensor` into the
+production kernel implementation.
+
+Validation after the refactor:
+
+```text
+D128 q=512 kv=8192 group=8 causal sliding_window=1024 softcap=50:
+  paged bridge vs dense cosine=1.0
+  varlen paged bridge vs dense cosine=1.0
+  exact-ref cosine=0.994457
+
+D256 q=512 kv=8192 group=6 causal sliding_window=1024 softcap=50:
+  paged bridge vs dense cosine=1.0000001
+  varlen paged bridge vs dense cosine=1.0000001
+  exact-ref cosine=0.990931
+
+D512 q=512 kv=8192 group=4 causal sliding_window=1024 softcap=50:
+  paged bridge vs dense cosine=1.0000001
+  varlen paged bridge vs dense cosine=1.0000001
+  exact-ref cosine=0.988548
+```
+
+Remaining production migration:
+
+```text
+1. Move raw launchers and shared CUDA implementation out of benchmarks.
+2. Replace Torch-only paged bridge scratch allocation with caller-managed
+   workspace.
+3. Add TVM-FFI run bindings and a FlashInfer JIT module name.
+4. Wire backend dispatch only after the source-tree module compiles and passes
+   the same D128/D256/D512 correctness gates.
+```
+
+The paged gather adapter also now has a raw CUDA boundary in the FlashInfer
+source include tree:
+
+```text
+include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_adapter.cuh
+gather_paged_kv_to_dense_pv_raw(...)
+```
+
+It accepts raw K/V page pointers, block-table pointer, dense scratch pointers,
+shape scalars, and stream. The Torch adapter remains as validation/plumbing but
+now delegates the actual page gather to that source-tree launcher. D256 paged
+and varlen bridge validation was rerun after this extraction and remained
+bit-identical to the dense path.

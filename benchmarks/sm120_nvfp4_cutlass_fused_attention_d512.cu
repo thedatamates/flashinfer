@@ -2354,6 +2354,100 @@ void sm120_nvfp4_qkv_online_register_q_full_grid(torch::Tensor q_packed,
 }
 
 template <int kOutputGroupSpan>
+cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
+    uint8_t* q_packed,
+    uint8_t* q_scales,
+    uint8_t* k_packed,
+    uint8_t* k_scales,
+    uint8_t* v_pv_packed,
+    uint8_t* v_pv_scales,
+    __nv_bfloat16* partial,
+    float* split_m,
+    float* split_l,
+    __nv_bfloat16* out,
+    uint8_t* workspace,
+    size_t workspace_bytes,
+    float qk_alpha,
+    float pv_alpha,
+    int split_kv_tiles,
+    int q_len,
+    int group_size,
+    int kv_len_tokens,
+    bool causal,
+    int sliding_window,
+    float logits_soft_cap,
+    int q_rows,
+    int head_dim,
+    int kv_len,
+    cudaStream_t stream) {
+  static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
+                    kOutputGroupSpan == 4,
+                "SM120 split-KV launcher supports span 1, 2, or 4");
+  const int total_kv_tiles = kv_len / kCutlassTileN;
+  const int num_splits =
+      (total_kv_tiles + split_kv_tiles - 1) / split_kv_tiles;
+
+  float alpha = 1.0f;
+  auto qk_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
+      nullptr, q_packed, k_packed, q_scales, k_scales, &alpha, q_rows,
+      kv_len, head_dim, 1);
+  CutlassGemm qk_gemm;
+  const size_t qk_workspace_size = qk_gemm.get_workspace_size(qk_args);
+  if (workspace_bytes < qk_workspace_size) {
+    return cudaErrorInvalidValue;
+  }
+  auto qk_status = qk_gemm.initialize(
+      qk_args, reinterpret_cast<char*>(workspace), stream);
+  if (qk_status != cutlass::Status::kSuccess) {
+    return cudaErrorUnknown;
+  }
+  auto qk_params = qk_gemm.params();
+
+  auto pv_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemmK128Stage2>(
+      nullptr, q_packed, v_pv_packed, q_scales, v_pv_scales, &alpha,
+      kCutlassTileM, head_dim, kv_len, 1);
+  CutlassGemmK128Stage2 pv_gemm;
+  const size_t pv_workspace_size = pv_gemm.get_workspace_size(pv_args);
+  if (workspace_bytes < pv_workspace_size) {
+    return cudaErrorInvalidValue;
+  }
+  auto pv_status = pv_gemm.initialize(
+      pv_args, reinterpret_cast<char*>(workspace), stream);
+  if (pv_status != cutlass::Status::kSuccess) {
+    return cudaErrorUnknown;
+  }
+  auto pv_params = pv_gemm.params();
+
+  constexpr int kSmemBytes =
+      static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
+  auto stage_kernel =
+      sm120_nvfp4_qkv_online_register_q_stage_kernel<kOutputGroupSpan>;
+  cudaError_t status = cudaFuncSetAttribute(
+      stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  stage_kernel<<<dim3(q_rows / kCutlassTileM,
+                      head_dim / (kOutputGroupSpan * kCutlassTileN),
+                      num_splits),
+                 kSm120Nvfp4FmhaThreadCount, kSmemBytes, stream>>>(
+      qk_params, pv_params, partial, qk_alpha, pv_alpha, 0, 0,
+      split_kv_tiles, total_kv_tiles, q_len, group_size, kv_len_tokens,
+      causal ? 1 : 0, sliding_window, logits_soft_cap, 0, head_dim,
+      split_m, split_l, q_rows, q_rows * head_dim);
+  status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  constexpr int kThreads = 256;
+  sm120_nvfp4_splitkv_combine_kernel<<<q_rows, kThreads, 0, stream>>>(
+      partial, split_m, split_l, out, num_splits, q_rows, head_dim);
+  return cudaGetLastError();
+}
+
+template <int kOutputGroupSpan>
 void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
     torch::Tensor q_packed,
     torch::Tensor q_scales,
@@ -2452,87 +2546,20 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_impl(
   TORCH_CHECK(head_dim % (kOutputGroupSpan * kCutlassTileN) == 0,
               "head dimension must be divisible by output-group span");
 
-  float alpha = 1.0f;
-  auto qk_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemm>(
-      nullptr,
-      q_packed.data_ptr<uint8_t>(),
-      k_packed.data_ptr<uint8_t>(),
-      q_scales.data_ptr<uint8_t>(),
-      k_scales.data_ptr<uint8_t>(),
-      &alpha,
-      q_rows,
-      kv_len,
-      head_dim,
-      1);
-  CutlassGemm qk_gemm;
-  const size_t qk_workspace_size = qk_gemm.get_workspace_size(qk_args);
-  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(qk_workspace_size),
-              "workspace too small for QK: need ", qk_workspace_size,
-              " bytes, got ", workspace.numel());
-  auto qk_status = qk_gemm.initialize(
-      qk_args,
-      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
-      at::cuda::getCurrentCUDAStream());
-  TORCH_CHECK(qk_status == cutlass::Status::kSuccess,
-              "failed to initialize CUTLASS QK GEMM params");
-  auto qk_params = qk_gemm.params();
-
-  auto pv_args = flashinfer::gemm::prepareGemmArgsImpl<CutlassGemmK128Stage2>(
-      nullptr,
-      q_packed.data_ptr<uint8_t>(),
-      v_pv_packed.data_ptr<uint8_t>(),
-      q_scales.data_ptr<uint8_t>(),
-      v_pv_scales.data_ptr<uint8_t>(),
-      &alpha,
-      kCutlassTileM,
-      head_dim,
-      kv_len,
-      1);
-  CutlassGemmK128Stage2 pv_gemm;
-  const size_t pv_workspace_size = pv_gemm.get_workspace_size(pv_args);
-  TORCH_CHECK(workspace.numel() >= static_cast<int64_t>(pv_workspace_size),
-              "workspace too small for PV: need ", pv_workspace_size,
-              " bytes, got ", workspace.numel());
-  auto pv_status = pv_gemm.initialize(
-      pv_args,
-      reinterpret_cast<char*>(workspace.data_ptr<uint8_t>()),
-      at::cuda::getCurrentCUDAStream());
-  TORCH_CHECK(pv_status == cutlass::Status::kSuccess,
-              "failed to initialize CUTLASS stage-2 PV GEMM params");
-  auto pv_params = pv_gemm.params();
-
-  constexpr int kSmemBytes =
-      static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
-  auto stage_kernel =
-      sm120_nvfp4_qkv_online_register_q_stage_kernel<kOutputGroupSpan>;
-  C10_CUDA_CHECK(cudaFuncSetAttribute(
-      stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-  stage_kernel<<<dim3(q_rows / kCutlassTileM,
-                      head_dim / (kOutputGroupSpan * kCutlassTileN),
-                      num_splits),
-                 kSm120Nvfp4FmhaThreadCount, kSmemBytes,
-                 at::cuda::getCurrentCUDAStream()>>>(
-      qk_params, pv_params,
+  C10_CUDA_CHECK(sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw<
+                 kOutputGroupSpan>(
+      q_packed.data_ptr<uint8_t>(), q_scales.data_ptr<uint8_t>(),
+      k_packed.data_ptr<uint8_t>(), k_scales.data_ptr<uint8_t>(),
+      v_pv_packed.data_ptr<uint8_t>(), v_pv_scales.data_ptr<uint8_t>(),
       reinterpret_cast<__nv_bfloat16*>(partial.data_ptr<at::BFloat16>()),
-      static_cast<float>(qk_alpha), static_cast<float>(pv_alpha), 0, 0,
-      static_cast<int>(split_kv_tiles), total_kv_tiles,
-      static_cast<int>(q_len), static_cast<int>(group_size),
-      static_cast<int>(kv_len_tokens), causal ? 1 : 0,
-      static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
-      0, head_dim,
-      split_m.data_ptr<float>(), split_l.data_ptr<float>(), q_rows,
-      q_rows * head_dim);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  constexpr int kThreads = 256;
-  sm120_nvfp4_splitkv_combine_kernel<<<q_rows, kThreads, 0,
-                                       at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const __nv_bfloat16*>(
-          partial.data_ptr<at::BFloat16>()),
       split_m.data_ptr<float>(), split_l.data_ptr<float>(),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()),
-      num_splits, q_rows, head_dim);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      workspace.data_ptr<uint8_t>(), static_cast<size_t>(workspace.numel()),
+      static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
+      static_cast<int>(split_kv_tiles), static_cast<int>(q_len),
+      static_cast<int>(group_size), static_cast<int>(kv_len_tokens), causal,
+      static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
+      q_rows, head_dim, kv_len, at::cuda::getCurrentCUDAStream()));
 }
 
 void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(

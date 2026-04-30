@@ -6,107 +6,14 @@
 
 #include <cstdint>
 
+#include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_adapter.cuh>
+
 namespace sm120_nvfp4_paged_adapter {
 
 inline void check_byte_tensor(const torch::Tensor& t, const char* name) {
   TORCH_CHECK(t.is_cuda(), name, " must be CUDA");
   TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
   TORCH_CHECK(t.element_size() == 1, name, " must have 1-byte elements");
-}
-
-__global__ void gather_k_pages_kernel(
-    const uint8_t* k_pages,
-    const uint8_t* k_sf_pages,
-    const int32_t* block_table,
-    uint8_t* k_dense,
-    uint8_t* k_sf_dense,
-    int kv_len,
-    int page_size,
-    int num_kv_heads,
-    int kv_head,
-    int packed_dim,
-    int scale_dim) {
-  const int token = int(blockIdx.x);
-  const int col = int(threadIdx.x);
-  if (token >= kv_len) {
-    return;
-  }
-  const int logical_page = token / page_size;
-  const int page_offset = token - logical_page * page_size;
-  const int physical_page = block_table[logical_page];
-
-  if (col < packed_dim) {
-    const int src =
-        (((physical_page * page_size + page_offset) * num_kv_heads + kv_head) *
-             packed_dim +
-         col);
-    k_dense[token * packed_dim + col] = k_pages[src];
-  }
-  if (col < scale_dim) {
-    const int src =
-        (((physical_page * page_size + page_offset) * num_kv_heads + kv_head) *
-             scale_dim +
-         col);
-    k_sf_dense[token * scale_dim + col] = k_sf_pages[src];
-  }
-}
-
-__global__ void gather_v_pv_pages_kernel(
-    const uint8_t* v_pages,
-    const uint8_t* v_sf_pages,
-    const int32_t* block_table,
-    uint8_t* v_pv_dense,
-    uint8_t* v_pv_sf_dense,
-    int kv_len,
-    int page_size,
-    int num_kv_heads,
-    int kv_head,
-    int packed_dim,
-    int scale_dim,
-    int head_dim) {
-  const int pair = int(blockIdx.x);
-  const int d = int(blockIdx.y * blockDim.x + threadIdx.x);
-  if (pair >= kv_len / 2 || d >= head_dim) {
-    return;
-  }
-
-  const int token0 = pair * 2;
-  const int token1 = token0 + 1;
-  const int logical_page0 = token0 / page_size;
-  const int logical_page1 = token1 / page_size;
-  const int physical_page0 = block_table[logical_page0];
-  const int physical_page1 = block_table[logical_page1];
-  const int page_offset0 = token0 - logical_page0 * page_size;
-  const int page_offset1 = token1 - logical_page1 * page_size;
-  const int packed_col = d >> 1;
-  const int nibble_shift = (d & 1) * 4;
-
-  const int src0 =
-      (((physical_page0 * page_size + page_offset0) * num_kv_heads + kv_head) *
-           packed_dim +
-       packed_col);
-  const int src1 =
-      (((physical_page1 * page_size + page_offset1) * num_kv_heads + kv_head) *
-           packed_dim +
-       packed_col);
-  const uint8_t nib0 = (v_pages[src0] >> nibble_shift) & 0x0f;
-  const uint8_t nib1 = (v_pages[src1] >> nibble_shift) & 0x0f;
-  v_pv_dense[d * (kv_len / 2) + pair] =
-      static_cast<uint8_t>(nib0 | (nib1 << 4));
-
-  if ((pair & ((page_size / 2) - 1)) == 0) {
-    const int scale_col = pair / (page_size / 2);
-    const int scale_page = block_table[scale_col];
-    const int scale_row_in_page = d / scale_dim;
-    const int scale_col_in_page = d - scale_row_in_page * scale_dim;
-    const int scale_src =
-        (((scale_page * page_size + scale_row_in_page) * num_kv_heads +
-          kv_head) *
-             scale_dim +
-         scale_col_in_page);
-    v_pv_sf_dense[d * (kv_len / page_size) + scale_col] =
-        v_sf_pages[scale_src];
-  }
 }
 
 inline void gather_paged_kv_to_dense_pv_from_block_table_ptr(
@@ -168,34 +75,22 @@ inline void gather_paged_kv_to_dense_pv_from_block_table_ptr(
                   torch::IntArrayRef({head_dim, kv_len / page_size}),
               "v_pv_sf_dense must have shape [D, kv_len/page_size]");
 
-  const int k_threads = 256;
-  gather_k_pages_kernel<<<kv_len, k_threads, 0,
-                          at::cuda::getCurrentCUDAStream()>>>(
+  C10_CUDA_CHECK(
+      flashinfer::attention::blackwell::sm120_nvfp4::
+          gather_paged_kv_to_dense_pv_raw(
       reinterpret_cast<const uint8_t*>(k_pages.data_ptr()),
       reinterpret_cast<const uint8_t*>(k_sf_pages.data_ptr()),
-      block_table_ptr,
-      reinterpret_cast<uint8_t*>(k_dense.data_ptr()),
-      reinterpret_cast<uint8_t*>(k_sf_dense.data_ptr()),
-      static_cast<int>(kv_len),
-      static_cast<int>(page_size), static_cast<int>(num_kv_heads),
-      static_cast<int>(kv_head), static_cast<int>(packed_dim),
-      static_cast<int>(scale_dim));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-  dim3 grid_v(static_cast<unsigned>(kv_len / 2),
-              static_cast<unsigned>((head_dim + k_threads - 1) / k_threads));
-  gather_v_pv_pages_kernel<<<grid_v, k_threads, 0,
-                              at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const uint8_t*>(v_pages_pv.data_ptr()),
       reinterpret_cast<const uint8_t*>(v_sf_pages_pv.data_ptr()),
       block_table_ptr,
+      reinterpret_cast<uint8_t*>(k_dense.data_ptr()),
+      reinterpret_cast<uint8_t*>(k_sf_dense.data_ptr()),
       reinterpret_cast<uint8_t*>(v_pv_dense.data_ptr()),
       reinterpret_cast<uint8_t*>(v_pv_sf_dense.data_ptr()),
-      static_cast<int>(kv_len),
+      static_cast<int>(kv_head), static_cast<int>(kv_len),
       static_cast<int>(page_size), static_cast<int>(num_kv_heads),
-      static_cast<int>(kv_head), static_cast<int>(packed_dim),
-      static_cast<int>(scale_dim), static_cast<int>(head_dim));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+      static_cast<int>(packed_dim), static_cast<int>(scale_dim),
+      at::cuda::getCurrentCUDAStream()));
 }
 
 inline void gather_paged_kv_to_dense_pv(
