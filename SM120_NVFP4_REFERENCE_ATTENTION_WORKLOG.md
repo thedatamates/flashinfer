@@ -11981,3 +11981,75 @@ slice it passes the 2x gate for every q>=1024 cell and for the longer q=512
 cells. The strongest production-relevant region is q>=1024, where speedups are
 2.15x to 4.93x against NVFP4 FA2 and correctness cosines stay around 0.989-0.993.
 ```
+
+## Cleanup: Remove Settled Hill-Climb Scaffolding
+
+The D256 and D512 benchmark kernels no longer accept the settled hill-climb
+macros from the environment. The production values are fixed in source:
+
+```text
+D256 tile:                 64x128x128
+D256 direct MMA epilogue:  false
+D256 single softmax warp:  true
+D256 MMA-owned softmax:    true
+D256 min blocks/SM:        1
+D256 logits row skew:      4
+
+D512 MMA-owned softmax:    true
+D512 softmax threads/row:  2
+D512 min blocks/SM:        1
+D512 logits row skew:      4
+```
+
+The common benchmark harness now builds one stable extension name per head dim
+instead of encoding D256/D512 hill-climb permutations in the torch extension
+cache key. Removed harness-side compile knobs:
+
+```text
+SM120_D256_TILE_POLICY
+SM120_D256_MIN_BLOCKS_PER_SM
+SM120_D256_LOGITS_ROW_SKEW
+SM120_D512_MMA_OWNS_SOFTMAX
+SM120_D512_LOGITS_ROW_SKEW
+SM120_D512_SOFTMAX_THREADS_PER_ROW
+SM120_D512_MIN_BLOCKS_PER_SM
+SM120_NVFP4_MAXRREGCOUNT
+```
+
+D256 rejected manual experiment paths were removed from the C++ extension and
+CLI:
+
+```text
+manual QK/PV direct-fragment probes
+manual fused-tile direct/smem/compact probes
+manual compact split-KV / online split-KV / register-O split-KV variants
+```
+
+The active production entrypoints remain:
+
+```text
+sm120_nvfp4_qkv_online_register_q_splitkv_full_grid
+sm120_nvfp4_qkv_online_register_q_splitkv_reuse2_full_grid
+sm120_nvfp4_qkv_online_register_q_splitkv_reuse4_full_grid
+```
+
+Smoke validation after cleanup:
+
+```text
+python -m py_compile benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py \
+  benchmarks/bench_sm120_d256_hillclimb.py
+
+D256 role schedule smoke:
+  total_warps=10, mma=8, load=1, epilogue=1, storage=50176 bytes
+
+D512 role schedule smoke:
+  total_warps=10, mma=8, load=1, epilogue=1, storage=96256 bytes
+
+D256 active split-KV smoke:
+  q=512 kv=8192 group=2 reuse2
+  finite=true cosine=0.99149 min_ms=0.2044
+
+D512 active split-KV smoke:
+  q=512 kv=8192 group=8 reuse4
+  finite=true cosine=0.98977 min_ms=1.3083
+```

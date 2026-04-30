@@ -41,7 +41,7 @@ def build_cells(args: argparse.Namespace) -> list[Cell]:
     kv_lens = parse_int_list(args.kv_lens, default=DEFAULT_KV_LENS)
     groups = parse_int_list(args.groups, default=DEFAULT_GROUPS)
     return [
-        Cell(q_len=q_len, kv_len=kv_len, group=group)
+        Cell(q_len=q_len, kv_len=kv_len, head_dim=args.head_dim, group=group)
         for group in groups
         for q_len in q_lens
         for kv_len in kv_lens
@@ -507,6 +507,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--timeout-sec", type=int, default=900)
+    parser.add_argument("--head-dim", type=int, default=256)
     parser.add_argument("--fused-split-kv-len", type=int, default=6656)
     parser.add_argument("--fused-output-group-span", type=int, default=2)
     parser.add_argument(
@@ -548,11 +549,32 @@ def main() -> None:
     prefix = (
         Path(args.output_prefix)
         if args.output_prefix
-        else root / "reports" / f"d256_hillclimb_{stamp}"
+        else root / "reports" / f"d{args.head_dim}_hillclimb_{stamp}"
     )
     rows: list[dict[str, Any]] = load_jsonl_rows(prefix)
+    existing = {
+        (row.get("group"), row.get("q"), row.get("kv"), row.get("d"), row.get("kernel"))
+        for row in rows
+    }
     for cell in cells:
         for kernel in kernels:
+            row_key = (cell.group, cell.q_len, cell.kv_len, cell.head_dim, kernel)
+            if row_key in existing:
+                print(
+                    json.dumps(
+                        {
+                            "status": "skipped_existing",
+                            "group": cell.group,
+                            "q": cell.q_len,
+                            "kv": cell.kv_len,
+                            "d": cell.head_dim,
+                            "kernel": kernel,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                continue
             command = (
                 fused_command(root, cell, args)
                 if kernel == "sm120_fused"
@@ -578,6 +600,7 @@ def main() -> None:
                     error=exc,
                 )
             rows.append(row)
+            existing.add(row_key)
             append_row(row, prefix=prefix)
             write_summary_reports(rows, prefix=prefix)
             print(json.dumps(row, sort_keys=True), flush=True)

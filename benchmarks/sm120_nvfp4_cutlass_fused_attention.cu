@@ -40,23 +40,10 @@ constexpr int kTileN = 16;
 constexpr int kCutlassTileM = 128;
 constexpr int kCutlassTileN = 128;
 constexpr int kCutlassTileK = 256;
-#ifndef SM120_D512_MMA_OWNS_SOFTMAX
-#define SM120_D512_MMA_OWNS_SOFTMAX 1
-#endif
-#ifndef SM120_D512_LOGITS_ROW_SKEW
-#define SM120_D512_LOGITS_ROW_SKEW 4
-#endif
-#ifndef SM120_D512_SOFTMAX_THREADS_PER_ROW
-#define SM120_D512_SOFTMAX_THREADS_PER_ROW 2
-#endif
-#ifndef SM120_D512_MIN_BLOCKS_PER_SM
-#define SM120_D512_MIN_BLOCKS_PER_SM 1
-#endif
-constexpr bool kSm120D512MmaOwnsSoftmax =
-    SM120_D512_MMA_OWNS_SOFTMAX != 0;
-constexpr int kSm120D512LogitsRowSkew = SM120_D512_LOGITS_ROW_SKEW;
-constexpr int kSm120D512SoftmaxThreadsPerRow =
-    SM120_D512_SOFTMAX_THREADS_PER_ROW;
+constexpr bool kSm120D512MmaOwnsSoftmax = true;
+constexpr int kSm120D512LogitsRowSkew = 4;
+constexpr int kSm120D512SoftmaxThreadsPerRow = 2;
+constexpr int kSm120D512MinBlocksPerSm = 1;
 constexpr int kCutlassTileK128 = 128;
 constexpr int kDebugHead = 0;
 constexpr int kProbPackedCols = kKvLen / 2;
@@ -903,7 +890,7 @@ __device__ __forceinline__ void sm120_epilogue_store_bf16_tile(
 
 template <int kOutputGroupSpan>
 __global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount,
-                             SM120_D512_MIN_BLOCKS_PER_SM)
+                             kSm120D512MinBlocksPerSm)
 void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128Stage2::Params const pv_params,
