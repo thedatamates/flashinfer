@@ -11626,3 +11626,107 @@ q values. The 2x gate starts at q=4096. q=1024 wins by 1.72x but remains below
 the 2x target, which is consistent with launch/short-KV overhead dominating the
 lowest-q cell.
 ```
+
+## D512 Backport: MMA-Owned Softmax And P-Reuse
+
+Ported the D256 structural wins back into the original D512 fused kernel:
+
+```text
+file: benchmarks/sm120_nvfp4_cutlass_fused_attention.cu
+
+default compile knobs:
+  SM120_D512_MMA_OWNS_SOFTMAX=1
+  SM120_D512_LOGITS_ROW_SKEW=4
+  SM120_D512_SOFTMAX_THREADS_PER_ROW=2
+  SM120_D512_MIN_BLOCKS_PER_SM=1
+```
+
+Changes landed:
+
+```text
+- MMA-owned P generation / online softmax replaces the old Softmax0/Softmax1
+  role pipeline by default.
+- D512 uses 2 MMA threads per score row. A 1-thread row owner was tested and
+  regressed.
+- V pipeline release is delayed until after PV consumes the V fragment.
+- P tile bytes are coalesced into 32-bit stores where the CuTe layout is
+  contiguous.
+- Logits row skew is supported and defaults to 4, but the D512 focused sweep
+  showed skew is not the main lever.
+- Nonfinal PV now copies the P fragment once and reuses it across output-group
+  span2/span4 accumulators. This is the large D512 win.
+```
+
+Focused validation surface requested for D512:
+
+```text
+D=512
+group=4
+q_len=32768
+kv_len={32768,65536,131072,262144}
+split_kv_len=32768
+output_group_span=4
+warmup=1
+repeat=3
+CUDA_HOME=/usr/local/cuda-13.2
+CUTLASS_ROOT=/home/josh/tdm/cutlass
+```
+
+Old role-softmax comparison on the anchor:
+
+```text
+q=32768 kv=32768 group=4
+old role-softmax path: 88.6640 ms
+MMA-owned softmax only: 77.5065 ms
+lift: 12.6%
+```
+
+D512 row-skew / softmax-thread checks on the anchor:
+
+```text
+skew=0,  threads=2: 77.7464 ms
+skew=2,  threads=2: 78.2632 ms
+skew=4,  threads=2: 77.5065 ms
+skew=8,  threads=2: 78.9255 ms
+skew=16, threads=2: 79.0175 ms
+skew=4,  threads=1: 79.7990 ms
+```
+
+Interpretation:
+
+```text
+2-thread MMA-owned row softmax is the right D512 default. Logits row skew is
+flat around the focused anchor; keep skew=4 for consistency with the D256 path,
+but the main D512 improvement is P-fragment reuse across output groups.
+```
+
+Focused D512 result after P-fragment reuse:
+
+```text
+q      kv      fused ms  nvfp4 FA2 ms  fp8 FA2 ms  speedup vs nvfp4  cosine
+32768  32768   36.7411   69.2557       74.0916     1.88x             0.9928
+32768  65536   73.7090   216.0493      211.8449    2.93x             0.9870
+32768  131072  154.4947  501.8390      488.4138    3.25x             0.9909
+32768  262144  321.1207  1078.7087     1059.6572   3.36x             0.9898
+```
+
+BF16 FA2 note:
+
+```text
+The BF16 FA2 baseline for this custom D512/group4/q32768 shape hit the local
+FlashInfer invalid-configuration path:
+NUM_MMA_Q=1 NUM_MMA_D_QK=32 NUM_MMA_D_VO=32 NUM_MMA_KV=1
+NUM_WARPS_Q=4 NUM_WARPS_KV=1
+
+Do not use BF16 FA2 as a decision baseline for this focused D512 surface until
+that routing/config issue is fixed.
+```
+
+Conclusion:
+
+```text
+The D512 backport is a real win. It is not just a direct copy of the D256
+softmax change: the decisive D512 lever is reusing the staged P fragment across
+the span4 PV accumulators. The focused long-context cells now beat NVFP4 FA2 by
+1.88x-3.36x and FP8 FA2 by 2.02x-3.30x.
+```

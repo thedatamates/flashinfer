@@ -134,8 +134,28 @@ def build_extension(head_dim: int = HEAD_DIM):
             f"_lskew{d256_logits_row_skew}"
         )
     elif head_dim == 512:
+        d512_mma_owns_softmax = int(os.environ.get("SM120_D512_MMA_OWNS_SOFTMAX", "1"))
+        d512_logits_row_skew = int(os.environ.get("SM120_D512_LOGITS_ROW_SKEW", "4"))
+        d512_softmax_threads = int(
+            os.environ.get("SM120_D512_SOFTMAX_THREADS_PER_ROW", "2")
+        )
+        d512_min_blocks = int(os.environ.get("SM120_D512_MIN_BLOCKS_PER_SM", "1"))
+        extra_cuda_cflags.extend(
+            [
+                f"-DSM120_D512_MMA_OWNS_SOFTMAX={d512_mma_owns_softmax}",
+                f"-DSM120_D512_LOGITS_ROW_SKEW={d512_logits_row_skew}",
+                f"-DSM120_D512_SOFTMAX_THREADS_PER_ROW={d512_softmax_threads}",
+                f"-DSM120_D512_MIN_BLOCKS_PER_SM={d512_min_blocks}",
+            ]
+        )
         source_name = "sm120_nvfp4_cutlass_fused_attention.cu"
-        extension_name = "sm120_nvfp4_cutlass_fused_attention_ext"
+        extension_name = (
+            "sm120_nvfp4_cutlass_fused_attention_ext"
+            f"_mmaown{d512_mma_owns_softmax}"
+            f"_lskew{d512_logits_row_skew}"
+            f"_sth{d512_softmax_threads}"
+            f"_mb{d512_min_blocks}"
+        )
     else:
         raise ValueError("head_dim must be one of {128, 256, 512}")
     return load(

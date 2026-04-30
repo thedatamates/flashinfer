@@ -40,6 +40,23 @@ constexpr int kTileN = 16;
 constexpr int kCutlassTileM = 128;
 constexpr int kCutlassTileN = 128;
 constexpr int kCutlassTileK = 256;
+#ifndef SM120_D512_MMA_OWNS_SOFTMAX
+#define SM120_D512_MMA_OWNS_SOFTMAX 1
+#endif
+#ifndef SM120_D512_LOGITS_ROW_SKEW
+#define SM120_D512_LOGITS_ROW_SKEW 4
+#endif
+#ifndef SM120_D512_SOFTMAX_THREADS_PER_ROW
+#define SM120_D512_SOFTMAX_THREADS_PER_ROW 2
+#endif
+#ifndef SM120_D512_MIN_BLOCKS_PER_SM
+#define SM120_D512_MIN_BLOCKS_PER_SM 1
+#endif
+constexpr bool kSm120D512MmaOwnsSoftmax =
+    SM120_D512_MMA_OWNS_SOFTMAX != 0;
+constexpr int kSm120D512LogitsRowSkew = SM120_D512_LOGITS_ROW_SKEW;
+constexpr int kSm120D512SoftmaxThreadsPerRow =
+    SM120_D512_SOFTMAX_THREADS_PER_ROW;
 constexpr int kCutlassTileK128 = 128;
 constexpr int kDebugHead = 0;
 constexpr int kProbPackedCols = kKvLen / 2;
@@ -66,8 +83,10 @@ enum class Sm120Nvfp4FmhaRole : int {
   Count = 7,
 };
 
-constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 = 1;
-constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 = 1;
+constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 =
+    kSm120D512MmaOwnsSoftmax ? 0 : 1;
+constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 =
+    kSm120D512MmaOwnsSoftmax ? 0 : 1;
 constexpr int kSm120Nvfp4FmhaNumWarpsCorrection = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsMma = 8;
 constexpr int kSm120Nvfp4FmhaNumWarpsLoad = 1;
@@ -97,8 +116,12 @@ constexpr int kSm120Nvfp4FmhaSoftmaxThreadCount =
      kSm120Nvfp4FmhaNumWarpsSoftmax1) *
     cutlass::NumThreadsPerWarp;
 constexpr int kSm120Nvfp4FmhaSoftmaxGroupThreadCount =
-    kSm120Nvfp4FmhaNumWarpsSoftmax0 * cutlass::NumThreadsPerWarp;
-static_assert(kSm120Nvfp4FmhaNumWarpsSoftmax0 ==
+    (kSm120Nvfp4FmhaNumWarpsSoftmax0 > 0
+         ? kSm120Nvfp4FmhaNumWarpsSoftmax0
+         : 1) *
+    cutlass::NumThreadsPerWarp;
+static_assert(kSm120D512MmaOwnsSoftmax ||
+              kSm120Nvfp4FmhaNumWarpsSoftmax0 ==
               kSm120Nvfp4FmhaNumWarpsSoftmax1);
 constexpr int kSm120Nvfp4FmhaMmaSoftmaxThreadCount =
     kSm120Nvfp4FmhaNumWarpsMma * cutlass::NumThreadsPerWarp +
@@ -879,7 +902,8 @@ __device__ __forceinline__ void sm120_epilogue_store_bf16_tile(
 }
 
 template <int kOutputGroupSpan>
-__global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount, 1)
+__global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount,
+                             SM120_D512_MIN_BLOCKS_PER_SM)
 void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernelK128Stage2::Params const pv_params,
@@ -957,11 +981,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     pipeline_mma_s1_params.role =
         Sm120Nvfp4PipelineS::ThreadCategory::Producer;
   }
-  if (is_softmax0) {
+  if (!kSm120D512MmaOwnsSoftmax && is_softmax0) {
     pipeline_mma_s0_params.role =
         Sm120Nvfp4PipelineS::ThreadCategory::Consumer;
   }
-  if (is_softmax1) {
+  if (!kSm120D512MmaOwnsSoftmax && is_softmax1) {
     pipeline_mma_s1_params.role =
         Sm120Nvfp4PipelineS::ThreadCategory::Consumer;
   }
@@ -1480,9 +1504,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                    pv_tCrSFB_copy_view(_, _, k_block));
       });
 
-      cutlass::arch::NamedBarrier::sync(
-          cute::thr_size(pv_tiled_mma),
-          cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+    };
+
+    auto pv_release_v_stage = [&]() {
       v_pipeline.consumer_release(v_pipe_read);
       ++v_pipe_read;
     };
@@ -1500,13 +1524,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     auto pv_smem_thr_copy_SFA =
         pv_smem_tiled_copy_SFA.get_thread_slice(pv_mma_thread_idx);
 
-    auto pv_gemm_p_stage = [&](auto& accum, auto& p_sA_stage,
-                               auto& p_sSFA_stage) {
-      auto pv_tCrA =
-          pv_thread_mma.partition_fragment_A(p_sA_stage(_, _, cute::Int<0>{}));
-      auto pv_tCrSFA =
-          pv_collective.partition_fragment_SFA(
-              p_sSFA_stage(_, _, cute::Int<0>{}), pv_thread_mma);
+    auto pv_copy_p_frag = [&](auto& p_sA_stage, auto& p_sSFA_stage,
+                              auto& pv_tCrA, auto& pv_tCrSFA) {
       auto pv_tCsA = pv_smem_thr_copy_A.partition_S(
           cute::as_position_independent_swizzle_tensor(p_sA_stage));
       auto pv_tCrA_copy_view = pv_smem_thr_copy_A.retile_D(pv_tCrA);
@@ -1525,15 +1544,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                    pv_tCrSFA_copy_view(_, _, k_block));
       };
 
-      auto pv_gemm_kblock = [&](auto k_block) {
-        cute::gemm(pv_tiled_mma,
-                   cute::make_zip_tensor(pv_tCrA(_, _, k_block),
-                                          pv_tCrSFA(_, _, k_block)),
-                   cute::make_zip_tensor(v_frag(_, _, k_block),
-                                          v_scale_frag(_, _, k_block)),
-                   accum);
-      };
-
       pv_copy_p_kblock(cute::_0{});
       cute::for_each(cute::make_int_sequence<pv_K_BLOCK_MAX>{},
                      [&](auto k_block) {
@@ -1542,15 +1552,212 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         if (k_block_next > 0) {
           pv_copy_p_kblock(k_block_next);
         }
-        pv_gemm_kblock(k_block);
       });
+    };
+
+    auto pv_gemm_loaded_p = [&](auto& accum, auto& pv_tCrA,
+                                auto& pv_tCrSFA) {
+      auto pv_K_BLOCK_MAX = cute::size<2>(pv_tCrA);
+      cute::for_each(cute::make_int_sequence<pv_K_BLOCK_MAX>{},
+                     [&](auto k_block) {
+        cute::gemm(pv_tiled_mma,
+                   cute::make_zip_tensor(pv_tCrA(_, _, k_block),
+                                          pv_tCrSFA(_, _, k_block)),
+                   cute::make_zip_tensor(v_frag(_, _, k_block),
+                                          v_scale_frag(_, _, k_block)),
+                   accum);
+      });
+    };
+
+    auto pv_gemm_p_stage = [&](auto& accum, auto& p_sA_stage,
+                               auto& p_sSFA_stage) {
+      auto pv_tCrA =
+          pv_thread_mma.partition_fragment_A(p_sA_stage(_, _, cute::Int<0>{}));
+      auto pv_tCrSFA =
+          pv_collective.partition_fragment_SFA(
+              p_sSFA_stage(_, _, cute::Int<0>{}), pv_thread_mma);
+      pv_copy_p_frag(p_sA_stage, p_sSFA_stage, pv_tCrA, pv_tCrSFA);
+      pv_gemm_loaded_p(accum, pv_tCrA, pv_tCrSFA);
     };
 
     auto pv_cC = cute::make_identity_tensor(
         cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
     auto pv_tCcC = pv_thread_mma.partition_C(pv_cC);
+    static_assert(kCutlassTileN == 128,
+                  "D512 MMA-owned softmax currently assumes 128 score columns");
+    static_assert(kSm120D512SoftmaxThreadsPerRow == 1 ||
+                  kSm120D512SoftmaxThreadsPerRow == 2);
+    static_assert((kCutlassTileN & (kCutlassTileN - 1)) == 0,
+                  "logits row skew assumes power-of-two score tile width");
+    auto logits_smem_index = [](int row, int col) {
+      if constexpr (kSm120D512LogitsRowSkew == 0) {
+        return row * kCutlassTileN + col;
+      } else {
+        const int skewed_col =
+            (col + (row & 0x0f) * kSm120D512LogitsRowSkew) &
+            (kCutlassTileN - 1);
+        return row * kCutlassTileN + skewed_col;
+      }
+    };
+    const bool mma_softmax_row_owner =
+        kSm120D512MmaOwnsSoftmax &&
+        qk_mma_thread_idx < kCutlassTileM * kSm120D512SoftmaxThreadsPerRow;
+    const int mma_softmax_row =
+        qk_mma_thread_idx / kSm120D512SoftmaxThreadsPerRow;
+    const int mma_softmax_row_lane =
+        qk_mma_thread_idx & (kSm120D512SoftmaxThreadsPerRow - 1);
+    float mma_running_m = -INFINITY;
+    float mma_running_l = 0.0f;
+
+    auto mma_stage_probability_row = [&](auto& p_sA, auto& p_sSFA,
+                                         const __nv_bfloat16* smem_logits_stage,
+                                         int tile, bool final_tile) {
+      if (!mma_softmax_row_owner) {
+        return;
+      }
+      constexpr unsigned kSoftmaxGroupMask = 0xffffffffu;
+      constexpr int kColsPerSoftmaxThread =
+          kCutlassTileN / kSm120D512SoftmaxThreadsPerRow;
+      const int col_begin = mma_softmax_row_lane * kColsPerSoftmaxThread;
+      float tile_m_local = -INFINITY;
+#pragma unroll
+      for (int col_offset = 0; col_offset < kColsPerSoftmaxThread;
+           ++col_offset) {
+        const int col = col_begin + col_offset;
+        const float logit = __bfloat162float(
+            smem_logits_stage[logits_smem_index(mma_softmax_row, col)]);
+        tile_m_local = fmaxf(tile_m_local, logit);
+      }
+      float tile_m = tile_m_local;
+      if constexpr (kSm120D512SoftmaxThreadsPerRow >= 2) {
+        tile_m =
+            fmaxf(tile_m, __shfl_xor_sync(kSoftmaxGroupMask, tile_m, 1));
+      }
+      if constexpr (kSm120D512SoftmaxThreadsPerRow >= 4) {
+        tile_m =
+            fmaxf(tile_m, __shfl_xor_sync(kSoftmaxGroupMask, tile_m, 2));
+      }
+      const float next_m = fmaxf(mma_running_m, tile_m);
+      const float old_scale =
+          mma_running_l == 0.0f ? 0.0f : __expf(mma_running_m - next_m);
+      const float tile_scale = __expf(tile_m - next_m);
+      float tile_l_scaled_local = 0.0f;
+#pragma unroll
+      for (int scale_group = col_begin / 16;
+           scale_group < (col_begin + kColsPerSoftmaxThread) / 16;
+           ++scale_group) {
+        const int local_col = scale_group * 16;
+        float vec_max = 0.0f;
+        float p_vals[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+          const float logit = __bfloat162float(
+              smem_logits_stage[logits_smem_index(mma_softmax_row,
+                                                  local_col + i)]);
+          const float p_scaled = __expf(logit - tile_m) * tile_scale;
+          tile_l_scaled_local += p_scaled;
+          vec_max = fmaxf(vec_max, p_scaled);
+          p_vals[i] = p_scaled;
+        }
+        const float scale_value =
+            fmaxf(kProbGlobalScale * vec_max / 6.0f, 1.0e-8f);
+        const uint8_t scale_byte = fp32_to_e4m3_byte(scale_value);
+        p_sSFA(mma_softmax_row, local_col, cute::Int<0>{}) =
+            make_ue4m3_raw(scale_byte);
+        const float output_scale = kProbGlobalScale / scale_value;
+        uint32_t packed_lo = 0;
+        uint32_t packed_hi = 0;
+#pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+          const float p0 = p_vals[2 * pair];
+          const float p1 = p_vals[2 * pair + 1];
+          const uint8_t packed_pair =
+              fp32_pair_to_e2m1_byte(p0 * output_scale, p1 * output_scale);
+          if (pair < 4) {
+            packed_lo |= static_cast<uint32_t>(packed_pair) << (8 * pair);
+          } else {
+            packed_hi |= static_cast<uint32_t>(packed_pair)
+                         << (8 * (pair - 4));
+          }
+        }
+        auto first_ref = p_sA(mma_softmax_row, local_col, cute::Int<0>{});
+        auto second_ref = p_sA(mma_softmax_row, local_col + 2, cute::Int<0>{});
+        auto third_ref = p_sA(mma_softmax_row, local_col + 4, cute::Int<0>{});
+        auto fourth_ref = p_sA(mma_softmax_row, local_col + 6, cute::Int<0>{});
+        auto fifth_ref = p_sA(mma_softmax_row, local_col + 8, cute::Int<0>{});
+        auto sixth_ref = p_sA(mma_softmax_row, local_col + 10, cute::Int<0>{});
+        auto seventh_ref =
+            p_sA(mma_softmax_row, local_col + 12, cute::Int<0>{});
+        auto eighth_ref =
+            p_sA(mma_softmax_row, local_col + 14, cute::Int<0>{});
+        uint8_t* dst0 = cute::recast_ptr<uint8_t>(&first_ref);
+        uint8_t* dst1 = cute::recast_ptr<uint8_t>(&second_ref);
+        uint8_t* dst2 = cute::recast_ptr<uint8_t>(&third_ref);
+        uint8_t* dst3 = cute::recast_ptr<uint8_t>(&fourth_ref);
+        uint8_t* dst4 = cute::recast_ptr<uint8_t>(&fifth_ref);
+        uint8_t* dst5 = cute::recast_ptr<uint8_t>(&sixth_ref);
+        uint8_t* dst6 = cute::recast_ptr<uint8_t>(&seventh_ref);
+        uint8_t* dst7 = cute::recast_ptr<uint8_t>(&eighth_ref);
+        const bool contiguous =
+            dst1 == dst0 + 1 && dst2 == dst0 + 2 && dst3 == dst0 + 3 &&
+            dst4 == dst0 + 4 && dst5 == dst0 + 5 && dst6 == dst0 + 6 &&
+            dst7 == dst0 + 7;
+        if (contiguous && ((reinterpret_cast<uintptr_t>(dst0) & 0x3u) == 0)) {
+          *reinterpret_cast<uint32_t*>(dst0) = packed_lo;
+          *reinterpret_cast<uint32_t*>(dst0 + 4) = packed_hi;
+        } else {
+          *dst0 = static_cast<uint8_t>(packed_lo);
+          *dst1 = static_cast<uint8_t>(packed_lo >> 8);
+          *dst2 = static_cast<uint8_t>(packed_lo >> 16);
+          *dst3 = static_cast<uint8_t>(packed_lo >> 24);
+          *dst4 = static_cast<uint8_t>(packed_hi);
+          *dst5 = static_cast<uint8_t>(packed_hi >> 8);
+          *dst6 = static_cast<uint8_t>(packed_hi >> 16);
+          *dst7 = static_cast<uint8_t>(packed_hi >> 24);
+        }
+      }
+      float tile_l_scaled = tile_l_scaled_local;
+      if constexpr (kSm120D512SoftmaxThreadsPerRow >= 2) {
+        tile_l_scaled +=
+            __shfl_xor_sync(kSoftmaxGroupMask, tile_l_scaled, 1);
+      }
+      if constexpr (kSm120D512SoftmaxThreadsPerRow >= 4) {
+        tile_l_scaled +=
+            __shfl_xor_sync(kSoftmaxGroupMask, tile_l_scaled, 2);
+      }
+      mma_running_l = mma_running_l * old_scale + tile_l_scaled;
+      mma_running_m = next_m;
+      if (mma_softmax_row_lane == 0) {
+        storage.old_scale_stage[tile & 1][mma_softmax_row] = old_scale;
+        if (final_tile) {
+          storage.global_m[mma_softmax_row] = mma_running_m;
+          storage.global_l[mma_softmax_row] = mma_running_l;
+        }
+      }
+    };
+
+    auto mma_stage_softmax_tile = [&](int tile, bool final_tile) {
+      cutlass::arch::NamedBarrier::sync(
+          CutlassCollectiveMainloop::ThreadCount,
+          cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+      const __nv_bfloat16* smem_logits_stage =
+          (tile & 1) == 0 ? smem_logits0 : smem_logits1;
+      if ((tile & 1) == 0) {
+        mma_stage_probability_row(p_sA0, p_sSFA0, smem_logits_stage, tile,
+                                  final_tile);
+      } else {
+        mma_stage_probability_row(p_sA1, p_sSFA1, smem_logits_stage, tile,
+                                  final_tile);
+      }
+      cutlass::arch::NamedBarrier::sync(
+          CutlassCollectiveMainloop::ThreadCount,
+          cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+    };
 
     auto acquire_score_stages = [&]() {
+      if constexpr (kSm120D512MmaOwnsSoftmax) {
+        return;
+      }
       if (!pipeline_mma_s0_acquired) {
         pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
       }
@@ -1562,6 +1769,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     };
 
     auto commit_score_stages = [&]() {
+      if constexpr (kSm120D512MmaOwnsSoftmax) {
+        return;
+      }
       cutlass::arch::NamedBarrier::sync(
           CutlassCollectiveMainloop::ThreadCount,
           cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
@@ -1579,7 +1789,12 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     };
 
     auto wait_p_ready_and_release_k = [&]() {
-      if (qk_head_chunks == 1) {
+      if constexpr (kSm120D512MmaOwnsSoftmax) {
+        release_k_chunk();
+        if (qk_head_chunks > 1) {
+          release_k_chunk();
+        }
+      } else if (qk_head_chunks == 1) {
         pipeline_mma_s0.producer_acquire(pipeline_mma_s0_producer_state);
         pipeline_mma_s0_acquired = true;
         pipeline_mma_s1.producer_acquire(pipeline_mma_s1_producer_state);
@@ -1632,8 +1847,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const int col = int(cute::get<1>(coord));
         if (row < kCutlassTileM && col < kCutlassTileN) {
           const float logit = qk_accum(i) * qk_scale;
-          smem_logits_stage[row * kCutlassTileN + col] =
-              __float2bfloat16(logit);
+          if constexpr (kSm120D512MmaOwnsSoftmax) {
+            smem_logits_stage[logits_smem_index(row, col)] =
+                __float2bfloat16(logit);
+          } else {
+            smem_logits_stage[row * kCutlassTileN + col] =
+                __float2bfloat16(logit);
+          }
         }
       }
 
@@ -1661,6 +1881,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       } else {
         pv_gemm_p_stage(pv_accum, p_sA1, p_sSFA1);
       }
+      pv_release_v_stage();
       if (final_tile) {
         const float pv_base_scale = pv_alpha / kProbGlobalScale;
         sm120_stage_o_fragment_to_epilogue_smem(
@@ -1670,18 +1891,72 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
     };
 
+    auto rescale_pv_accum = [&](int tile, auto& pv_accum) {
+      for (int i = 0; i < cute::size(pv_accum); ++i) {
+        if (tile == 0) {
+          pv_accum(i) = 0.0f;
+          continue;
+        }
+        auto coord = pv_tCcC(i);
+        const int row = int(cute::get<0>(coord));
+        if (row < kCutlassTileM) {
+          pv_accum(i) *= storage.old_scale_stage[tile & 1][row];
+        }
+      }
+    };
+
+    auto run_pv_tile_group_nonfinal = [&](int tile) {
+      auto run_with_p_stage = [&](auto& p_sA_stage, auto& p_sSFA_stage) {
+        auto pv_tCrA = pv_thread_mma.partition_fragment_A(
+            p_sA_stage(_, _, cute::Int<0>{}));
+        auto pv_tCrSFA = pv_collective.partition_fragment_SFA(
+            p_sSFA_stage(_, _, cute::Int<0>{}), pv_thread_mma);
+        pv_copy_p_frag(p_sA_stage, p_sSFA_stage, pv_tCrA, pv_tCrSFA);
+
+        rescale_pv_accum(tile, pv_accum0);
+        pv_consume_v_stage();
+        pv_gemm_loaded_p(pv_accum0, pv_tCrA, pv_tCrSFA);
+        pv_release_v_stage();
+
+        if constexpr (kOutputGroupSpan >= 2) {
+          rescale_pv_accum(tile, pv_accum1);
+          pv_consume_v_stage();
+          pv_gemm_loaded_p(pv_accum1, pv_tCrA, pv_tCrSFA);
+          pv_release_v_stage();
+        }
+
+        if constexpr (kOutputGroupSpan == 4) {
+          rescale_pv_accum(tile, pv_accum2);
+          pv_consume_v_stage();
+          pv_gemm_loaded_p(pv_accum2, pv_tCrA, pv_tCrSFA);
+          pv_release_v_stage();
+
+          rescale_pv_accum(tile, pv_accum3);
+          pv_consume_v_stage();
+          pv_gemm_loaded_p(pv_accum3, pv_tCrA, pv_tCrSFA);
+          pv_release_v_stage();
+        }
+      };
+
+      if ((tile & 1) == 0) {
+        run_with_p_stage(p_sA0, p_sSFA0);
+      } else {
+        run_with_p_stage(p_sA1, p_sSFA1);
+      }
+    };
+
     for (int tile = 0; tile < effective_num_kv_tiles; ++tile) {
       acquire_score_stages();
       run_qk_tile(tile);
       if (tile > 0) {
-        run_pv_tile(tile - 1, false, pv_accum0);
         if constexpr (kOutputGroupSpan >= 2) {
-          run_pv_tile(tile - 1, false, pv_accum1);
+          run_pv_tile_group_nonfinal(tile - 1);
+        } else {
+          run_pv_tile(tile - 1, false, pv_accum0);
         }
-        if constexpr (kOutputGroupSpan == 4) {
-          run_pv_tile(tile - 1, false, pv_accum2);
-          run_pv_tile(tile - 1, false, pv_accum3);
-        }
+      }
+      if constexpr (kSm120D512MmaOwnsSoftmax) {
+        mma_stage_softmax_tile(tile, tile == effective_num_kv_tiles - 1);
       }
       wait_p_ready_and_release_k();
     }
