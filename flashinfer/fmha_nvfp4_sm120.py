@@ -169,8 +169,14 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             raise ValueError("kv_lens entries must be positive.")
 
         self._qo_indptr = qo_indptr
+        self._qo_indptr_device = qo_indptr.to(
+            device=self.device, dtype=torch.int32
+        ).contiguous()
         self._block_tables = block_tables
         self._kv_lens = kv_lens
+        self._kv_lens_device = kv_lens.to(
+            device=self.device, dtype=torch.int32
+        ).contiguous()
         self._batch_size = batch_size
         self._total_q_len = int(qo_cpu[-1].item())
         self._max_q_len = int(q_lens.max().item()) if batch_size > 0 else 0
@@ -188,7 +194,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
 
         tile_m = _tile_m_for_head_dim(head_dim)
         max_q_rows = self._max_q_len * self._group_size
-        padded_q_rows = _round_up(max_q_rows, tile_m)
+        padded_q_rows_per_seq = _round_up(max_q_rows, tile_m)
+        batch_padded_q_rows = batch_size * padded_q_rows_per_seq
         physical_kv_len = _round_up(self._max_kv_len, 128)
         num_splits = math.ceil((physical_kv_len // 128) / self._split_kv_tiles)
         total_q_rows = self._total_q_len * self._group_size
@@ -206,10 +213,10 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         self._q_packed = alloc((total_q_rows, head_dim // 2), torch.uint8)
         self._q_scales = alloc((total_q_rows, head_dim // 16), torch.uint8)
         self._q_packed_scratch = alloc(
-            (padded_q_rows, head_dim // 2), torch.uint8
+            (batch_padded_q_rows, head_dim // 2), torch.uint8
         )
         self._q_scales_scratch = alloc(
-            (padded_q_rows, head_dim // 16), torch.uint8
+            (batch_padded_q_rows, head_dim // 16), torch.uint8
         )
         self._k_dense_scratch = alloc(
             (physical_kv_len, head_dim // 2), torch.uint8
@@ -224,11 +231,11 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             (head_dim, physical_kv_len // page_size), torch.uint8
         )
         self._partial = alloc(
-            (num_splits, padded_q_rows, head_dim), torch.bfloat16
+            (num_splits, batch_padded_q_rows, head_dim), torch.bfloat16
         )
-        self._split_m = alloc((num_splits, padded_q_rows), torch.float32)
-        self._split_l = alloc((num_splits, padded_q_rows), torch.float32)
-        self._out_scratch = alloc((padded_q_rows, head_dim), torch.bfloat16)
+        self._split_m = alloc((num_splits, batch_padded_q_rows), torch.float32)
+        self._split_l = alloc((num_splits, batch_padded_q_rows), torch.float32)
+        self._out_scratch = alloc((batch_padded_q_rows, head_dim), torch.bfloat16)
         self._out_group = alloc((total_q_rows, head_dim), torch.bfloat16)
         self._planned = True
 
@@ -317,8 +324,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 v_pages_pv,
                 v_sf_pages_pv_u8,
                 self._block_tables,
-                self._qo_indptr,
-                self._kv_lens,
+                self._qo_indptr_device,
+                self._kv_lens_device,
                 self._q_packed_scratch,
                 self._q_scales_scratch,
                 self._k_dense_scratch,

@@ -17,10 +17,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
-#include <cstring>
-#include <vector>
-
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_d128.cuh>
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh>
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh>
@@ -32,34 +28,147 @@
 namespace flashinfer {
 namespace {
 
-__global__ void CopyQToPaddedKernel(const uint8_t* q_packed,
-                                    const uint8_t* q_scales,
-                                    uint8_t* q_packed_scratch,
-                                    uint8_t* q_scales_scratch, int q_rows,
-                                    int padded_q_rows, int packed_dim,
-                                    int scale_dim) {
-  const int row = static_cast<int>(blockIdx.x);
-  const int col = static_cast<int>(threadIdx.x);
-  if (row >= padded_q_rows) {
+__global__ void CopyQToPaddedBatchKernel(const uint8_t* q_packed,
+                                         const uint8_t* q_scales,
+                                         const int32_t* qo_indptr,
+                                         uint8_t* q_packed_scratch,
+                                         uint8_t* q_scales_scratch,
+                                         int batch_size,
+                                         int group_size,
+                                         int padded_q_rows_per_seq,
+                                         int packed_dim,
+                                         int scale_dim) {
+  const int global_row = static_cast<int>(blockIdx.x);
+  if (padded_q_rows_per_seq <= 0) {
     return;
   }
-  if (col < packed_dim) {
-    q_packed_scratch[row * packed_dim + col] =
-        row < q_rows ? q_packed[row * packed_dim + col] : 0;
+  const int batch_idx = global_row / padded_q_rows_per_seq;
+  const int local_row = global_row - batch_idx * padded_q_rows_per_seq;
+  if (batch_idx >= batch_size) {
+    return;
   }
-  if (col < scale_dim) {
-    q_scales_scratch[row * scale_dim + col] =
-        row < q_rows ? q_scales[row * scale_dim + col] : 0;
+  const int q_begin = qo_indptr[batch_idx];
+  const int q_end = qo_indptr[batch_idx + 1];
+  const int q_rows = (q_end - q_begin) * group_size;
+  const int src_row = q_begin * group_size + local_row;
+  for (int col = static_cast<int>(threadIdx.x); col < packed_dim;
+       col += static_cast<int>(blockDim.x)) {
+    q_packed_scratch[global_row * packed_dim + col] =
+        local_row < q_rows ? q_packed[src_row * packed_dim + col] : 0;
+  }
+  for (int col = static_cast<int>(threadIdx.x); col < scale_dim;
+       col += static_cast<int>(blockDim.x)) {
+    q_scales_scratch[global_row * scale_dim + col] =
+        local_row < q_rows ? q_scales[src_row * scale_dim + col] : 0;
   }
 }
 
-__global__ void CopyPaddedOutKernel(const __nv_bfloat16* out_scratch,
-                                    __nv_bfloat16* out, int q_rows,
-                                    int head_dim) {
-  const int row = static_cast<int>(blockIdx.x);
-  const int col = static_cast<int>(threadIdx.x);
-  if (row < q_rows && col < head_dim) {
-    out[row * head_dim + col] = out_scratch[row * head_dim + col];
+__global__ void CopyPaddedBatchOutKernel(const __nv_bfloat16* out_scratch,
+                                         __nv_bfloat16* out,
+                                         const int32_t* qo_indptr,
+                                         int batch_size,
+                                         int group_size,
+                                         int padded_q_rows_per_seq,
+                                         int head_dim) {
+  const int global_row = static_cast<int>(blockIdx.x);
+  if (padded_q_rows_per_seq <= 0) {
+    return;
+  }
+  const int batch_idx = global_row / padded_q_rows_per_seq;
+  const int local_row = global_row - batch_idx * padded_q_rows_per_seq;
+  if (batch_idx >= batch_size) {
+    return;
+  }
+  const int q_begin = qo_indptr[batch_idx];
+  const int q_end = qo_indptr[batch_idx + 1];
+  const int q_rows = (q_end - q_begin) * group_size;
+  if (local_row >= q_rows) {
+    return;
+  }
+  const int out_row = q_begin * group_size + local_row;
+  for (int col = static_cast<int>(threadIdx.x); col < head_dim;
+       col += static_cast<int>(blockDim.x)) {
+    out[out_row * head_dim + col] =
+        out_scratch[global_row * head_dim + col];
+  }
+}
+
+__global__ void Sm120Nvfp4SplitKvCombineBatchKernel(
+    const __nv_bfloat16* partial,
+    const float* split_m,
+    const float* split_l,
+    __nv_bfloat16* out,
+    const int32_t* qo_indptr,
+    const int32_t* kv_lens,
+    int batch_size,
+    int group_size,
+    int padded_q_rows_per_seq,
+    int split_kv_tiles,
+    int max_splits,
+    int head_dim) {
+  const int global_row = static_cast<int>(blockIdx.x);
+  if (padded_q_rows_per_seq <= 0) {
+    return;
+  }
+  const int batch_idx = global_row / padded_q_rows_per_seq;
+  const int local_row = global_row - batch_idx * padded_q_rows_per_seq;
+  if (batch_idx >= batch_size) {
+    return;
+  }
+  const int q_begin = qo_indptr[batch_idx];
+  const int q_end = qo_indptr[batch_idx + 1];
+  const int q_rows = (q_end - q_begin) * group_size;
+  if (local_row >= q_rows) {
+    return;
+  }
+  const int kv_len_tokens = kv_lens[batch_idx];
+  const int total_kv_tiles = (kv_len_tokens + 127) / 128;
+  const int num_splits =
+      (total_kv_tiles + split_kv_tiles - 1) / split_kv_tiles;
+  if (num_splits <= 0 || num_splits > max_splits) {
+    return;
+  }
+
+  extern __shared__ float split_weights[];
+  const int total_padded_rows = batch_size * padded_q_rows_per_seq;
+  if (threadIdx.x == 0) {
+    float global_m = -INFINITY;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      global_m =
+          fmaxf(global_m, split_m[split * total_padded_rows + global_row]);
+    }
+
+    float global_l = 0.0f;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      const int stats_idx = split * total_padded_rows + global_row;
+      const float correction =
+          attention::blackwell::sm120_nvfp4::finite_f32(global_m)
+              ? __expf(split_m[stats_idx] - global_m)
+              : 0.0f;
+      split_weights[split] = correction;
+      global_l += correction * split_l[stats_idx];
+    }
+    const float inv_global_l = global_l > 0.0f ? 1.0f / global_l : 0.0f;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      split_weights[split] *= inv_global_l;
+    }
+  }
+  __syncthreads();
+
+  const int out_row = q_begin * group_size + local_row;
+  for (int col = static_cast<int>(threadIdx.x); col < head_dim;
+       col += static_cast<int>(blockDim.x)) {
+    float acc = 0.0f;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      const int partial_idx =
+          (split * total_padded_rows + global_row) * head_dim + col;
+      acc += split_weights[split] * __bfloat162float(partial[partial_idx]);
+    }
+    out[out_row * head_dim + col] = __float2bfloat16(acc);
   }
 }
 
@@ -77,10 +186,6 @@ int64_t tile_m_for_head_dim(int64_t head_dim) {
   return 0;
 }
 
-int64_t RoundUpMultiple(int64_t x, int64_t multiple) {
-  return ((x + multiple - 1) / multiple) * multiple;
-}
-
 void CheckCudaTypeLastDimContiguous(TensorView tensor, DLDataType dtype,
                                     const char* name) {
   CHECK_CUDA(tensor);
@@ -88,58 +193,6 @@ void CheckCudaTypeLastDimContiguous(TensorView tensor, DLDataType dtype,
       << "Inconsistency of Tensor type: " << name;
   TVM_FFI_ICHECK_EQ(tensor.stride(tensor.ndim() - 1), 1)
       << name << " must be contiguous in the last dimension";
-}
-
-std::vector<int64_t> ReadIndexTensorToHost(TensorView tensor, const char* name,
-                                           cudaStream_t stream) {
-  TVM_FFI_ICHECK(tensor.ndim() == 1) << name << " must be a 1D tensor";
-  TVM_FFI_ICHECK(tensor.IsContiguous()) << name << " must be contiguous";
-  TVM_FFI_ICHECK(tensor.dtype() == dl_int32 || tensor.dtype() == dl_int64)
-      << name << " must be int32 or int64";
-  std::vector<int64_t> host(tensor.size(0));
-  if (tensor.device().device_type == kDLCPU) {
-    if (tensor.dtype() == dl_int32) {
-      const int32_t* src = static_cast<const int32_t*>(tensor.data_ptr());
-      for (int64_t i = 0; i < tensor.size(0); ++i) {
-        host[i] = static_cast<int64_t>(src[i]);
-      }
-    } else {
-      std::memcpy(host.data(), tensor.data_ptr(),
-                  static_cast<size_t>(tensor.size(0)) * sizeof(int64_t));
-    }
-    return host;
-  }
-  CHECK_CUDA(tensor);
-  if (tensor.dtype() == dl_int32) {
-    std::vector<int32_t> tmp(tensor.size(0));
-    cudaError_t status =
-        cudaMemcpyAsync(tmp.data(), tensor.data_ptr(),
-                        static_cast<size_t>(tensor.size(0)) * sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, stream);
-    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to copy " << name << " to host: "
-        << cudaGetErrorString(status);
-    status = cudaStreamSynchronize(stream);
-    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to synchronize " << name << " copy: "
-        << cudaGetErrorString(status);
-    for (int64_t i = 0; i < tensor.size(0); ++i) {
-      host[i] = static_cast<int64_t>(tmp[i]);
-    }
-  } else {
-    cudaError_t status =
-        cudaMemcpyAsync(host.data(), tensor.data_ptr(),
-                        static_cast<size_t>(tensor.size(0)) * sizeof(int64_t),
-                        cudaMemcpyDeviceToHost, stream);
-    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to copy " << name << " to host: "
-        << cudaGetErrorString(status);
-    status = cudaStreamSynchronize(stream);
-    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to synchronize " << name << " copy: "
-        << cudaGetErrorString(status);
-  }
-  return host;
 }
 
 void CheckDenseRunTensors(TensorView q_packed, TensorView q_scales,
@@ -303,7 +356,10 @@ cudaError_t RunD256RawSpanDispatchPaged(
     bool causal, int sliding_window, float logits_soft_cap, int q_rows,
     int kv_len, cudaStream_t stream,
     attention::blackwell::sm120_nvfp4::d256::Sm120Nvfp4PagedKvLoadParams
-        paged_params) {
+        paged_params,
+    const int32_t* qo_indptr = nullptr, const int32_t* kv_lens = nullptr,
+    int batch_size = 1, int q_tiles_per_sequence = 0,
+    bool skip_internal_combine = false) {
   if (output_group_span == 1) {
     return attention::blackwell::sm120_nvfp4::d256::
         sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw<1>(
@@ -311,7 +367,8 @@ cudaError_t RunD256RawSpanDispatchPaged(
             partial, split_m, split_l, out, workspace, workspace_bytes,
             qk_alpha, pv_alpha, split_kv_tiles, q_len, group_size,
             kv_len_tokens, causal, sliding_window, logits_soft_cap, q_rows,
-            256, kv_len, stream, paged_params);
+            256, kv_len, stream, paged_params, qo_indptr, kv_lens, batch_size,
+            q_tiles_per_sequence, skip_internal_combine);
   }
   if (output_group_span == 2) {
     return attention::blackwell::sm120_nvfp4::d256::
@@ -320,7 +377,8 @@ cudaError_t RunD256RawSpanDispatchPaged(
             partial, split_m, split_l, out, workspace, workspace_bytes,
             qk_alpha, pv_alpha, split_kv_tiles, q_len, group_size,
             kv_len_tokens, causal, sliding_window, logits_soft_cap, q_rows,
-            256, kv_len, stream, paged_params);
+            256, kv_len, stream, paged_params, qo_indptr, kv_lens, batch_size,
+            q_tiles_per_sequence, skip_internal_combine);
   }
   return attention::blackwell::sm120_nvfp4::d256::
       sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw<4>(
@@ -328,7 +386,8 @@ cudaError_t RunD256RawSpanDispatchPaged(
           partial, split_m, split_l, out, workspace, workspace_bytes,
           qk_alpha, pv_alpha, split_kv_tiles, q_len, group_size,
           kv_len_tokens, causal, sliding_window, logits_soft_cap, q_rows, 256,
-          kv_len, stream, paged_params);
+          kv_len, stream, paged_params, qo_indptr, kv_lens, batch_size,
+          q_tiles_per_sequence, skip_internal_combine);
 }
 
 template <int HeadDim>
@@ -342,7 +401,10 @@ cudaError_t RunCommonRawSpanDispatchPaged(
     bool causal, int sliding_window, float logits_soft_cap, int q_rows,
     int kv_len, cudaStream_t stream,
     attention::blackwell::sm120_nvfp4::Sm120Nvfp4PagedKvLoadParams
-        paged_params) {
+        paged_params,
+    const int32_t* qo_indptr = nullptr, const int32_t* kv_lens = nullptr,
+    int batch_size = 1, int q_tiles_per_sequence = 0,
+    bool skip_internal_combine = false) {
   static_assert(HeadDim == 128 || HeadDim == 512);
   if constexpr (HeadDim == 128) {
     if (output_group_span != 1) {
@@ -354,7 +416,8 @@ cudaError_t RunCommonRawSpanDispatchPaged(
             partial, split_m, split_l, out, workspace, workspace_bytes,
             qk_alpha, pv_alpha, split_kv_tiles, q_len, group_size,
             kv_len_tokens, causal, sliding_window, logits_soft_cap, q_rows,
-            HeadDim, kv_len, stream, paged_params);
+            HeadDim, kv_len, stream, paged_params, qo_indptr, kv_lens,
+            batch_size, q_tiles_per_sequence, skip_internal_combine);
   } else {
     if (output_group_span == 1) {
       return attention::blackwell::sm120_nvfp4::d512::
@@ -363,7 +426,8 @@ cudaError_t RunCommonRawSpanDispatchPaged(
               partial, split_m, split_l, out, workspace, workspace_bytes,
               qk_alpha, pv_alpha, split_kv_tiles, q_len, group_size,
               kv_len_tokens, causal, sliding_window, logits_soft_cap, q_rows,
-              HeadDim, kv_len, stream, paged_params);
+              HeadDim, kv_len, stream, paged_params, qo_indptr, kv_lens,
+              batch_size, q_tiles_per_sequence, skip_internal_combine);
     }
     if (output_group_span == 2) {
       return attention::blackwell::sm120_nvfp4::d512::
@@ -372,7 +436,8 @@ cudaError_t RunCommonRawSpanDispatchPaged(
               partial, split_m, split_l, out, workspace, workspace_bytes,
               qk_alpha, pv_alpha, split_kv_tiles, q_len, group_size,
               kv_len_tokens, causal, sliding_window, logits_soft_cap, q_rows,
-              HeadDim, kv_len, stream, paged_params);
+              HeadDim, kv_len, stream, paged_params, qo_indptr, kv_lens,
+              batch_size, q_tiles_per_sequence, skip_internal_combine);
     }
     return attention::blackwell::sm120_nvfp4::d512::
         sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw<4>(
@@ -380,7 +445,8 @@ cudaError_t RunCommonRawSpanDispatchPaged(
             partial, split_m, split_l, out, workspace, workspace_bytes,
             qk_alpha, pv_alpha, split_kv_tiles, q_len, group_size,
             kv_len_tokens, causal, sliding_window, logits_soft_cap, q_rows,
-            HeadDim, kv_len, stream, paged_params);
+            HeadDim, kv_len, stream, paged_params, qo_indptr, kv_lens,
+            batch_size, q_tiles_per_sequence, skip_internal_combine);
   }
 }
 
@@ -708,27 +774,17 @@ void SM120Nvfp4FmhaRunPagedBatch(
   CHECK_DIM(1, workspace);
   CHECK_SHAPE(k_pages, v_pages_pv);
   CHECK_SHAPE(k_sf_pages, v_sf_pages_pv);
-  if (qo_indptr.device().device_type == kDLCUDA) {
-    CHECK_DEVICE(q_packed, qo_indptr);
-  } else {
-    CHECK_CPU(qo_indptr);
-  }
-  if (kv_lens.device().device_type == kDLCUDA) {
-    CHECK_DEVICE(q_packed, kv_lens);
-  } else {
-    CHECK_CPU(kv_lens);
-  }
+  CHECK_INPUT_AND_TYPE(qo_indptr, dl_int32);
+  CHECK_INPUT_AND_TYPE(kv_lens, dl_int32);
+  CHECK_DIM(1, qo_indptr);
+  CHECK_DIM(1, kv_lens);
 
   ffi::CUDADeviceGuard device_guard(q_packed.device().device_id);
   const cudaStream_t stream = get_stream(q_packed.device());
-  std::vector<int64_t> qo_host =
-      ReadIndexTensorToHost(qo_indptr, "qo_indptr", stream);
-  std::vector<int64_t> kv_host =
-      ReadIndexTensorToHost(kv_lens, "kv_lens", stream);
 
   const int64_t batch = block_tables.size(0);
-  TVM_FFI_ICHECK_EQ(static_cast<int64_t>(qo_host.size()), batch + 1);
-  TVM_FFI_ICHECK_EQ(static_cast<int64_t>(kv_host.size()), batch);
+  TVM_FFI_ICHECK_EQ(qo_indptr.size(0), batch + 1);
+  TVM_FFI_ICHECK_EQ(kv_lens.size(0), batch);
   const int64_t page_size = kv_layout_hnd ? k_pages.size(2) : k_pages.size(1);
   const int64_t num_kv_heads = kv_layout_hnd ? k_pages.size(1) : k_pages.size(2);
   const int64_t packed_dim = k_pages.size(3);
@@ -792,251 +848,163 @@ void SM120Nvfp4FmhaRunPagedBatch(
   __nv_bfloat16* out_scratch_ptr =
       static_cast<__nv_bfloat16*>(out_scratch.data_ptr());
   uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
+  TVM_FFI_ICHECK(batch > 0) << "batch must be positive";
+  TVM_FFI_ICHECK(q_packed_scratch.size(0) % batch == 0)
+      << "q scratch rows must be divisible by batch size";
+  const int64_t padded_q_rows_per_seq = q_packed_scratch.size(0) / batch;
+  TVM_FFI_ICHECK(padded_q_rows_per_seq > 0 &&
+                 padded_q_rows_per_seq % tile_m == 0)
+      << "per-sequence q scratch rows must be a positive multiple of tile_m";
+  const int64_t total_padded_q_rows = q_packed_scratch.size(0);
+  const int64_t q_tiles_per_sequence = padded_q_rows_per_seq / tile_m;
+  const int64_t physical_kv_len = k_dense_scratch.size(0);
+  TVM_FFI_ICHECK(physical_kv_len > 0 && physical_kv_len % 128 == 0)
+      << "K scratch rows must encode the max physical KV length";
+  TVM_FFI_ICHECK_EQ(k_sf_dense_scratch.size(0), physical_kv_len);
+  TVM_FFI_ICHECK(v_pv_dense_scratch.size(1) >= physical_kv_len / 2)
+      << "V scratch is too small for max physical KV length";
+  TVM_FFI_ICHECK(v_pv_sf_dense_scratch.size(1) >= physical_kv_len / page_size)
+      << "V scale scratch is too small for max physical KV length";
+  const int64_t max_total_kv_tiles = physical_kv_len / 128;
+  const int64_t max_splits =
+      (max_total_kv_tiles + split_kv_tiles - 1) / split_kv_tiles;
+  TVM_FFI_ICHECK(max_splits > 0 && partial.size(0) >= max_splits)
+      << "partial scratch does not cover split count";
+  TVM_FFI_ICHECK(block_tables.size(1) >= physical_kv_len / page_size)
+      << "block_tables rows do not cover max padded KV length";
 
-  for (int64_t b = 0; b < batch; ++b) {
-    const int64_t q_begin = qo_host[b];
-    const int64_t q_end = qo_host[b + 1];
-    TVM_FFI_ICHECK(q_end >= q_begin)
-        << "qo_indptr must be non-decreasing";
-    const int64_t q_len = q_end - q_begin;
-    if (q_len == 0) {
-      continue;
-    }
-    const int64_t q_row_begin = q_begin * group_size;
-    const int64_t q_rows = q_len * group_size;
-    const int64_t padded_q_rows = RoundUpMultiple(q_rows, tile_m);
-    const int64_t kv_len_tokens = kv_host[b];
-    TVM_FFI_ICHECK(kv_len_tokens > 0) << "kv_lens entries must be positive";
-    const int64_t physical_kv_len = RoundUpMultiple(kv_len_tokens, 128);
-    const int64_t total_kv_tiles = physical_kv_len / 128;
-    const int64_t num_splits =
-        (total_kv_tiles + split_kv_tiles - 1) / split_kv_tiles;
-    TVM_FFI_ICHECK(q_row_begin + q_rows <= q_packed.size(0))
-        << "q sequence exceeds q_packed rows";
-    TVM_FFI_ICHECK(q_row_begin + q_rows <= out.size(0))
-        << "q sequence exceeds out rows";
-    TVM_FFI_ICHECK(padded_q_rows <= q_packed_scratch.size(0))
-        << "q scratch is too small for padded sequence";
-    TVM_FFI_ICHECK(physical_kv_len <= k_dense_scratch.size(0))
-        << "K scratch is too small for padded KV length";
-    TVM_FFI_ICHECK(physical_kv_len <= k_sf_dense_scratch.size(0))
-        << "K scale scratch is too small for padded KV length";
-    TVM_FFI_ICHECK(v_pv_dense_scratch.size(1) >= physical_kv_len / 2)
-        << "V scratch is too small for padded KV length";
-    TVM_FFI_ICHECK(v_pv_sf_dense_scratch.size(1) >= physical_kv_len / page_size)
-        << "V scale scratch is too small for padded KV length";
-    TVM_FFI_ICHECK(num_splits <= partial.size(0))
-        << "partial scratch does not cover split count";
-    TVM_FFI_ICHECK(block_tables.size(1) >= physical_kv_len / page_size)
-        << "block_tables row does not cover padded KV length";
+  const int32_t* qo_indptr_ptr =
+      static_cast<const int32_t*>(qo_indptr.data_ptr());
+  const int32_t* kv_lens_ptr =
+      static_cast<const int32_t*>(kv_lens.data_ptr());
+  cudaError_t status = cudaSuccess;
+  CopyQToPaddedBatchKernel<<<static_cast<unsigned>(total_padded_q_rows), 256, 0,
+                             stream>>>(
+      static_cast<const uint8_t*>(q_packed.data_ptr()),
+      static_cast<const uint8_t*>(q_scales.data_ptr()), qo_indptr_ptr,
+      q_scratch_ptr, q_sf_scratch_ptr, static_cast<int>(batch),
+      static_cast<int>(group_size),
+      static_cast<int>(padded_q_rows_per_seq), static_cast<int>(packed_dim),
+      static_cast<int>(scale_dim));
+  status = cudaGetLastError();
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "SM120 NVFP4 batch Q pad copy failed: "
+      << cudaGetErrorString(status);
 
-    const int32_t* block_table_ptr =
-        static_cast<const int32_t*>(block_tables.data_ptr()) +
-        b * block_tables.stride(0);
-    cudaError_t status = cudaSuccess;
-    constexpr bool kUseNativePagedK = true;
-    constexpr bool kUseNativePagedV = true;
-    const bool use_native_paged_v = kUseNativePagedV;
-    // Native K/V staging is used for D128/D256/D512. PV-layout V pages are
-    // consumed directly. Normal-layout V pages are converted into the PV MMA
-    // operand inside the stage producer so the active path does not depend on a
-    // dense V reblock scratch pass.
-    const bool needs_dense_gather = !kUseNativePagedK || !use_native_paged_v;
-    if (needs_dense_gather) {
-      if (v_cache_uses_pv_layout) {
-        if constexpr (kUseNativePagedK) {
-          status =
-              attention::blackwell::sm120_nvfp4::gather_paged_v_to_dense_pv_raw(
-                  static_cast<const uint8_t*>(v_pages_pv.data_ptr()),
-                  static_cast<const uint8_t*>(v_sf_pages_pv.data_ptr()),
-                  block_table_ptr, v_scratch_ptr, v_sf_scratch_ptr,
-                  static_cast<int>(kv_head), static_cast<int>(physical_kv_len),
-                  static_cast<int>(page_size), static_cast<int>(num_kv_heads),
-                  static_cast<int>(packed_dim), static_cast<int>(scale_dim),
-                  v_pages_pv.stride(0), v_pages_pv.stride(1),
-                  v_pages_pv.stride(2), v_pages_pv.stride(3),
-                  v_sf_pages_pv.stride(0), v_sf_pages_pv.stride(1),
-                  v_sf_pages_pv.stride(2), v_sf_pages_pv.stride(3), false,
-                  stream);
-        } else {
-          status = attention::blackwell::sm120_nvfp4::
-              gather_paged_kv_to_dense_pv_raw(
-                  static_cast<const uint8_t*>(k_pages.data_ptr()),
-                  static_cast<const uint8_t*>(k_sf_pages.data_ptr()),
-                  static_cast<const uint8_t*>(v_pages_pv.data_ptr()),
-                  static_cast<const uint8_t*>(v_sf_pages_pv.data_ptr()),
-                  block_table_ptr, k_scratch_ptr, k_sf_scratch_ptr,
-                  v_scratch_ptr, v_sf_scratch_ptr, static_cast<int>(kv_head),
-                  static_cast<int>(physical_kv_len),
-                  static_cast<int>(page_size), static_cast<int>(num_kv_heads),
-                  static_cast<int>(packed_dim), static_cast<int>(scale_dim),
-                  k_pages.stride(0), k_pages.stride(1), k_pages.stride(2),
-                  k_pages.stride(3), k_sf_pages.stride(0),
-                  k_sf_pages.stride(1), k_sf_pages.stride(2),
-                  k_sf_pages.stride(3), v_pages_pv.stride(0),
-                  v_pages_pv.stride(1), v_pages_pv.stride(2),
-                  v_pages_pv.stride(3), v_sf_pages_pv.stride(0),
-                  v_sf_pages_pv.stride(1), v_sf_pages_pv.stride(2),
-                  v_sf_pages_pv.stride(3), false, stream);
-        }
-      } else {
-        if constexpr (kUseNativePagedK) {
-          status = attention::blackwell::sm120_nvfp4::
-              gather_paged_normal_v_to_dense_pv_raw(
-                  static_cast<const uint8_t*>(v_pages_pv.data_ptr()),
-                  static_cast<const uint8_t*>(v_sf_pages_pv.data_ptr()),
-                  block_table_ptr, v_scratch_ptr, v_sf_scratch_ptr,
-                  static_cast<int>(kv_head), static_cast<int>(kv_len_tokens),
-                  static_cast<int>(physical_kv_len),
-                  static_cast<int>(page_size), static_cast<int>(num_kv_heads),
-                  static_cast<int>(packed_dim), static_cast<int>(scale_dim),
-                  static_cast<float>(pv_alpha), v_pages_pv.stride(0),
-                  v_pages_pv.stride(1), v_pages_pv.stride(2),
-                  v_pages_pv.stride(3), v_sf_pages_pv.stride(0),
-                  v_sf_pages_pv.stride(1), v_sf_pages_pv.stride(2),
-                  v_sf_pages_pv.stride(3), kv_layout_hnd,
-                  normal_v_scales_are_trtllm_interleaved, stream);
-        } else {
-          status = attention::blackwell::sm120_nvfp4::
-              gather_paged_kv_normal_v_to_dense_pv_raw(
-                  static_cast<const uint8_t*>(k_pages.data_ptr()),
-                  static_cast<const uint8_t*>(k_sf_pages.data_ptr()),
-                  static_cast<const uint8_t*>(v_pages_pv.data_ptr()),
-                  static_cast<const uint8_t*>(v_sf_pages_pv.data_ptr()),
-                  block_table_ptr, k_scratch_ptr, k_sf_scratch_ptr,
-                  v_scratch_ptr, v_sf_scratch_ptr, static_cast<int>(kv_head),
-                  static_cast<int>(kv_len_tokens),
-                  static_cast<int>(physical_kv_len),
-                  static_cast<int>(page_size), static_cast<int>(num_kv_heads),
-                  static_cast<int>(packed_dim), static_cast<int>(scale_dim),
-                  static_cast<float>(pv_alpha), k_pages.stride(0),
-                  k_pages.stride(1), k_pages.stride(2), k_pages.stride(3),
-                  k_sf_pages.stride(0), k_sf_pages.stride(1),
-                  k_sf_pages.stride(2), k_sf_pages.stride(3),
-                  v_pages_pv.stride(0), v_pages_pv.stride(1),
-                  v_pages_pv.stride(2), v_pages_pv.stride(3),
-                  v_sf_pages_pv.stride(0), v_sf_pages_pv.stride(1),
-                  v_sf_pages_pv.stride(2), v_sf_pages_pv.stride(3),
-                  kv_layout_hnd, normal_v_scales_are_trtllm_interleaved,
-                  stream);
-        }
-      }
-      TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-          << "SM120 NVFP4 paged gather failed: "
-          << cudaGetErrorString(status);
-    }
+  constexpr bool kUseNativePagedK = true;
+  constexpr bool kUseNativePagedV = true;
+  const bool use_native_paged_v = kUseNativePagedV;
+  auto fill_paged_params = [&](auto& paged_params) {
+    paged_params.k_pages = static_cast<const uint8_t*>(k_pages.data_ptr());
+    paged_params.k_scales =
+        static_cast<const uint8_t*>(k_sf_pages.data_ptr());
+    paged_params.v_pages =
+        static_cast<const uint8_t*>(v_pages_pv.data_ptr());
+    paged_params.v_scales =
+        static_cast<const uint8_t*>(v_sf_pages_pv.data_ptr());
+    paged_params.block_table =
+        static_cast<const int32_t*>(block_tables.data_ptr());
+    paged_params.block_table_stride = block_tables.stride(0);
+    paged_params.k_stride_page = k_pages.stride(0);
+    paged_params.k_stride_dim1 = k_pages.stride(1);
+    paged_params.k_stride_dim2 = k_pages.stride(2);
+    paged_params.k_stride_dim3 = k_pages.stride(3);
+    paged_params.k_scale_stride_page = k_sf_pages.stride(0);
+    paged_params.k_scale_stride_dim1 = k_sf_pages.stride(1);
+    paged_params.k_scale_stride_dim2 = k_sf_pages.stride(2);
+    paged_params.k_scale_stride_dim3 = k_sf_pages.stride(3);
+    paged_params.v_stride_page = v_pages_pv.stride(0);
+    paged_params.v_stride_dim1 = v_pages_pv.stride(1);
+    paged_params.v_stride_dim2 = v_pages_pv.stride(2);
+    paged_params.v_stride_dim3 = v_pages_pv.stride(3);
+    paged_params.v_scale_stride_page = v_sf_pages_pv.stride(0);
+    paged_params.v_scale_stride_dim1 = v_sf_pages_pv.stride(1);
+    paged_params.v_scale_stride_dim2 = v_sf_pages_pv.stride(2);
+    paged_params.v_scale_stride_dim3 = v_sf_pages_pv.stride(3);
+    paged_params.kv_head = static_cast<int>(kv_head);
+    paged_params.page_size = static_cast<int>(page_size);
+    paged_params.packed_dim = static_cast<int>(packed_dim);
+    paged_params.scale_dim = static_cast<int>(scale_dim);
+    paged_params.kv_layout_hnd = kv_layout_hnd ? 1 : 0;
+    paged_params.v_cache_uses_pv_layout =
+        v_cache_uses_pv_layout ? 1 : 0;
+    paged_params.v_scales_trtllm_interleaved =
+        normal_v_scales_are_trtllm_interleaved ? 1 : 0;
+    paged_params.native_k = kUseNativePagedK ? 1 : 0;
+    paged_params.native_v = use_native_paged_v ? 1 : 0;
+    paged_params.v_global_scale = static_cast<float>(pv_alpha);
+  };
 
-    CopyQToPaddedKernel<<<static_cast<unsigned>(padded_q_rows), 256, 0,
-                          stream>>>(
-        static_cast<const uint8_t*>(q_packed.data_ptr()) +
-            q_row_begin * packed_dim,
-        static_cast<const uint8_t*>(q_scales.data_ptr()) +
-            q_row_begin * scale_dim,
-        q_scratch_ptr, q_sf_scratch_ptr, static_cast<int>(q_rows),
-        static_cast<int>(padded_q_rows), static_cast<int>(packed_dim),
-        static_cast<int>(scale_dim));
-    status = cudaGetLastError();
-    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "SM120 NVFP4 Q pad copy failed: " << cudaGetErrorString(status);
-
-    auto fill_paged_params = [&](auto& paged_params) {
-      paged_params.k_pages = static_cast<const uint8_t*>(k_pages.data_ptr());
-      paged_params.k_scales =
-          static_cast<const uint8_t*>(k_sf_pages.data_ptr());
-      paged_params.v_pages =
-          static_cast<const uint8_t*>(v_pages_pv.data_ptr());
-      paged_params.v_scales =
-          static_cast<const uint8_t*>(v_sf_pages_pv.data_ptr());
-      paged_params.block_table = block_table_ptr;
-      paged_params.k_stride_page = k_pages.stride(0);
-      paged_params.k_stride_dim1 = k_pages.stride(1);
-      paged_params.k_stride_dim2 = k_pages.stride(2);
-      paged_params.k_stride_dim3 = k_pages.stride(3);
-      paged_params.k_scale_stride_page = k_sf_pages.stride(0);
-      paged_params.k_scale_stride_dim1 = k_sf_pages.stride(1);
-      paged_params.k_scale_stride_dim2 = k_sf_pages.stride(2);
-      paged_params.k_scale_stride_dim3 = k_sf_pages.stride(3);
-      paged_params.v_stride_page = v_pages_pv.stride(0);
-      paged_params.v_stride_dim1 = v_pages_pv.stride(1);
-      paged_params.v_stride_dim2 = v_pages_pv.stride(2);
-      paged_params.v_stride_dim3 = v_pages_pv.stride(3);
-      paged_params.v_scale_stride_page = v_sf_pages_pv.stride(0);
-      paged_params.v_scale_stride_dim1 = v_sf_pages_pv.stride(1);
-      paged_params.v_scale_stride_dim2 = v_sf_pages_pv.stride(2);
-      paged_params.v_scale_stride_dim3 = v_sf_pages_pv.stride(3);
-      paged_params.kv_head = static_cast<int>(kv_head);
-      paged_params.page_size = static_cast<int>(page_size);
-      paged_params.packed_dim = static_cast<int>(packed_dim);
-      paged_params.scale_dim = static_cast<int>(scale_dim);
-      paged_params.kv_layout_hnd = kv_layout_hnd ? 1 : 0;
-      paged_params.v_cache_uses_pv_layout =
-          v_cache_uses_pv_layout ? 1 : 0;
-      paged_params.v_scales_trtllm_interleaved =
-          normal_v_scales_are_trtllm_interleaved ? 1 : 0;
-      paged_params.native_k = kUseNativePagedK ? 1 : 0;
-      paged_params.native_v = use_native_paged_v ? 1 : 0;
-      paged_params.v_global_scale = static_cast<float>(pv_alpha);
-    };
-
-    if (head_dim == 128) {
-      attention::blackwell::sm120_nvfp4::Sm120Nvfp4PagedKvLoadParams
-          paged_params{};
-      fill_paged_params(paged_params);
-      status = RunCommonRawSpanDispatchPaged<128>(
-          output_group_span,
-          q_scratch_ptr, q_sf_scratch_ptr, k_scratch_ptr, k_sf_scratch_ptr,
-          v_scratch_ptr, v_sf_scratch_ptr, partial_ptr, split_m_ptr,
-          split_l_ptr, out_scratch_ptr, workspace_ptr, workspace_bytes,
-          static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
-          static_cast<int>(split_kv_tiles), static_cast<int>(q_len),
-          static_cast<int>(group_size), static_cast<int>(kv_len_tokens), causal,
-          static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
-          static_cast<int>(padded_q_rows), static_cast<int>(physical_kv_len),
-          stream, paged_params);
-    } else if (head_dim == 256) {
-      attention::blackwell::sm120_nvfp4::d256::Sm120Nvfp4PagedKvLoadParams
-          paged_params{};
-      fill_paged_params(paged_params);
-      status = RunD256RawSpanDispatchPaged(
-          output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_scratch_ptr,
-          k_sf_scratch_ptr, v_scratch_ptr, v_sf_scratch_ptr, partial_ptr,
-          split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
-          workspace_bytes, static_cast<float>(qk_alpha),
-          static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles),
-          static_cast<int>(q_len), static_cast<int>(group_size),
-          static_cast<int>(kv_len_tokens), causal,
-          static_cast<int>(sliding_window),
-          static_cast<float>(logits_soft_cap),
-          static_cast<int>(padded_q_rows),
-          static_cast<int>(physical_kv_len), stream, paged_params);
-    } else {
-      attention::blackwell::sm120_nvfp4::Sm120Nvfp4PagedKvLoadParams
-          paged_params{};
-      fill_paged_params(paged_params);
-      status = RunCommonRawSpanDispatchPaged<512>(
-          output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_scratch_ptr,
-          k_sf_scratch_ptr, v_scratch_ptr, v_sf_scratch_ptr, partial_ptr,
-          split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
-          workspace_bytes, static_cast<float>(qk_alpha),
-          static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles),
-          static_cast<int>(q_len), static_cast<int>(group_size),
-          static_cast<int>(kv_len_tokens), causal,
-          static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
-          static_cast<int>(padded_q_rows), static_cast<int>(physical_kv_len),
-          stream, paged_params);
-    }
-    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "SM120 NVFP4 FMHA batch sequence failed: "
-        << cudaGetErrorString(status);
-
-    CopyPaddedOutKernel<<<static_cast<unsigned>(q_rows), 1024, 0, stream>>>(
-        out_scratch_ptr,
-        static_cast<__nv_bfloat16*>(out.data_ptr()) + q_row_begin * head_dim,
-        static_cast<int>(q_rows), static_cast<int>(head_dim));
-    status = cudaGetLastError();
-    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "SM120 NVFP4 output copy failed: " << cudaGetErrorString(status);
+  if (head_dim == 128) {
+    attention::blackwell::sm120_nvfp4::Sm120Nvfp4PagedKvLoadParams
+        paged_params{};
+    fill_paged_params(paged_params);
+    status = RunCommonRawSpanDispatchPaged<128>(
+        output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_scratch_ptr,
+        k_sf_scratch_ptr, v_scratch_ptr, v_sf_scratch_ptr, partial_ptr,
+        split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
+        workspace_bytes, static_cast<float>(qk_alpha),
+        static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles), 0,
+        static_cast<int>(group_size), 0, causal,
+        static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
+        static_cast<int>(total_padded_q_rows), static_cast<int>(physical_kv_len),
+        stream, paged_params, qo_indptr_ptr, kv_lens_ptr, static_cast<int>(batch),
+        static_cast<int>(q_tiles_per_sequence), true);
+  } else if (head_dim == 256) {
+    attention::blackwell::sm120_nvfp4::d256::Sm120Nvfp4PagedKvLoadParams
+        paged_params{};
+    fill_paged_params(paged_params);
+    status = RunD256RawSpanDispatchPaged(
+        output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_scratch_ptr,
+        k_sf_scratch_ptr, v_scratch_ptr, v_sf_scratch_ptr, partial_ptr,
+        split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
+        workspace_bytes, static_cast<float>(qk_alpha),
+        static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles), 0,
+        static_cast<int>(group_size), 0, causal,
+        static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
+        static_cast<int>(total_padded_q_rows), static_cast<int>(physical_kv_len),
+        stream, paged_params, qo_indptr_ptr, kv_lens_ptr, static_cast<int>(batch),
+        static_cast<int>(q_tiles_per_sequence), true);
+  } else {
+    attention::blackwell::sm120_nvfp4::Sm120Nvfp4PagedKvLoadParams
+        paged_params{};
+    fill_paged_params(paged_params);
+    status = RunCommonRawSpanDispatchPaged<512>(
+        output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_scratch_ptr,
+        k_sf_scratch_ptr, v_scratch_ptr, v_sf_scratch_ptr, partial_ptr,
+        split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
+        workspace_bytes, static_cast<float>(qk_alpha),
+        static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles), 0,
+        static_cast<int>(group_size), 0, causal,
+        static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
+        static_cast<int>(total_padded_q_rows), static_cast<int>(physical_kv_len),
+        stream, paged_params, qo_indptr_ptr, kv_lens_ptr, static_cast<int>(batch),
+        static_cast<int>(q_tiles_per_sequence), true);
   }
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "SM120 NVFP4 FMHA batch failed: " << cudaGetErrorString(status);
+
+  if (max_splits == 1) {
+    CopyPaddedBatchOutKernel<<<static_cast<unsigned>(total_padded_q_rows), 256,
+                               0, stream>>>(
+        out_scratch_ptr, static_cast<__nv_bfloat16*>(out.data_ptr()),
+        qo_indptr_ptr, static_cast<int>(batch), static_cast<int>(group_size),
+        static_cast<int>(padded_q_rows_per_seq), static_cast<int>(head_dim));
+  } else {
+    Sm120Nvfp4SplitKvCombineBatchKernel<<<
+        static_cast<unsigned>(total_padded_q_rows), 256,
+        static_cast<size_t>(max_splits) * sizeof(float), stream>>>(
+        partial_ptr, split_m_ptr, split_l_ptr,
+        static_cast<__nv_bfloat16*>(out.data_ptr()), qo_indptr_ptr,
+        kv_lens_ptr, static_cast<int>(batch), static_cast<int>(group_size),
+        static_cast<int>(padded_q_rows_per_seq),
+        static_cast<int>(split_kv_tiles), static_cast<int>(max_splits),
+        static_cast<int>(head_dim));
+  }
+  status = cudaGetLastError();
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "SM120 NVFP4 batch output combine/copy failed: "
+      << cudaGetErrorString(status);
 }
 
 }  // namespace flashinfer

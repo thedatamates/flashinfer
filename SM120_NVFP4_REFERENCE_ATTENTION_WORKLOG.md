@@ -14111,3 +14111,66 @@ Current production switch:
   native K: enabled for D128/D256/D512
   native V: enabled for D128/D256/D512
 ```
+
+## Device-Side Varlen Batch Launch
+
+Host-side per-sequence CUTLASS params initialization has been removed from the
+SM120 NVFP4 paged batch path. The Python wrapper still uses CPU copies of
+`qo_indptr` and `kv_lens` during `plan()` for scratch sizing, but the runtime
+`run_paged_batch` call now passes CUDA int32 `qo_indptr` and `kv_lens` into the
+kernel path.
+
+Implementation:
+
+```text
+- Q padding is one batch-wide CUDA kernel:
+    compact [total_q * group, D] -> [batch * padded_q_rows_per_seq, D]
+
+- The D128/D256/D512 stage kernels receive:
+    qo_indptr, kv_lens, batch_size, q_tiles_per_sequence
+
+- Each CTA derives its batch row on device:
+    batch_idx      = blockIdx.x / q_tiles_per_sequence
+    local_q_tile   = blockIdx.x % q_tiles_per_sequence
+    effective_tile = blockIdx.x for batch-padded scratch/output
+
+- Each CTA selects the correct per-sequence block table on device:
+    paged_params.block_table += batch_idx * block_table_stride
+
+- Per-sequence q_len and kv_len_tokens are loaded from device metadata.
+  The causal/window mask uses local_q_tile; scratch, split stats, and output
+  staging use effective_tile.
+
+- Split-KV combine is now batch-aware:
+    it combines only the number of splits needed by that sequence and writes
+    directly to compact output rows.
+```
+
+Validation:
+
+```text
+# Focused multi-sequence direct wrapper parity, D128/D256/D512
+tests/attention/test_nvfp4_kv_head_dim_512.py::
+  test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x
+
+3 passed in 257.47s
+
+# Standard wrapper parity and normal-V layout, D128/D256/D512
+tests/attention/test_nvfp4_kv_head_dim_512.py::
+  test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x
+tests/attention/test_nvfp4_kv_head_dim_512.py::
+  test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x
+
+6 passed in 113.49s
+
+# Full FlashInfer NVFP4 attention regression file
+tests/attention/test_nvfp4_kv_head_dim_512.py
+
+35 passed in 121.29s
+
+# vLLM FlashInfer/TRTLLM attention integration with FlashInfer worktree first
+# on PYTHONPATH
+tests/v1/attention/test_trtllm_attention_integration.py
+
+9 passed in 12.22s
+```

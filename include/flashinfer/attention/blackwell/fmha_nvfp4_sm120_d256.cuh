@@ -424,6 +424,7 @@ struct Sm120Nvfp4PagedKvLoadParams {
   const uint8_t* v_pages = nullptr;
   const uint8_t* v_scales = nullptr;
   const int32_t* block_table = nullptr;
+  int64_t block_table_stride = 0;
   int64_t k_stride_page = 0;
   int64_t k_stride_dim1 = 0;
   int64_t k_stride_dim2 = 0;
@@ -1188,7 +1189,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     float* split_l,
     int split_stats_stride_rows,
     int split_output_stride_elems,
-    Sm120Nvfp4PagedKvLoadParams paged_kv_params) {
+    Sm120Nvfp4PagedKvLoadParams paged_kv_params,
+    const int32_t* qo_indptr,
+    const int32_t* kv_lens,
+    int batch_size,
+    int q_tiles_per_sequence) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
   using cute::_;
   static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
@@ -1197,7 +1202,35 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 
   extern __shared__ __align__(128) char smem[];
   auto& storage = *reinterpret_cast<Sm120Nvfp4QkvLoadCollectiveStorage*>(smem);
-  const int effective_q_tile = q_tile + int(blockIdx.x);
+  const bool varlen_batch = qo_indptr != nullptr && kv_lens != nullptr;
+  int batch_idx = 0;
+  int local_q_tile = q_tile + int(blockIdx.x);
+  int effective_q_tile = q_tile + int(blockIdx.x);
+  if (varlen_batch) {
+    if (q_tiles_per_sequence <= 0) {
+      return;
+    }
+    batch_idx = int(blockIdx.x) / q_tiles_per_sequence;
+    if (batch_idx >= batch_size) {
+      return;
+    }
+    local_q_tile = int(blockIdx.x) - batch_idx * q_tiles_per_sequence;
+    effective_q_tile = int(blockIdx.x);
+    const int q_begin = qo_indptr[batch_idx];
+    const int q_end = qo_indptr[batch_idx + 1];
+    q_len = q_end - q_begin;
+    if (q_len <= 0) {
+      return;
+    }
+    kv_len_tokens = kv_lens[batch_idx];
+    if (kv_len_tokens <= 0) {
+      return;
+    }
+    total_kv_tiles = (kv_len_tokens + kCutlassTileN - 1) / kCutlassTileN;
+    paged_kv_params.block_table =
+        paged_kv_params.block_table +
+        static_cast<int64_t>(batch_idx) * paged_kv_params.block_table_stride;
+  }
   const int effective_split_idx = int(blockIdx.z);
   const int effective_kv_tile_start =
       kv_tile_start + effective_split_idx * num_kv_tiles;
@@ -2031,7 +2064,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
     };
     auto score_is_valid = [&](int row, int col, int tile) {
-      const int global_q_row = effective_q_tile * kCutlassTileM + row;
+      const int global_q_row = local_q_tile * kCutlassTileM + row;
       if (global_q_row >= q_len * group_size) {
         return false;
       }
@@ -2592,7 +2625,12 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
     int head_dim,
     int kv_len,
     cudaStream_t stream,
-    Sm120Nvfp4PagedKvLoadParams paged_kv_params = {}) {
+    Sm120Nvfp4PagedKvLoadParams paged_kv_params = {},
+    const int32_t* qo_indptr = nullptr,
+    const int32_t* kv_lens = nullptr,
+    int batch_size = 1,
+    int q_tiles_per_sequence = 0,
+    bool skip_internal_combine = false) {
   static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
                     kOutputGroupSpan == 4,
                 "SM120 split-KV launcher supports span 1, 2, or 4");
@@ -2654,9 +2692,9 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
       split_kv_tiles, total_kv_tiles, q_len, group_size, kv_len_tokens,
       causal ? 1 : 0, sliding_window, logits_soft_cap, 0, head_dim,
       stage_split_m, stage_split_l, q_rows, stage_output_stride,
-      paged_kv_params);
+      paged_kv_params, qo_indptr, kv_lens, batch_size, q_tiles_per_sequence);
   status = cudaGetLastError();
-  if (status != cudaSuccess || direct_single_split) {
+  if (status != cudaSuccess || direct_single_split || skip_internal_combine) {
     return status;
   }
 

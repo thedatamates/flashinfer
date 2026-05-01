@@ -14,6 +14,7 @@ struct Sm120Nvfp4PagedKvLoadParams {
   const uint8_t* v_pages = nullptr;
   const uint8_t* v_scales = nullptr;
   const int32_t* block_table = nullptr;
+  int64_t block_table_stride = 0;
   int64_t k_stride_page = 0;
   int64_t k_stride_dim1 = 0;
   int64_t k_stride_dim2 = 0;
