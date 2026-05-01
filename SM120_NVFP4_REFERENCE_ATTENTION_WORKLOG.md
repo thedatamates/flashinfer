@@ -13505,3 +13505,49 @@ Production csrc/JIT run_paged_batch using the public quantizer output:
 The grouped-attention benchmark no longer has a separate PV reblock helper.
 It now calls the same public quantizer path, so benchmark validation and the
 production csrc binding share one V/PV layout implementation.
+
+## SM120 NVFP4 Paged Prefill Python Wrapper
+
+Added a FlashInfer Python wrapper:
+
+```text
+flashinfer.BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper
+```
+
+The wrapper is the production call boundary above the csrc/JIT module. It owns:
+
+```text
+- plan-time scratch sizing for D128/D256/D512
+- BF16 Q -> NVFP4 Q quantization through csrc/fmha_nvfp4_sm120_utils.cu
+- per-KV-head grouped dispatch for GQA/MQA
+- run_paged_batch invocation with PV-layout NVFP4 K/V pages
+- output scatter back to [total_q, num_qo_heads, head_dim]
+```
+
+Current constraints:
+
+```text
+- SM120/SM121 target
+- BF16 Q and BF16 output
+- NHD paged KV
+- page_size=16
+- NVFP4 K pages in normal page layout
+- NVFP4 V pages in PV-reblocked layout from
+  nvfp4_quantize_paged_kv_cache(..., v_data_layout="pv", v_scale_layout="pv")
+- csrc implementation still gathers paged K/V into dense scratch before the
+  fused dense SM120 kernel; native in-mainloop page-table loads remain the next
+  performance migration if the gather bridge is not enough.
+```
+
+Validation:
+
+```text
+Ad hoc wrapper smoke:
+  D128 two-KV-head wrapper equals independent single-KV-head wrappers, max_abs=0.0
+  D256 two-KV-head wrapper equals independent single-KV-head wrappers, max_abs=0.0
+  D512 two-KV-head wrapper equals independent single-KV-head wrappers, max_abs=0.0
+
+Pytest:
+  tests/attention/test_nvfp4_kv_head_dim_512.py::test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x
+  3 passed
+```

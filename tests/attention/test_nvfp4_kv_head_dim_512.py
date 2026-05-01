@@ -1095,3 +1095,118 @@ def test_nvfp4_xqa_decode_sharp_tokens_sm12x(head_dim):
         assert selected[target_token] > 0.9
         selected[target_token] = 0
         assert selected.abs().max() < 0.1
+
+
+@pytest.mark.parametrize("head_dim,group", [(128, 4), (256, 6), (512, 4)])
+def test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x(head_dim, group):
+    _requires_sm12x_nvfp4()
+
+    device = torch.device("cuda")
+    page_size = 16
+    q_lens = [128, 256]
+    kv_lens = [1024, 1024]
+    num_kv_heads = 2
+    num_qo_heads = group * num_kv_heads
+    pages_per_seq = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    total_pages = sum(pages_per_seq)
+    table_width = max(pages_per_seq)
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(120256 + head_dim)
+    q = (
+        torch.randn(
+            (sum(q_lens), num_qo_heads, head_dim), device=device, generator=gen
+        )
+        / 4
+    ).to(torch.bfloat16)
+    k = (
+        torch.randn(
+            (total_pages, page_size, num_kv_heads, head_dim),
+            device=device,
+            generator=gen,
+        )
+        / 4
+    ).to(torch.bfloat16)
+    v = (
+        torch.randn(
+            (total_pages, page_size, num_kv_heads, head_dim),
+            device=device,
+            generator=gen,
+        )
+        / 4
+    ).to(torch.bfloat16)
+
+    block_tables = torch.full(
+        (len(q_lens), table_width), -1, dtype=torch.int32, device=device
+    )
+    page_cursor = 0
+    for batch_idx, pages in enumerate(pages_per_seq):
+        block_tables[batch_idx, :pages] = torch.arange(
+            page_cursor, page_cursor + pages, dtype=torch.int32, device=device
+        )
+        page_cursor += pages
+
+    qo_indptr = torch.tensor(
+        [0, q_lens[0], sum(q_lens)], dtype=torch.int32, device="cpu"
+    )
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
+    (k_fp4, v_fp4), (k_sf, v_sf), k_scale, v_scale = (
+        nvfp4_quantize_paged_kv_cache(
+            k, v, "NHD", v_data_layout="pv", v_scale_layout="pv"
+        )
+    )
+
+    workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(workspace)
+    wrapper.plan(
+        qo_indptr,
+        block_tables,
+        kv_lens_t,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        causal=True,
+        window_left=1024,
+        logits_soft_cap=50.0,
+        split_kv_len=8192,
+    )
+    out = wrapper.run(
+        q, (k_fp4, v_fp4), (k_sf, v_sf), k_scale=k_scale, v_scale=v_scale
+    )
+
+    expected_slices = []
+    for kv_head in range(num_kv_heads):
+        single_wrapper = flashinfer.BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(
+            workspace
+        )
+        single_wrapper.plan(
+            qo_indptr,
+            block_tables,
+            kv_lens_t,
+            num_qo_heads=group,
+            num_kv_heads=1,
+            head_dim=head_dim,
+            causal=True,
+            window_left=1024,
+            logits_soft_cap=50.0,
+            split_kv_len=8192,
+        )
+        q_slice = q[:, kv_head * group : (kv_head + 1) * group, :].contiguous()
+        out_slice = single_wrapper.run(
+            q_slice,
+            (
+                k_fp4[:, :, kv_head : kv_head + 1, :].contiguous(),
+                v_fp4[:, :, kv_head : kv_head + 1, :].contiguous(),
+            ),
+            (
+                k_sf[:, :, kv_head : kv_head + 1, :].contiguous(),
+                v_sf[:, :, kv_head : kv_head + 1, :].contiguous(),
+            ),
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        expected_slices.append(out_slice)
+
+    expected = torch.cat(expected_slices, dim=1)
+    assert torch.isfinite(out.float()).all()
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)

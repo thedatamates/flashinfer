@@ -90,6 +90,9 @@ from .fused_moe import (
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
 )
+from .fmha_nvfp4_sm120 import (
+    BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper as BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper,
+)
 
 # CuteDSL MoE high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
