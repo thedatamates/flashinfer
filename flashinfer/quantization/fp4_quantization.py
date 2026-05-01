@@ -1232,6 +1232,7 @@ def nvfp4_quantize_paged_kv_cache(
     k_global_sf: Optional[torch.Tensor] = None,
     v_global_sf: Optional[torch.Tensor] = None,
     v_scale_layout: str = "trtllm_interleaved",
+    v_data_layout: str = "normal",
 ) -> Tuple[
     Tuple[torch.Tensor, torch.Tensor],
     Tuple[torch.Tensor, torch.Tensor],
@@ -1257,6 +1258,12 @@ def nvfp4_quantize_paged_kv_cache(
             If None, auto-computed as ``FLOAT8_E4M3_MAX / v_amax``.
         v_scale_layout: Physical V scale layout. ``"trtllm_interleaved"`` keeps the
             historical default; ``"linear"`` leaves V scales in row-major layout.
+            ``"pv"`` emits the PV-reblocked scale layout used by the SM120
+            NVFP4 FMHA path and requires ``v_data_layout="pv"``.
+        v_data_layout: Physical V data layout. ``"normal"`` returns V in the same
+            packed page layout as K. ``"pv"`` emits the PV-reblocked layout used by
+            SM120 NVFP4 FMHA. PV layout currently requires ``kv_layout="NHD"`` and
+            ``page_size=16``.
 
     Returns:
         kv_cache_fp4: Tuple of (k_fp4, v_fp4) in the same layout as input,
@@ -1298,16 +1305,22 @@ def nvfp4_quantize_paged_kv_cache(
     # Flatten to 2D [total_tokens, head_dim] for fp4_quantize
     # Both layouts flatten identically since total elements are the same
     k_2d = k_cache.reshape(-1, head_dim)
-    v_2d = v_cache.reshape(-1, head_dim)
+    if v_data_layout not in ("normal", "pv"):
+        raise ValueError("v_data_layout must be 'normal' or 'pv'.")
+    if v_data_layout == "pv":
+        if kv_layout != "NHD":
+            raise ValueError("v_data_layout='pv' currently requires kv_layout='NHD'.")
+        if page_size != 16:
+            raise ValueError("v_data_layout='pv' currently requires page_size=16.")
+        if v_scale_layout != "pv":
+            raise ValueError("v_data_layout='pv' requires v_scale_layout='pv'.")
+    elif v_scale_layout == "pv":
+        raise ValueError("v_scale_layout='pv' requires v_data_layout='pv'.")
 
     # Quantize using FlashInfer's GPU kernel with linear scale layout
     k_packed, k_sf = fp4_quantize(
         k_2d, k_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
     )
-    v_packed, v_sf = fp4_quantize(
-        v_2d, v_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
-    )
-
     # fp4_quantize returns uint8 packed FP4 and uint8 scale factors (FP8 E4M3 encoded)
     # Reshape packed data and scale factors back to the original layout
     if kv_layout == "NHD":
@@ -1317,17 +1330,62 @@ def nvfp4_quantize_paged_kv_cache(
         out_shape_fp4 = (num_pages, num_kv_heads, page_size, head_dim // 2)
         out_shape_sf = (num_pages, num_kv_heads, page_size, scale_dim)
 
-    kv_cache_fp4 = (
-        k_packed.view(torch.uint8).reshape(out_shape_fp4),
-        v_packed.view(torch.uint8).reshape(out_shape_fp4),
-    )
-
     # Reshape scale factors (FP8 E4M3 encoded as uint8)
     k_sf_fp8 = k_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
-    v_sf_fp8 = v_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
 
-    if v_scale_layout not in ("trtllm_interleaved", "linear"):
-        raise ValueError("v_scale_layout must be 'trtllm_interleaved' or 'linear'.")
+    if v_data_layout == "normal":
+        v_2d = v_cache.reshape(-1, head_dim)
+        v_packed, v_sf = fp4_quantize(
+            v_2d, v_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
+        )
+        v_cache_fp4 = v_packed.view(torch.uint8).reshape(out_shape_fp4)
+        v_sf_fp8 = v_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
+    else:
+        # PV-reblocked V layout for the SM120 NVFP4 fused attention kernel.
+        # Data remains shaped like NHD pages, but each byte packs two tokens for
+        # a fixed output column. Scales are stored as [page, token_slot, head,
+        # scale_col] where token_slot selects the output-column group consumed by
+        # the PV MMA staging path.
+        v_by_col = (
+            v_cache.permute(0, 2, 3, 1)
+            .contiguous()
+            .reshape(num_pages * num_kv_heads * head_dim, page_size)
+        )
+        packed_col_token, sf_col = fp4_quantize(
+            v_by_col, v_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
+        )
+        packed_col_token = packed_col_token.view(torch.uint8).reshape(
+            num_pages, num_kv_heads, head_dim, page_size // 2
+        )
+        nibbles = torch.empty(
+            (num_pages, num_kv_heads, head_dim, page_size),
+            device=device,
+            dtype=torch.uint8,
+        )
+        nibbles[..., 0::2] = packed_col_token & 0x0F
+        nibbles[..., 1::2] = (packed_col_token >> 4) & 0x0F
+        nibbles_by_row = nibbles.permute(0, 3, 1, 2).contiguous()
+        v_cache_fp4 = (
+            nibbles_by_row[..., 0::2] | (nibbles_by_row[..., 1::2] << 4)
+        ).contiguous()
+
+        v_sf_u8 = (
+            sf_col.view(torch.uint8)
+            .reshape(num_pages, num_kv_heads, page_size, scale_dim)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
+        v_sf_fp8 = v_sf_u8.view(torch.float8_e4m3fn)
+
+    kv_cache_fp4 = (
+        k_packed.view(torch.uint8).reshape(out_shape_fp4),
+        v_cache_fp4,
+    )
+
+    if v_scale_layout not in ("trtllm_interleaved", "linear", "pv"):
+        raise ValueError(
+            "v_scale_layout must be 'trtllm_interleaved', 'linear', or 'pv'."
+        )
     if v_scale_layout == "trtllm_interleaved":
         # Apply V scale factor swizzling for SM100 trtllm-gen MHA kernel.
         # The swizzle interleaves the token dimension by groups of 4 within each

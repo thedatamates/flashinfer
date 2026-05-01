@@ -7,7 +7,7 @@ import statistics
 import torch
 
 import flashinfer
-from flashinfer.fp4_quantization import fp4_quantize, nvfp4_quantize_paged_kv_cache
+from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
 
 
 def _event_ms(fn, *, warmup: int, repeat: int) -> list[float]:
@@ -51,55 +51,6 @@ def _to_float8(
     scale = finfo.max / amax * 0.1
     x_scaled = (x * scale).clamp(min=finfo.min, max=finfo.max)
     return x_scaled.to(dtype), scale.float().reciprocal().item()
-
-
-def _quantize_v_pv_layout_nhd(
-    v_cache: torch.Tensor,
-    v_global_sf: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    num_pages, page_size, num_kv_heads, head_dim = v_cache.shape
-    if page_size != 16:
-        raise ValueError("PV-layout NVFP4 V cache benchmark currently requires page_size=16.")
-
-    v_by_col = (
-        v_cache.permute(0, 2, 3, 1)
-        .contiguous()
-        .reshape(num_pages * num_kv_heads * head_dim, page_size)
-    )
-    packed_col_token, sf_col = fp4_quantize(
-        v_by_col,
-        v_global_sf,
-        sf_vec_size=16,
-        is_sf_swizzled_layout=False,
-    )
-
-    packed_col_token = packed_col_token.view(torch.uint8).reshape(
-        num_pages, num_kv_heads, head_dim, page_size // 2
-    )
-    nibbles = torch.empty(
-        (num_pages, num_kv_heads, head_dim, page_size),
-        device=v_cache.device,
-        dtype=torch.uint8,
-    )
-    nibbles[..., 0::2] = packed_col_token & 0x0F
-    nibbles[..., 1::2] = (packed_col_token >> 4) & 0x0F
-
-    nibbles_by_row = nibbles.permute(0, 3, 1, 2).contiguous()
-    v_packed = (
-        nibbles_by_row[..., 0::2] | (nibbles_by_row[..., 1::2] << 4)
-    ).contiguous()
-
-    scale_dim = head_dim // 16
-    sf_col = sf_col.view(torch.uint8).reshape(num_pages, num_kv_heads, head_dim)
-    v_sf = torch.empty(
-        (num_pages, page_size, num_kv_heads, scale_dim),
-        device=v_cache.device,
-        dtype=torch.uint8,
-    )
-    for col in range(head_dim):
-        v_sf[:, col // scale_dim, :, col % scale_dim] = sf_col[:, :, col]
-
-    return v_packed, v_sf.view(torch.float8_e4m3fn)
 
 
 def _make_plan_tensors(
@@ -349,24 +300,21 @@ def main() -> None:
     v = torch.randn_like(k) / 4
     if args.fp4_v_sf_layout == "linear" and args.fp4_backend != "fa2":
         raise ValueError("--fp4-v-sf-layout=linear is only supported with --fp4-backend=fa2")
-    (k_fp4, v_reblocked), (k_sf, v_reblocked_sf), k_scale, v_scale = (
-        nvfp4_quantize_paged_kv_cache(
-            k, v, "NHD", v_scale_layout=args.fp4_v_sf_layout
-        )
-    )
-    v_fp4_pv, v_sf_pv = _quantize_v_pv_layout_nhd(
-        v,
-        torch.tensor([1.0 / v_scale], device=device, dtype=torch.float32),
-    )
     if args.fp4_v_layout == "pv":
         if args.fp4_backend != "fmha_v2":
             raise ValueError("--fp4-v-layout=pv is only supported with --fp4-backend=fmha_v2")
-        v_fp4 = v_fp4_pv
-        v_sf = v_sf_pv
+        (k_fp4, v_fp4), (k_sf, v_sf), k_scale, v_scale = (
+            nvfp4_quantize_paged_kv_cache(
+                k, v, "NHD", v_scale_layout="pv", v_data_layout="pv"
+            )
+        )
         nvfp4_v_cache_uses_pv_layout = True
     else:
-        v_fp4 = v_reblocked
-        v_sf = v_reblocked_sf
+        (k_fp4, v_fp4), (k_sf, v_sf), k_scale, v_scale = (
+            nvfp4_quantize_paged_kv_cache(
+                k, v, "NHD", v_scale_layout=args.fp4_v_sf_layout
+            )
+        )
         nvfp4_v_cache_uses_pv_layout = False
 
     k_bf16 = k.contiguous()

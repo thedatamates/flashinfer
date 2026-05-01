@@ -13456,3 +13456,52 @@ Remaining production migration:
 3. Remove any benchmark-only debug kernels or exports that are no longer part
    of the production validation surface.
 ```
+
+## Production PV KV Quantization API
+
+The SM120 NVFP4 fused attention path needs V stored in the PV operand layout:
+
+```text
+V data pages:  [num_pages, 16, num_kv_heads, head_dim / 2]
+V scale pages: [num_pages, 16, num_kv_heads, head_dim / 16]
+```
+
+The existing `nvfp4_quantize_paged_kv_cache` API now has:
+
+```text
+v_data_layout="normal"  # historical behavior
+v_data_layout="pv"      # SM120 PV-reblocked V data
+v_scale_layout="pv"     # matching SM120 PV scale sidecar
+```
+
+Constraints for the PV layout:
+
+```text
+kv_layout must be "NHD"
+page_size must be 16
+v_data_layout="pv" requires v_scale_layout="pv"
+```
+
+Validation:
+
+```text
+PV layout compatibility against the old benchmark-private helper:
+  pv_data_equal=true
+  pv_sf_equal=true
+  K shape=(4, 16, 2, 128), K scale shape=(4, 16, 2, 16)
+  V shape=(4, 16, 2, 128), V scale shape=(4, 16, 2, 16)
+
+Normal layout backward-compat smoke:
+  normal_shapes=(4, 16, 2, 128), (4, 16, 2, 128),
+                (4, 16, 2, 16), (4, 16, 2, 16)
+  normal_dtypes=uint8, uint8, float8_e4m3fn, float8_e4m3fn
+
+Production csrc/JIT run_paged_batch using the public quantizer output:
+  D128 paged_batch vs per-seq paged_single equal=true, max_abs=0.0, finite=true
+  D256 paged_batch vs per-seq paged_single equal=true, max_abs=0.0, finite=true
+  D512 paged_batch vs per-seq paged_single equal=true, max_abs=0.0, finite=true
+```
+
+The grouped-attention benchmark no longer has a separate PV reblock helper.
+It now calls the same public quantizer path, so benchmark validation and the
+production csrc binding share one V/PV layout implementation.
