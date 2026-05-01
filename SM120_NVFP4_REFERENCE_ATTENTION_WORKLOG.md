@@ -14259,7 +14259,7 @@ Changed benchmark ownership:
 ```text
 - bench_gemma4_attention_grid.py: sm120_fused already routes through
   bench_fmha_nvfp4_sm120.py --mode paged-wrapper.
-- bench_sm120_d256_hillclimb.py: sm120_fused now routes through
+- bench_sm120_nvfp4_attention_grid.py: sm120_fused now routes through
   bench_fmha_nvfp4_sm120.py --mode paged-wrapper instead of the old
   benchmark extension dense path.
 - bench_fmha_nvfp4_sm120.py: imports
@@ -14295,7 +14295,7 @@ Validation:
 
 ```text
 # Python benchmark syntax
-benchmarks/bench_sm120_d256_hillclimb.py
+benchmarks/bench_sm120_nvfp4_attention_grid.py
 benchmarks/bench_fmha_nvfp4_sm120.py
 benchmarks/bench_gemma4_attention_grid.py
 benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py
@@ -14311,8 +14311,8 @@ bench_fmha_nvfp4_sm120.py --mode paged-wrapper
 output_finite: true
 production_paged_wrapper: true
 
-# Hillclimb one-cell route smoke
-bench_sm120_d256_hillclimb.py --kernels sm120_fused
+# SM120 grid one-cell route smoke
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused
   --q-lens 512 --kv-lens 8192 --groups 6 --warmup 1 --repeat 1
 
 status: ok
@@ -14347,8 +14347,8 @@ benchmarks/bench_fmha_nvfp4_sm120.py
 benchmarks/bench_gemma4_attention_grid.py
   Gemma4 grid sweep.
 
-benchmarks/bench_sm120_d256_hillclimb.py
-  Focused D256 sweep, routed through the production paged wrapper.
+benchmarks/bench_sm120_nvfp4_attention_grid.py
+  SM120 NVFP4 q/kv/group sweep, routed through the production paged wrapper.
 
 benchmarks/bench_gemma4_paged_workload_scenarios.py
   Paged workload scenario validation.
@@ -14398,7 +14398,7 @@ Validation:
 py_compile:
   benchmarks/bench_fmha_nvfp4_sm120.py
   benchmarks/bench_gemma4_attention_grid.py
-  benchmarks/bench_sm120_d256_hillclimb.py
+  benchmarks/bench_sm120_nvfp4_attention_grid.py
   benchmarks/bench_gemma4_paged_workload_scenarios.py
   benchmarks/bench_nvfp4_fmha_v2_gqa_grouped_attention.py
 
@@ -14421,8 +14421,8 @@ bench_fmha_nvfp4_sm120.py --mode dense
 
 output_finite: true
 
-# Hillclimb route smoke
-bench_sm120_d256_hillclimb.py --kernels sm120_fused
+# SM120 grid route smoke
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused
   --q-lens 512 --kv-lens 8192 --groups 6 --warmup 1 --repeat 1
 
 status: ok
@@ -14431,7 +14431,7 @@ command includes: bench_fmha_nvfp4_sm120.py --mode paged-wrapper
 
 ## Restore 180-Cell Sweep Defaults
 
-`bench_sm120_d256_hillclimb.py` now treats `--q-lens all --kv-lens all
+`bench_sm120_nvfp4_attention_grid.py` now treats `--q-lens all --kv-lens all
 --groups all` as the 180-cell validation matrix again:
 
 ```text
@@ -14455,23 +14455,83 @@ That means the same harness invocation shape can validate all three
 specializations by changing only `--head-dim`:
 
 ```text
-bench_sm120_d256_hillclimb.py --kernels sm120_fused --head-dim 128
-bench_sm120_d256_hillclimb.py --kernels sm120_fused --head-dim 256
-bench_sm120_d256_hillclimb.py --kernels sm120_fused --head-dim 512
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused --head-dim 128
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused --head-dim 256
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused --head-dim 512
 ```
 
 Validation:
 
 ```text
-py_compile benchmarks/bench_sm120_d256_hillclimb.py: passed
+py_compile benchmarks/bench_sm120_nvfp4_attention_grid.py: passed
 
 cell_count: 180
 default spans: D128=1, D256=2, D512=4
 
 Smoke:
-bench_sm120_d256_hillclimb.py --kernels sm120_fused --head-dim 128
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused --head-dim 128
   --q-lens 128 --kv-lens 8192 --groups 2 --warmup 1 --repeat 1
 
 status: ok
 command includes: --output-group-span 1
+```
+
+## Rename SM120 Sweep Harness
+
+The generic SM120 NVFP4 q/kv/group sweep harness is now named for what it does:
+
+```text
+old: benchmarks/bench_sm120_d256_hillclimb.py
+new: benchmarks/bench_sm120_nvfp4_attention_grid.py
+```
+
+Reasons:
+
+```text
+- It is no longer D256-only.
+- It validates D128/D256/D512 by changing --head-dim.
+- It is a production-routed grid benchmark, not a hill-climb experiment.
+- Default report names now use d{head_dim}_sm120_nvfp4_attention_grid_<stamp>.
+```
+
+Validation:
+
+```text
+py_compile benchmarks/bench_sm120_nvfp4_attention_grid.py: passed
+
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused --head-dim 128
+  --q-lens 128 --kv-lens 8192 --groups 2 --warmup 1 --repeat 1
+
+status: ok
+command includes: bench_fmha_nvfp4_sm120.py --mode paged-wrapper
+```
+
+## Expand Short-Context Sweep Coverage
+
+The default SM120 NVFP4 attention grid now includes short-context KV lengths
+where the fused kernels are expected to lose or be least favorable, so the
+reports show the full crossover curve instead of only the long-context win
+zone:
+
+```text
+q_len:  {128, 256, 512, 1024, 2048, 4096}
+kv_len: {128, 512, 1024, 2048, 4096, 8192, 32768, 65536, 131072, 262144}
+group:  {2, 4, 6, 8, 12, 16}
+
+6 * 10 * 6 = 360 cells per head dimension
+```
+
+This only changes the `--kv-lens all` default. Explicit `--kv-lens` selections
+still run exactly the requested subset.
+
+Validation:
+
+```text
+py_compile benchmarks/bench_sm120_nvfp4_attention_grid.py: passed
+
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused --head-dim 128
+  --q-lens 128 --kv-lens 128 --groups 2 --warmup 1 --repeat 1
+
+status: ok
+command includes: bench_fmha_nvfp4_sm120.py --mode paged-wrapper
 ```

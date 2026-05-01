@@ -21,7 +21,7 @@ class Cell:
 
 
 DEFAULT_Q_LENS = (128, 256, 512, 1024, 2048, 4096)
-DEFAULT_KV_LENS = (8192, 32768, 65536, 131072, 262144)
+DEFAULT_KV_LENS = (128, 512, 1024, 2048, 4096, 8192, 32768, 65536, 131072, 262144)
 DEFAULT_GROUPS = (2, 4, 6, 8, 12, 16)
 
 KERNELS = ("sm120_fused", "nvfp4_fa2", "fp8_fa2", "bf16_fa2")
@@ -530,7 +530,9 @@ def error_row(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Run SM120 NVFP4 attention sweeps across q/kv/group cells."
+    )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=5)
@@ -585,7 +587,7 @@ def main() -> None:
     prefix = (
         Path(args.output_prefix)
         if args.output_prefix
-        else root / "reports" / f"d{args.head_dim}_hillclimb_{stamp}"
+        else root / "reports" / f"d{args.head_dim}_sm120_nvfp4_attention_grid_{stamp}"
     )
     rows: list[dict[str, Any]] = load_jsonl_rows(prefix)
     existing = {
