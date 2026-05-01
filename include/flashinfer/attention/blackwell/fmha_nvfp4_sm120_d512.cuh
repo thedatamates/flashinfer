@@ -339,63 +339,6 @@ static_assert(
             static_cast<int>(sizeof(cutlass::float_ue4m3_t)),
     "QK SFA smem must be large enough for two compact PV P scale stages");
 
-__device__ __forceinline__ bool finite_f32(float x) {
-  return x == x && fabsf(x) != INFINITY;
-}
-
-__device__ __forceinline__ uint8_t fp32_to_e4m3_byte(float x) {
-  if (!(x > 0.0f) || !finite_f32(x)) {
-    x = 1.0e-8f;
-  }
-  __nv_fp8_e4m3 y = static_cast<__nv_fp8_e4m3>(x);
-  return y.__x;
-}
-
-__device__ __forceinline__ float e4m3_byte_to_fp32(uint8_t x) {
-  __nv_fp8_e4m3 y;
-  y.__x = x;
-  return static_cast<float>(y);
-}
-
-__device__ __forceinline__ uint8_t nearest_e2m1_code(float x) {
-  constexpr float values[16] = {
-      0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
-  x = fminf(fmaxf(finite_f32(x) ? x : 0.0f, -6.0f), 6.0f);
-  float best_dist = fabsf(x - values[0]);
-  uint8_t best = 0;
-#pragma unroll
-  for (uint8_t i = 1; i < 16; ++i) {
-    const float dist = fabsf(x - values[i]);
-    if (dist < best_dist) {
-      best_dist = dist;
-      best = i;
-    }
-  }
-  return best;
-}
-
-__device__ __forceinline__ uint8_t fp32_pair_to_e2m1_byte(float x, float y) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  uint16_t val;
-  asm volatile(
-      "{\n"
-      ".reg .b8 byte0;\n"
-      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
-      "mov.b16 %0, {byte0, 0};\n"
-      "}"
-      : "=h"(val)
-      : "f"(x), "f"(y));
-  return static_cast<uint8_t>(val);
-#else
-  return 0;
-#endif
-}
-
-__device__ __forceinline__ uint8_t fp32_to_e2m1_code_hw(float x) {
-  return static_cast<uint8_t>(fp32_pair_to_e2m1_byte(x, x) & 0x0Fu);
-}
-
 __device__ __forceinline__ cutlass::float_ue4m3_t make_ue4m3_raw(uint8_t raw) {
   cutlass::float_ue4m3_t value;
   value.storage = raw;
@@ -807,7 +750,9 @@ __device__ __forceinline__ void sm120_epilogue_store_bf16_tile(
   }
 }
 
-template <int kOutputGroupSpan, bool kUsePagedKv>
+template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
+          bool kUseSlidingWindow, bool kUseLogitsSoftCap,
+          bool kUsePvLayoutV>
 __global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount, kMinBlocksPerSm)
 void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     CUTLASS_GRID_CONSTANT typename CutlassGemmKernel::Params const qk_params,
@@ -1129,7 +1074,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 
       auto pv_scale_for = [&](int token, int dim) {
         const int logical_page = token / paged_kv_params.page_size;
-        if (paged_kv_params.v_cache_uses_pv_layout) {
+        if constexpr (kUsePvLayoutV) {
           return sm120_nvfp4_paged_v_pv_scale(paged_kv_params, logical_page,
                                               dim);
         }
@@ -1138,7 +1083,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       };
 
       auto pv_code_for = [&](int token, int dim, uint8_t scale) {
-        if (paged_kv_params.v_cache_uses_pv_layout) {
+        if constexpr (kUsePvLayoutV) {
           return token < kv_len_tokens
                      ? sm120_nvfp4_paged_v_code(paged_kv_params, token, dim)
                      : uint8_t{0};
@@ -1667,11 +1612,15 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       if (kv_pos >= kv_len_tokens) {
         return false;
       }
-      if (causal && kv_pos > q_pos) {
-        return false;
+      if constexpr (kCausal) {
+        if (kv_pos > q_pos) {
+          return false;
+        }
       }
-      if (sliding_window > 0 && kv_pos < q_pos - sliding_window + 1) {
-        return false;
+      if constexpr (kUseSlidingWindow) {
+        if (kv_pos < q_pos - sliding_window + 1) {
+          return false;
+        }
       }
       return true;
     };
@@ -1679,7 +1628,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       if (!score_is_valid(row, col, tile)) {
         return -INFINITY;
       }
-      if (logits_soft_cap > 0.0f) {
+      if constexpr (kUseLogitsSoftCap) {
         logit = logits_soft_cap * tanhf(logit / logits_soft_cap);
       }
       return logit;
@@ -2013,7 +1962,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 #endif
 }
 
-template <int kOutputGroupSpan, bool kUsePagedKv = false>
+template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
+          bool kUseSlidingWindow, bool kUseLogitsSoftCap,
+          bool kUsePvLayoutV>
 cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
     uint8_t* q_packed,
     uint8_t* q_scales,
@@ -2090,8 +2041,9 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
   constexpr int kSmemBytes =
       static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
   auto stage_kernel =
-      sm120_nvfp4_qkv_online_register_q_stage_kernel<kOutputGroupSpan,
-                                                     kUsePagedKv>;
+      sm120_nvfp4_qkv_online_register_q_stage_kernel<
+          kOutputGroupSpan, kUsePagedKv, kCausal, kUseSlidingWindow,
+          kUseLogitsSoftCap, kUsePvLayoutV>;
   cudaError_t status = cudaFuncSetAttribute(
       stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
   if (status != cudaSuccess) {

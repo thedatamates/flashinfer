@@ -1812,31 +1812,52 @@ def _get_sm120_nvfp4_cutlass_include_paths():
     return None
 
 
-def gen_fmha_nvfp4_sm120_module(head_dim: int) -> JitSpec:
+def gen_fmha_nvfp4_sm120_module(
+    head_dim: int,
+    *,
+    causal: bool = True,
+    use_sliding_window: bool = False,
+    use_logits_soft_cap: bool = False,
+    v_cache_uses_pv_layout: bool = True,
+) -> JitSpec:
     if head_dim not in (128, 256, 512):
         raise ValueError("SM120 NVFP4 FMHA supports head_dim in {128, 256, 512}.")
-    uri = f"fmha_nvfp4_sm120_d{head_dim}"
+    uri = (
+        f"fmha_nvfp4_sm120_d{head_dim}_"
+        f"causal_{causal}_"
+        f"swa_{use_sliding_window}_"
+        f"softcap_{use_logits_soft_cap}_"
+        f"pv_v_{v_cache_uses_pv_layout}"
+    )
+    gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
+    os.makedirs(gen_directory, exist_ok=True)
+    with open(
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_nvfp4_sm120_customize_config.jinja"
+    ) as f:
+        config_templ = jinja2.Template(f.read())
+    write_if_different(
+        gen_directory / "fmha_nvfp4_sm120_config.inc",
+        config_templ.render(
+            causal=str(causal).lower(),
+            use_sliding_window=str(use_sliding_window).lower(),
+            use_logits_soft_cap=str(use_logits_soft_cap).lower(),
+            v_cache_uses_pv_layout=str(v_cache_uses_pv_layout).lower(),
+        ),
+    )
     source_paths = [
         jit_env.FLASHINFER_CSRC_DIR / f"fmha_nvfp4_sm120_d{head_dim}.cu",
+        jit_env.FLASHINFER_CSRC_DIR / f"fmha_nvfp4_sm120_d{head_dim}_paged.cu",
+        jit_env.FLASHINFER_CSRC_DIR / f"fmha_nvfp4_sm120_d{head_dim}_dense.cu",
     ]
+    include_paths = _get_sm120_nvfp4_cutlass_include_paths()
+    if include_paths is None:
+        include_paths = []
+    include_paths = [gen_directory] + include_paths
     return gen_jit_spec(
         uri,
         source_paths,
         extra_cuda_cflags=sm120f_nvcc_flags + ["-DFLASHINFER_ENABLE_BF16"],
-        extra_include_paths=_get_sm120_nvfp4_cutlass_include_paths(),
-    )
-
-
-def gen_fmha_nvfp4_sm120_dense_module() -> JitSpec:
-    uri = "fmha_nvfp4_sm120_dense"
-    source_paths = [
-        jit_env.FLASHINFER_CSRC_DIR / "fmha_nvfp4_sm120_dense.cu",
-    ]
-    return gen_jit_spec(
-        uri,
-        source_paths,
-        extra_cuda_cflags=sm120f_nvcc_flags + ["-DFLASHINFER_ENABLE_BF16"],
-        extra_include_paths=_get_sm120_nvfp4_cutlass_include_paths(),
+        extra_include_paths=include_paths,
     )
 
 

@@ -1856,6 +1856,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor] = None,
         seq_lens_q: Optional[torch.Tensor] = None,
         block_tables: Optional[torch.Tensor] = None,
+        nvfp4_v_cache_uses_pv_layout: bool = False,
         max_token_per_sequence: Optional[int] = None,
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
@@ -1958,6 +1959,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             If not provided, will be set to the same value as ``seq_lens``.
         block_tables: Optional[torch.Tensor]
             A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
+        nvfp4_v_cache_uses_pv_layout : bool
+            Whether NVFP4 V pages are already stored in the SM120 PV operand
+            layout. For ``backend="sm120-nvfp4"``, this is a plan-time
+            specialization axis and must match the value passed to
+            :meth:`run`.
         max_token_per_sequence: Optional[int],
             Required for cudnn backend. This is the scalar max token length of each sequence.
         max_sequence_kv: Optional[int],
@@ -2224,6 +2230,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     )
                 if page_size != 16:
                     raise ValueError("backend='sm120-nvfp4' currently requires page_size=16.")
+                if nvfp4_v_cache_uses_pv_layout and self._kv_layout != "NHD":
+                    raise ValueError(
+                        "backend='sm120-nvfp4' supports PV-layout V pages only with NHD KV layout."
+                    )
                 if custom_mask is not None or packed_custom_mask is not None:
                     raise NotImplementedError(
                         "backend='sm120-nvfp4' supports causal/sliding-window masks, "
@@ -2309,6 +2319,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
                 split_kv_len=split_kv_len,
+                v_cache_uses_pv_layout=nvfp4_v_cache_uses_pv_layout,
             )
 
         if self._cached_module is not None:

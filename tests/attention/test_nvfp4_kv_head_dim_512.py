@@ -1304,6 +1304,7 @@ def test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm1
         o_data_type=torch.bfloat16,
         seq_lens=kv_lens_t,
         block_tables=block_tables,
+        nvfp4_v_cache_uses_pv_layout=True,
     )
     out = standard.run(
         q,
@@ -1426,8 +1427,9 @@ def test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x(head_dim, group):
             o_data_type=torch.bfloat16,
             seq_lens=kv_lens_t,
             block_tables=block_tables,
+            nvfp4_v_cache_uses_pv_layout=use_pv_layout,
         )
-        return wrapper.run(
+        out = wrapper.run(
             q,
             (k_normal, v_cache),
             kv_cache_sf=(k_sf, v_sf),
@@ -1435,23 +1437,29 @@ def test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x(head_dim, group):
             v_scale=v_scale,
             nvfp4_v_cache_uses_pv_layout=use_pv_layout,
         )
+        torch.cuda.synchronize()
+        return out
 
     out_normal = run(v_normal, v_sf_normal, False)
     out_pv = run(v_pv, v_sf_pv, True)
     torch.cuda.synchronize()
 
     assert torch.isfinite(out_normal.float()).all()
+    assert torch.isfinite(out_pv.float()).all()
     diff = (out_normal.float() - out_pv.float()).abs().flatten()
     assert diff.mean() < 3e-3
     assert torch.quantile(diff, 0.99) < 8e-3
     assert diff.max() < 2e-2
 
+    out_normal_hnd_ref = run(v_normal, v_sf_normal, False)
+
     k_hnd = k_normal.permute(0, 2, 1, 3).contiguous()
     v_hnd = v_normal.permute(0, 2, 1, 3).contiguous()
     k_sf_hnd = k_sf.permute(0, 2, 1, 3).contiguous()
     v_sf_hnd = v_sf_normal.permute(0, 2, 1, 3).contiguous()
+    hnd_workspace = torch.empty_like(workspace)
     wrapper_hnd = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace, "HND", backend="sm120-nvfp4"
+        hnd_workspace, "HND", backend="sm120-nvfp4"
     )
     wrapper_hnd.plan(
         qo_indptr,
@@ -1470,6 +1478,7 @@ def test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x(head_dim, group):
         o_data_type=torch.bfloat16,
         seq_lens=kv_lens_t,
         block_tables=block_tables,
+        nvfp4_v_cache_uses_pv_layout=False,
     )
     out_hnd = wrapper_hnd.run(
         q,
@@ -1482,6 +1491,6 @@ def test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x(head_dim, group):
     torch.cuda.synchronize()
 
     assert torch.isfinite(out_hnd.float()).all()
-    diff_hnd = (out_hnd.float() - out_normal.float()).abs().flatten()
+    diff_hnd = (out_hnd.float() - out_normal_hnd_ref.float()).abs().flatten()
     assert diff_hnd.mean() < 1e-6
     assert diff_hnd.max() < 1e-5

@@ -9,7 +9,10 @@ import torch
 import flashinfer
 from flashinfer import SfLayout
 from flashinfer.fmha_nvfp4_sm120 import BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper
-from flashinfer.jit import gen_fmha_nvfp4_sm120_dense_module
+from flashinfer.jit import gen_fmha_nvfp4_sm120_module
+
+
+BENCHMARK_KEY = "sm120_nvfp4_attention"
 
 
 def default_output_group_span(head_dim: int) -> int:
@@ -20,15 +23,6 @@ def default_output_group_span(head_dim: int) -> int:
     if head_dim == 512:
         return 4
     raise ValueError("head_dim must be one of {128, 256, 512}")
-
-
-def bench_key(output_group_span: int) -> str:
-    if output_group_span == 1:
-        return "bench_sm120_qkv_online_register_q_splitkv_full_grid"
-    return (
-        f"bench_sm120_qkv_online_register_q_splitkv_reuse"
-        f"{output_group_span}_full_grid"
-    )
 
 
 def event_ms(fn, *, warmup: int, repeat: int) -> dict[str, float]:
@@ -91,7 +85,7 @@ def make_bf16_shape_inputs(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark the source-tree SM120 NVFP4 FMHA JIT module."
+        description="Benchmark the SM120 NVFP4 attention JIT module."
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--q-len", type=int, required=True)
@@ -110,7 +104,7 @@ def main() -> None:
         choices=("dense", "paged-wrapper"),
         default="dense",
         help=(
-            "dense benchmarks the low-level prepacked run_dense binding; "
+            "dense benchmarks the low-level prepacked dense_run binding; "
             "paged-wrapper benchmarks the production Python wrapper, including "
             "Q quantization, native paged KV loads, fused attention, and output scatter."
         ),
@@ -140,7 +134,6 @@ def main() -> None:
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     q_rows = args.q_len * args.group
-    key = bench_key(output_group_span)
 
     if args.mode == "paged-wrapper":
         gen = torch.Generator(device=device)
@@ -217,7 +210,7 @@ def main() -> None:
         torch.cuda.synchronize()
         result = {
             "fmha_nvfp4_sm120_jit": True,
-            "production_paged_wrapper": True,
+            "api": "paged",
             "q_len": args.q_len,
             "kv_len": args.kv_len,
             "head_dim": args.head_dim,
@@ -229,7 +222,7 @@ def main() -> None:
             "sliding_window": args.sliding_window,
             "logits_soft_cap": args.logits_soft_cap,
             "output_finite": bool(torch.isfinite(out.float()).all()),
-            key: event_ms(run, warmup=args.warmup, repeat=args.repeat),
+            BENCHMARK_KEY: event_ms(run, warmup=args.warmup, repeat=args.repeat),
         }
         print(json.dumps(result, sort_keys=True))
         return
@@ -262,10 +255,16 @@ def main() -> None:
     split_l = torch.empty((num_splits, q_rows), dtype=torch.float32, device=device)
     out = torch.empty((q_rows, args.head_dim), dtype=torch.bfloat16, device=device)
     workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
-    module = gen_fmha_nvfp4_sm120_dense_module().build_and_load()
+    module = gen_fmha_nvfp4_sm120_module(
+        args.head_dim,
+        causal=bool(args.causal),
+        use_sliding_window=args.sliding_window > 0,
+        use_logits_soft_cap=float(args.logits_soft_cap) > 0.0,
+        v_cache_uses_pv_layout=True,
+    ).build_and_load()
 
     def run() -> None:
-        module.run_dense(
+        module.dense_run(
             q_packed,
             q_scales,
             k_packed,
@@ -293,7 +292,7 @@ def main() -> None:
     torch.cuda.synchronize()
     result = {
         "fmha_nvfp4_sm120_jit": True,
-        "production_paged_wrapper": False,
+        "api": "dense",
         "q_len": args.q_len,
         "kv_len": args.kv_len,
         "head_dim": args.head_dim,
@@ -303,7 +302,7 @@ def main() -> None:
         "sliding_window": args.sliding_window,
         "logits_soft_cap": args.logits_soft_cap,
         "output_finite": bool(torch.isfinite(out.float()).all()),
-        key: event_ms(run, warmup=args.warmup, repeat=args.repeat),
+        BENCHMARK_KEY: event_ms(run, warmup=args.warmup, repeat=args.repeat),
     }
     print(json.dumps(result, sort_keys=True))
 

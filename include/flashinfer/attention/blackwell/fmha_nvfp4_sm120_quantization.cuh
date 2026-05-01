@@ -44,6 +44,29 @@ __device__ __forceinline__ uint8_t nearest_e2m1_code(float x) {
   return best;
 }
 
+__device__ __forceinline__ uint8_t fp32_pair_to_e2m1_byte(float x, float y) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  uint16_t val;
+  asm volatile(
+      "{\n"
+      ".reg .b8 byte0;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"
+      "mov.b16 %0, {byte0, 0};\n"
+      "}"
+      : "=h"(val)
+      : "f"(x), "f"(y));
+  return static_cast<uint8_t>(val);
+#else
+  const uint8_t c0 = nearest_e2m1_code(x);
+  const uint8_t c1 = nearest_e2m1_code(y);
+  return static_cast<uint8_t>(c0 | (c1 << 4));
+#endif
+}
+
+__device__ __forceinline__ uint8_t fp32_to_e2m1_code_hw(float x) {
+  return static_cast<uint8_t>(fp32_pair_to_e2m1_byte(x, x) & 0x0Fu);
+}
+
 __device__ __forceinline__ float e2m1_code_to_fp32(uint8_t code) {
   constexpr float values[16] = {
       0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -51,13 +74,13 @@ __device__ __forceinline__ float e2m1_code_to_fp32(uint8_t code) {
   return values[code & 0x0f];
 }
 
-__global__ void quantize_q_rowmajor_kernel(const __nv_bfloat16* q,
-                                           uint8_t* q_packed,
-                                           uint8_t* q_scales,
-                                           int rows,
-                                           int head_dim,
-                                           int packed_head_dim,
-                                           int scale_cols) {
+static __global__ void quantize_q_rowmajor_kernel(const __nv_bfloat16* q,
+                                                  uint8_t* q_packed,
+                                                  uint8_t* q_scales,
+                                                  int rows,
+                                                  int head_dim,
+                                                  int packed_head_dim,
+                                                  int scale_cols) {
   const int row = blockIdx.x;
   const int scale_col = threadIdx.x;
   if (row >= rows || scale_col >= scale_cols) {
@@ -79,10 +102,8 @@ __global__ void quantize_q_rowmajor_kernel(const __nv_bfloat16* q,
   for (int pair = 0; pair < 8; ++pair) {
     const float x0 = __bfloat162float(q[base + 2 * pair]) / scale;
     const float x1 = __bfloat162float(q[base + 2 * pair + 1]) / scale;
-    const uint8_t c0 = nearest_e2m1_code(x0);
-    const uint8_t c1 = nearest_e2m1_code(x1);
     q_packed[row * packed_head_dim + scale_col * 8 + pair] =
-        static_cast<uint8_t>(c0 | (c1 << 4));
+        fp32_pair_to_e2m1_byte(x0, x1);
   }
 }
 

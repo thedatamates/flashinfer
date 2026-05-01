@@ -180,16 +180,7 @@ def summarize_result(
         }
 
     if kernel == "sm120_fused":
-        key = (
-            "bench_sm120_qkv_online_register_q_splitkv_full_grid"
-            if cell.head_dim == 128
-            else (
-                "bench_sm120_qkv_online_register_q_splitkv_reuse2_full_grid"
-                if cell.head_dim == 256
-                else "bench_sm120_qkv_online_register_q_splitkv_reuse4_full_grid"
-            )
-        )
-        bench = data[key]
+        bench = data["sm120_nvfp4_attention"]
         return {
             "status": "ok",
             "reason": "",
@@ -280,7 +271,7 @@ def command_for_kernel(
             split_kv_len = 128 if cell.q_len <= 512 else 512
         return [
             py,
-            str(root / "benchmarks" / "bench_fmha_nvfp4_sm120.py"),
+            str(root / "benchmarks" / "bench_sm120_nvfp4_attention.py"),
             *common,
             "--mode",
             "paged-wrapper",

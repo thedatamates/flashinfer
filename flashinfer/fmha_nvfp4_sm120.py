@@ -28,9 +28,9 @@ from .utils import check_shape_dtype_device
 
 
 def _tile_m_for_head_dim(head_dim: int) -> int:
-    if head_dim == 256:
+    if head_dim in (128, 256):
         return 64
-    if head_dim in (128, 512):
+    if head_dim == 512:
         return 128
     raise ValueError("SM120 NVFP4 FMHA supports head_dim in {128, 256, 512}.")
 
@@ -66,8 +66,20 @@ def _empty_aligned(
 
 
 @functools.cache
-def _get_sm120_nvfp4_fmha_module(head_dim: int):
-    return gen_fmha_nvfp4_sm120_module(head_dim).build_and_load()
+def _get_sm120_nvfp4_fmha_module(
+    head_dim: int,
+    causal: bool,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+    v_cache_uses_pv_layout: bool,
+):
+    return gen_fmha_nvfp4_sm120_module(
+        head_dim,
+        causal=causal,
+        use_sliding_window=use_sliding_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        v_cache_uses_pv_layout=v_cache_uses_pv_layout,
+    ).build_and_load()
 
 
 def _as_uint8_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -91,7 +103,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
     normal V layout by reblocking V into the PV MMA operand in the stage
     producer.
 
-    The current implementation uses the source-tree csrc/JIT ``run_paged_batch``
+    The current implementation uses the source-tree csrc/JIT ``paged_run``
     path. D128/D256/D512 stage K and V directly from the paged block table.
     PV-layout V is consumed directly, while normal-layout V is converted into
     the PV MMA operand inside the stage producer. The API boundary is the
@@ -132,6 +144,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         logits_soft_cap: float = 0.0,
         split_kv_len: int = 8192,
         output_group_span: Optional[int] = None,
+        v_cache_uses_pv_layout: bool = True,
     ) -> None:
         if page_size != 16:
             raise ValueError("SM120 NVFP4 FMHA currently requires page_size=16.")
@@ -149,6 +162,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             raise ValueError("D128 only supports output_group_span=1.")
         if head_dim % (output_group_span * 128) != 0:
             raise ValueError("head_dim must be divisible by output_group_span * 128.")
+        if v_cache_uses_pv_layout and self._kv_layout != "NHD":
+            raise ValueError("PV-layout V cache is currently supported only with NHD layout.")
 
         if qo_indptr.numel() < 2:
             raise ValueError("qo_indptr must have shape [batch_size + 1].")
@@ -190,9 +205,16 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         self._causal = bool(causal)
         self._window_left = int(window_left)
         self._logits_soft_cap = float(logits_soft_cap)
+        self._v_cache_uses_pv_layout = bool(v_cache_uses_pv_layout)
         self._split_kv_tiles = int(split_kv_len // 128)
         self._output_group_span = int(output_group_span)
-        self._module = _get_sm120_nvfp4_fmha_module(self._head_dim)
+        self._module = _get_sm120_nvfp4_fmha_module(
+            self._head_dim,
+            self._causal,
+            self._window_left > 0,
+            self._logits_soft_cap > 0.0,
+            self._v_cache_uses_pv_layout,
+        )
 
         tile_m = _tile_m_for_head_dim(head_dim)
         max_q_rows = self._max_q_len * self._group_size
@@ -266,7 +288,11 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         v_sf_pages_pv_u8 = _as_uint8_scale(v_sf_pages_pv)
         if v_cache_sf_layout not in ("trtllm_interleaved", "linear"):
             raise ValueError("v_cache_sf_layout must be 'trtllm_interleaved' or 'linear'.")
-        if v_cache_uses_pv_layout and self._kv_layout != "NHD":
+        if bool(v_cache_uses_pv_layout) != self._v_cache_uses_pv_layout:
+            raise ValueError(
+                "v_cache_uses_pv_layout must match the value passed to plan()."
+            )
+        if self._v_cache_uses_pv_layout and self._kv_layout != "NHD":
             raise ValueError("PV-layout V cache is currently supported only with NHD layout.")
 
         expected_page_shape = (
@@ -309,7 +335,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             qo_stop = qo_start + self._group_size
             self._q_group.copy_(q[:, qo_start:qo_stop, :])
             self._module.quantize_q(self._q_group, self._q_packed, self._q_scales)
-            self._module.run_paged_batch(
+            self._module.paged_run(
                 self._q_packed,
                 self._q_scales,
                 k_pages,
@@ -337,7 +363,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 self._window_left,
                 self._logits_soft_cap,
                 self._output_group_span,
-                bool(v_cache_uses_pv_layout),
+                self._v_cache_uses_pv_layout,
                 v_cache_sf_layout == "trtllm_interleaved",
                 self._kv_layout == "HND",
             )

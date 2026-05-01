@@ -14429,6 +14429,200 @@ status: ok
 command includes: bench_fmha_nvfp4_sm120.py --mode paged-wrapper
 ```
 
+## SM120 NVFP4 Production JIT Specialization Cleanup
+
+The SM120 NVFP4 production module now follows the FlashInfer-style JIT
+specialization boundary instead of carrying benchmark-era side modules:
+
+```text
+module key:
+  head_dim
+  causal
+  use_sliding_window
+  use_logits_soft_cap
+  v_cache_uses_pv_layout
+
+runtime params:
+  kv_layout_hnd
+  v_scales_trtllm_interleaved
+```
+
+The specialization axes are the semantic/code-region switches that remove
+large runtime branches from the kernel body. KV layout and V-scale layout stay
+runtime because they are address-stride variants, not separate algorithmic
+regions, and specializing them would multiply module count without removing
+the expensive producer/reblock code paths.
+
+Dense and paged entry points are now exported from the same generated
+per-head-dim module:
+
+```text
+run_dense
+run_paged_batch
+quantize_q
+```
+
+The previous `fmha_nvfp4_sm120_dense` module and the per-head stage sidecar
+translation units were removed. Each head dimension now builds as one
+self-contained `.cu` file using an anonymous namespace for internal linkage,
+matching the comparable FlashInfer CUTLASS binding files. The temporary
+`FLASHINFER_SM120_NVFP4_HIDDEN` macro is not used.
+
+Validation:
+
+```text
+py_compile:
+  flashinfer/jit/attention/modules.py
+  flashinfer/fmha_nvfp4_sm120.py
+  flashinfer/prefill.py
+  benchmarks/bench_fmha_nvfp4_sm120.py
+  tests/attention/test_nvfp4_kv_head_dim_512.py
+status: passed
+
+source scan:
+  FLASHINFER_SM120_NVFP4_HIDDEN
+  fmha_nvfp4_sm120_d*_stage
+  gen_fmha_nvfp4_sm120_dense_module
+  fmha_nvfp4_sm120_dense
+status: no remaining references
+
+symbol scan:
+  nm -D generated D128/D256/D512 modules |
+    rg "Sm120Nvfp4|RunPaged|RunDense|QuantizeQ"
+status: no exported internal helper symbols
+
+paged-wrapper smoke:
+  D128 q=128 kv=128 group=2: finite output
+  D256 q=128 kv=128 group=2: finite output
+  D512 q=128 kv=128 group=2: finite output
+
+dense export smoke:
+  D128 q=128 kv=128 group=2: finite output
+
+semantic config smoke:
+  D256 q=128 kv=128 group=2
+  causal=true
+  sliding_window=128
+  logits_soft_cap=50.0
+status: finite output
+
+targeted normal-V/PV/HND test:
+  tests/attention/test_nvfp4_kv_head_dim_512.py::
+    test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x[128-4]
+status: passed
+```
+
+## SM120 NVFP4 FFI Export Naming
+
+The first source-sharded module used local names:
+
+```text
+run_paged_batch
+run_dense
+```
+
+FlashInfer's batch prefill modules expose:
+
+```text
+paged_run
+ragged_run
+```
+
+The SM120 NVFP4 module now follows that naming convention:
+
+```text
+quantize_q
+paged_run
+dense_run
+```
+
+Only names changed; the source-sharded structure is unchanged:
+
+```text
+csrc/fmha_nvfp4_sm120_d{D}.cu        light quantize_q binding
+csrc/fmha_nvfp4_sm120_d{D}_paged.cu  paged_run / kUsePagedKv=true
+csrc/fmha_nvfp4_sm120_d{D}_dense.cu  dense_run / kUsePagedKv=false
+```
+
+Validation:
+
+```text
+py_compile:
+  flashinfer/fmha_nvfp4_sm120.py
+  benchmarks/bench_fmha_nvfp4_sm120.py
+status: passed
+
+D128 paged-wrapper smoke after clean rebuild:
+  output_finite=true
+
+D128 dense export smoke:
+  output_finite=true
+```
+
+Test note: the local-wrapper helper in the normal-V/PV/HND test now
+synchronizes before returning because the wrapper owns async scratch buffers.
+Without that synchronization, a wrapper constructed inside the helper can be
+destroyed before the enqueued CUDA work has consumed its scratch tensors,
+creating nondeterministic validation failures unrelated to the HND math path.
+
+## SM120 NVFP4 Production JIT Compile-Time Baseline
+
+Measured clean rebuilds of existing FlashInfer cached production kernels to
+put the SM120 NVFP4 fused attention JIT time in context.
+
+```text
+Kernel/module                                      clean rebuild   objects
+------------------------------------------------  -------------   ----------------
+fp4_gemm_cutlass_sm120                            43.24 s         7 CUDA objects
+trtllm_fmha_v2_q_paged_kv_nhd_bf16_bf16           87.42 s         31 CUDA objects + link
+batch_prefill D512 BF16/u8 paged/ragged           29.54 s         10 CUDA objects + link
+fmha_nvfp4_sm120_d128 production paged smoke      362.72 s        1 CUDA object + link
+```
+
+Object-size comparison:
+
+```text
+fmha_nvfp4_sm120_d128:
+  csrc_fmha_nvfp4_sm120_d128.cuda.o               10.47 MB
+  fmha_nvfp4_sm120_d128.so                        10.11 MB
+
+trtllm_fmha_v2_q_paged_kv_nhd_bf16_bf16:
+  largest CUDA object                             ~2.23 MB
+  final .so                                       18.00 MB
+
+batch_prefill D512 BF16/u8:
+  largest CUDA object                             ~2.76 MB
+  final .so                                       19.85 MB
+```
+
+Conclusion:
+
+```text
+- The SM120 NVFP4 fused attention cold JIT time is materially slower than
+  existing production FlashInfer attention JIT modules.
+- Final .so size is not the useful predictor. The existing production modules
+  are larger overall but shard into many smaller CUDA objects.
+- Our slow path is one very large CUDA translation unit / ptxas unit.
+- A custom per-kernel JIT flag such as a private O2 env var is not PR-idiomatic.
+  For local dev, use the existing FlashInfer extra-CUDA-flags mechanism if
+  needed. For production-quality cleanup, reduce the size of the compiled unit
+  or split the launch surfaces the same way existing FlashInfer attention
+  modules do.
+```
+
+Compile-time cleanup already completed in the production source:
+
+```text
+- Replaced remaining software FP32->E2M1 search paths in Q quantization and
+  normal-V reblocking with the SM120 hardware conversion helper.
+- Moved shared FP4/FP8 quantization helpers into
+  fmha_nvfp4_sm120_quantization.cuh.
+- Removed dead D128/D256 direct-fragment and cp.async experiment helpers.
+- Made paged-vs-dense load mode explicit at the csrc instantiation sites:
+  the paged source shard instantiates kUsePagedKv=true only, and the dense
+  source shard instantiates kUsePagedKv=false only.
+```
+
 ## Production Header Cleanup: Direct CUTLASS Kernel Args
 
 Removed the remaining dependency on FlashInfer's FP4 GEMM runner facade from
@@ -14562,6 +14756,158 @@ using a lower-optimization dev-build mode; it is no longer a production header
 scaffolding issue.
 ```
 
+## Production Paged JIT: Binding/Stage Source Split
+
+The production paged JIT module was split into a light TVM-FFI binding object
+and a heavy per-head-dim stage object:
+
+```text
+csrc/fmha_nvfp4_sm120_d128.cu          binding only
+csrc/fmha_nvfp4_sm120_d128_stage.cu    D128 fused stage
+csrc/fmha_nvfp4_sm120_d256.cu          binding only
+csrc/fmha_nvfp4_sm120_d256_stage.cu    D256 fused stage
+csrc/fmha_nvfp4_sm120_d512.cu          binding only
+csrc/fmha_nvfp4_sm120_d512_stage.cu    D512 fused stage
+csrc/fmha_nvfp4_sm120_paged_stage.cuh  raw stage ABI/config
+```
+
+D128 clean rebuild result:
+
+```text
+before split:
+  clean JIT wall time: 362.72 s
+  CUDA object:         10.47 MB
+
+after binding/stage split:
+  clean JIT wall time: 346.64 s
+  binding object:      0.77 MB
+  stage object:        9.75 MB
+  output_finite:       true
+```
+
+A follow-up attempt to move the Q quantization kernel into a third csrc object
+compiled and ran, but regressed cold compile time:
+
+```text
+binding/stage/quant split:
+  clean JIT wall time: 371.09 s
+  stage object:        9.74 MB
+  quant object:        0.02 MB
+```
+
+That split was reverted. The quantizer is not the compile bottleneck; the fused
+stage kernel is. Additional wrapper/object splitting is unlikely to move the
+number materially.
+
+Useful object-level diagnosis:
+
+```text
+stage kernel resource usage:
+  registers/thread: 164
+  stack:            272
+  static shared:    1024
+
+stage object text:
+  .text.<stage kernel>:           ~3.19 MB
+  .nv.capmerc.text.<stage kernel>: ~6.41 MB
+```
+
+Conclusion:
+
+```text
+The remaining compile-time lever is reducing or specializing the monolithic
+stage kernel body itself. A PR-idiomatic next step would be generated module
+specialization by semantic mode (for example causal/sliding/logits-cap variants
+like existing FlashInfer module keys), not a private O2 env flag and not more
+binding-layer object splits.
+```
+
+Integration fix:
+
+```text
+The Python wrapper had D128 padding set to tile_m=128 while the D128 compiled
+stage uses kCutlassTileM=64. The wrapper now uses tile_m=64 for D128/D256 and
+tile_m=128 for D512 so q scratch padding matches the active stage config.
+```
+
+## JIT Specialization Pattern Search
+
+Source search across FlashInfer's JIT attention stack shows three existing
+specialization mechanisms:
+
+```text
+1. URI/config specialization:
+   modules.py includes dtype/head_dim/use_swa/use_logits_cap in the module URI
+   and renders a generated *_config.inc with constexpr values.
+
+2. Source sharding:
+   single_prefill and batch_prefill render separate kernel_inst .cu files for
+   each mask mode, plus light binding .cu files. This keeps each ptxas unit
+   smaller than one mega-TU with every mask path.
+
+3. In-TU dispatch macros:
+   DISPATCH_HEAD_DIM, DISPATCH_MASK_MODE, DISPATCH_CTA_TILE_Q, and similar
+   macros turn small runtime axes into constexpr template instantiations at the
+   host launch boundary. This is used when the cartesian product is bounded and
+   does not pull large unrelated producer pipelines into one device function.
+```
+
+Relevant examples:
+
+```text
+single_prefill:
+  csrc/single_prefill_customize_config.jinja
+  csrc/single_prefill_kernel_inst.jinja
+  gen_customize_single_prefill_module(...)
+
+batch_prefill:
+  csrc/batch_prefill_customize_config.jinja
+  csrc/batch_prefill_paged_kernel_inst.jinja
+  csrc/batch_prefill_ragged_kernel_inst.jinja
+  gen_customize_batch_prefill_module(...)
+
+batch_attention:
+  csrc/batch_attention_customize_config.jinja
+  csrc/batch_attention_paged_kernel_inst.jinja
+```
+
+How this applies to SM120 NVFP4:
+
+```text
+Current hot runtime axes inside the stage:
+  causal
+  sliding_window > 0
+  logits_soft_cap > 0
+  v_cache_uses_pv_layout
+  kv_layout_hnd
+  v_scales_trtllm_interleaved
+
+The first three match existing FlashInfer semantic-mode specialization and
+should be part of the generated module URI/config.
+
+v_cache_uses_pv_layout is also stage-structure-specializing for this kernel:
+the false branch pulls in the normal-V reblock/conversion path, including E2M1
+conversion and scale-layout logic. Production should compile a PV-layout-V
+module and keep normal-V as a separate compatibility module if needed.
+
+kv_layout_hnd and v_scales_trtllm_interleaved are layout axes. Existing
+FlashInfer kernels often keep NHD/HND as host-side stride setup, but in this
+kernel the layout flag appears in device address functions on the hot producer
+path. If compile time remains pathological after PV-layout and semantic-mode
+specialization, NHD/HND should become a module key too. For the vLLM/Gemma
+target, NHD + PV-layout V is the production specialization.
+```
+
+Do not compile every combination in one module:
+
+```text
+The D256 ptxas job ran for more than 30 minutes with the current monolithic
+stage TU before it was killed. Expanding all six booleans into a cartesian set
+inside one JIT module would likely make total cold-build time worse. The
+FlashInfer-compatible route is one generated module per planned semantic/layout
+mode, cached by URI, with the wrapper selecting that module during plan().
+```
+
 ## Restore 180-Cell Sweep Defaults
 
 `bench_sm120_nvfp4_attention_grid.py` now treats `--q-lens all --kv-lens all
@@ -14667,4 +15013,222 @@ bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused --head-dim 128
 
 status: ok
 command includes: bench_fmha_nvfp4_sm120.py --mode paged-wrapper
+```
+
+## SM120 NVFP4 Specialization Axes
+
+The previous "JIT Specialization Pattern Search" note listed `kv_layout_hnd`
+as a possible future module key. After rechecking the wrapper constraints and
+the device code paths, that should not be the next specialization axis.
+
+Current module key:
+
+```text
+head_dim
+causal
+use_sliding_window
+use_logits_soft_cap
+v_cache_uses_pv_layout
+```
+
+Runtime layout params:
+
+```text
+kv_layout_hnd
+v_scales_trtllm_interleaved
+```
+
+Reason:
+
+```text
+- causal / sliding / soft-cap remove score-path code regions.
+- v_cache_uses_pv_layout removes or includes the normal-V reblock path.
+- kv_layout_hnd is address-stride selection, not a separate structural path.
+- v_scales_trtllm_interleaved is likewise scale-address layout.
+- The wrapper rejects PV-layout V with HND, so that invalid combination is not
+  compiled.
+```
+
+## Dense/Paged Source Sharding
+
+The self-contained one-TU-per-head-dim cleanup preserved internal linkage but
+compiled both dense and paged stage instantiations sequentially in the same
+CUDA translation unit. That matched neither the compile-time goal nor the
+batch_prefill source-sharding idiom.
+
+The module now keeps the single generated module/`.so` surface:
+
+```text
+quantize_q
+run_paged_batch
+run_dense
+```
+
+but splits the heavy launch surfaces into separate CUDA source shards:
+
+```text
+csrc/fmha_nvfp4_sm120_d{D}.cu        light quantize_q binding
+csrc/fmha_nvfp4_sm120_d{D}_paged.cu  kUsePagedKv=true stage instantiation
+csrc/fmha_nvfp4_sm120_d{D}_dense.cu  kUsePagedKv=false stage instantiation
+```
+
+This matches the FlashInfer pattern used by batch_prefill, where related entry
+points live in one module but separate kernel-inst source files compile in
+parallel.
+
+Cold compile result after source sharding:
+
+```text
+spec                                                   real time   CUDA objects
+----------------------------------------------------   ---------   -----------------------------
+D128 causal=false/swa=false/softcap=false/pv_v=true    40.64 s     d128 + d128_paged + d128_dense
+D256 causal=false/swa=false/softcap=false/pv_v=true    41.81 s     d256 + d256_paged + d256_dense
+D512 causal=false/swa=false/softcap=false/pv_v=true    51.88 s     d512 + d512_paged + d512_dense
+```
+
+Object-size examples:
+
+```text
+D256:
+  csrc_fmha_nvfp4_sm120_d256.cuda.o         0.13 MB
+  csrc_fmha_nvfp4_sm120_d256_paged.cuda.o   1.40 MB
+  csrc_fmha_nvfp4_sm120_d256_dense.cuda.o   0.71 MB
+  final .so                                 1.51 MB
+
+D512:
+  csrc_fmha_nvfp4_sm120_d512.cuda.o         0.13 MB
+  csrc_fmha_nvfp4_sm120_d512_paged.cuda.o   1.88 MB
+  csrc_fmha_nvfp4_sm120_d512_dense.cuda.o   0.98 MB
+  final .so                                 2.28 MB
+```
+
+Validation after source sharding:
+
+```text
+py_compile:
+  flashinfer/jit/attention/modules.py
+  flashinfer/fmha_nvfp4_sm120.py
+  benchmarks/bench_fmha_nvfp4_sm120.py
+status: passed
+
+paged-wrapper smoke:
+  D128 q=128 kv=128 group=2: finite output
+  D256 q=128 kv=128 group=2: finite output
+  D512 q=128 kv=128 group=2: finite output
+
+dense export smoke:
+  D128 q=128 kv=128 group=2: finite output
+  D256 q=128 kv=128 group=2: finite output
+
+semantic config smoke:
+  D256 q=128 kv=128 group=2
+  causal=true
+  sliding_window=128
+  logits_soft_cap=50.0
+status: finite output
+
+targeted normal-V/PV/HND test:
+  tests/attention/test_nvfp4_kv_head_dim_512.py::
+    test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x[128-4]
+status: passed
+```
+
+## Benchmark Naming And Metric Schema
+
+The benchmark entry point has been renamed from the development-era name:
+
+```text
+benchmarks/bench_fmha_nvfp4_sm120.py
+```
+
+to the production-facing name:
+
+```text
+benchmarks/bench_sm120_nvfp4_attention.py
+```
+
+The timing metric key is now stable:
+
+```text
+sm120_nvfp4_attention
+```
+
+The old metric keys encoded fixed implementation history:
+
+```text
+bench_sm120_qkv_online_register_q_splitkv_full_grid
+bench_sm120_qkv_online_register_q_splitkv_reuse{2,4}_full_grid
+```
+
+Those names should not be part of the benchmark schema. Runtime/config inputs
+remain separate fields, including:
+
+```text
+q_len
+kv_len
+head_dim
+group
+split_kv_len
+output_group_span
+causal
+sliding_window
+logits_soft_cap
+mode / production_paged_wrapper
+```
+
+The grid harnesses now read `sm120_nvfp4_attention` instead of searching for
+implementation-specific metric names.
+
+Validation:
+
+```text
+py_compile:
+  benchmarks/bench_sm120_nvfp4_attention.py
+  benchmarks/bench_sm120_nvfp4_attention_grid.py
+  benchmarks/bench_gemma4_attention_grid.py
+status: passed
+
+bench_sm120_nvfp4_attention.py --mode paged-wrapper
+  q=128 kv=128 D=128 group=2
+status: output_finite=true, emitted sm120_nvfp4_attention timing key
+
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused
+  q=128 kv=128 D=128 group=2
+status: parsed sm120_nvfp4_attention and wrote /tmp smoke reports
+```
+
+## Benchmark API Field
+
+The benchmark output now uses a single `api` field to label the entry shape:
+
+```text
+api: "paged"   # BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper path
+api: "dense"   # direct dense FFI path
+```
+
+The intermediate `production_paged_wrapper`, `entry_point`, and `kv_source`
+fields were removed from live benchmark code. They either implied a production
+status distinction that is no longer accurate or duplicated the same
+paged/dense distinction.
+
+Validation:
+
+```text
+py_compile:
+  benchmarks/bench_sm120_nvfp4_attention.py
+  benchmarks/bench_sm120_nvfp4_attention_grid.py
+  benchmarks/bench_gemma4_attention_grid.py
+status: passed
+
+bench_sm120_nvfp4_attention.py --mode paged-wrapper
+  q=128 kv=128 D=128 group=2
+status: output_finite=true, emitted api="paged"
+
+bench_sm120_nvfp4_attention.py --mode dense
+  q=128 kv=128 D=128 group=2
+status: output_finite=true, emitted api="dense"
+
+bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused
+  q=128 kv=128 D=128 group=2
+status: parsed sm120_nvfp4_attention and wrote /tmp smoke reports
 ```

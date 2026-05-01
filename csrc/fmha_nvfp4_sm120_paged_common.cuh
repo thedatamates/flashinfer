@@ -11,6 +11,7 @@
 
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_quantization.cuh>
 
+#include "fmha_nvfp4_sm120_paged_stage.cuh"
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer {
@@ -18,16 +19,11 @@ namespace sm120_nvfp4_paged {
 
 namespace sm120 = attention::blackwell::sm120_nvfp4;
 
-__global__ void CopyQToPaddedBatchKernel(const uint8_t* q_packed,
-                                         const uint8_t* q_scales,
-                                         const int32_t* qo_indptr,
-                                         uint8_t* q_packed_scratch,
-                                         uint8_t* q_scales_scratch,
-                                         int batch_size,
-                                         int group_size,
-                                         int padded_q_rows_per_seq,
-                                         int packed_dim,
-                                         int scale_dim) {
+static __global__ void CopyQToPaddedBatchKernel(
+    const uint8_t* q_packed, const uint8_t* q_scales,
+    const int32_t* qo_indptr, uint8_t* q_packed_scratch,
+    uint8_t* q_scales_scratch, int batch_size, int group_size,
+    int padded_q_rows_per_seq, int packed_dim, int scale_dim) {
   const int global_row = static_cast<int>(blockIdx.x);
   if (padded_q_rows_per_seq <= 0) {
     return;
@@ -53,13 +49,10 @@ __global__ void CopyQToPaddedBatchKernel(const uint8_t* q_packed,
   }
 }
 
-__global__ void CopyPaddedBatchOutKernel(const __nv_bfloat16* out_scratch,
-                                         __nv_bfloat16* out,
-                                         const int32_t* qo_indptr,
-                                         int batch_size,
-                                         int group_size,
-                                         int padded_q_rows_per_seq,
-                                         int head_dim) {
+static __global__ void CopyPaddedBatchOutKernel(
+    const __nv_bfloat16* out_scratch, __nv_bfloat16* out,
+    const int32_t* qo_indptr, int batch_size, int group_size,
+    int padded_q_rows_per_seq, int head_dim) {
   const int global_row = static_cast<int>(blockIdx.x);
   if (padded_q_rows_per_seq <= 0) {
     return;
@@ -83,7 +76,7 @@ __global__ void CopyPaddedBatchOutKernel(const __nv_bfloat16* out_scratch,
   }
 }
 
-__global__ void Sm120Nvfp4SplitKvCombineBatchKernel(
+static __global__ void Sm120Nvfp4SplitKvCombineBatchKernel(
     const __nv_bfloat16* partial,
     const float* split_m,
     const float* split_l,
@@ -161,8 +154,8 @@ __global__ void Sm120Nvfp4SplitKvCombineBatchKernel(
   }
 }
 
-void CheckCudaTypeLastDimContiguous(TensorView tensor, DLDataType dtype,
-                                    const char* name) {
+static void CheckCudaTypeLastDimContiguous(TensorView tensor, DLDataType dtype,
+                                           const char* name) {
   CHECK_CUDA(tensor);
   TVM_FFI_ICHECK_EQ(tensor.dtype(), dtype)
       << "Inconsistency of Tensor type: " << name;
@@ -170,62 +163,197 @@ void CheckCudaTypeLastDimContiguous(TensorView tensor, DLDataType dtype,
       << name << " must be contiguous in the last dimension";
 }
 
-template <typename Kernel>
-cudaError_t RunRawSpanDispatchPaged(
-    int64_t output_group_span, uint8_t* q_packed, uint8_t* q_scales,
-    uint8_t* k_packed, uint8_t* k_scales, uint8_t* v_pv_packed,
-    uint8_t* v_pv_scales, __nv_bfloat16* partial, float* split_m,
-    float* split_l, __nv_bfloat16* out, uint8_t* workspace,
-    size_t workspace_bytes, float qk_alpha, float pv_alpha,
-    int split_kv_tiles, int q_len, int group_size, int kv_len_tokens,
-    bool causal, int sliding_window, float logits_soft_cap, int q_rows,
-    int kv_len, cudaStream_t stream, typename Kernel::PagedParams paged_params,
-    const int32_t* qo_indptr = nullptr, const int32_t* kv_lens = nullptr,
-    int batch_size = 1, int q_tiles_per_sequence = 0,
-    bool skip_internal_combine = false) {
-  if (output_group_span != Kernel::kOutputGroupSpan) {
-    return cudaErrorInvalidValue;
-  }
-  return Kernel::run(q_packed, q_scales, k_packed, k_scales, v_pv_packed,
-                     v_pv_scales, partial, split_m, split_l, out, workspace,
-                     workspace_bytes, qk_alpha, pv_alpha, split_kv_tiles,
-                     q_len, group_size, kv_len_tokens, causal, sliding_window,
-                     logits_soft_cap, q_rows, kv_len, stream, paged_params,
-                     qo_indptr, kv_lens, batch_size, q_tiles_per_sequence,
-                     skip_internal_combine);
-}
-
-template <typename Kernel>
-void QuantizeQImpl(TensorView q, TensorView q_packed, TensorView q_scales) {
-  CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
+static void CheckDenseRunTensors(
+    const DenseKernelConfig& kernel, TensorView q_packed, TensorView q_scales,
+    TensorView k_packed, TensorView k_scales, TensorView v_pv_packed,
+    TensorView v_pv_scales, TensorView partial, TensorView split_m,
+    TensorView split_l, TensorView out, TensorView workspace,
+    int64_t split_kv_tiles, int64_t q_len, int64_t group_size,
+    int64_t kv_len_tokens, int64_t output_group_span, bool causal,
+    int64_t sliding_window, double logits_soft_cap) {
   CHECK_INPUT_AND_TYPE(q_packed, dl_uint8);
   CHECK_INPUT_AND_TYPE(q_scales, dl_uint8);
-  TVM_FFI_ICHECK(q.ndim() == 2 || q.ndim() == 3)
-      << "q must have shape [rows, D] or [q_len, group, D]";
-  const int64_t q_rows = q.ndim() == 3 ? q.size(0) * q.size(1) : q.size(0);
-  const int64_t head_dim = q.ndim() == 3 ? q.size(2) : q.size(1);
-  TVM_FFI_ICHECK_EQ(head_dim, Kernel::kHeadDim)
-      << "SM120 NVFP4 module/head_dim mismatch";
-  TVM_FFI_ICHECK_EQ(q_packed.ndim(), 2);
-  TVM_FFI_ICHECK_EQ(q_packed.size(0), q_rows);
-  TVM_FFI_ICHECK_EQ(q_packed.size(1), head_dim / 2);
-  TVM_FFI_ICHECK_EQ(q_scales.ndim(), 2);
-  TVM_FFI_ICHECK(q_scales.size(0) >= q_rows);
-  TVM_FFI_ICHECK_EQ(q_scales.size(1), head_dim / 16);
+  CHECK_INPUT_AND_TYPE(k_packed, dl_uint8);
+  CHECK_INPUT_AND_TYPE(k_scales, dl_uint8);
+  CHECK_INPUT_AND_TYPE(v_pv_packed, dl_uint8);
+  CHECK_INPUT_AND_TYPE(v_pv_scales, dl_uint8);
+  CHECK_INPUT_AND_TYPE(partial, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(split_m, dl_float32);
+  CHECK_INPUT_AND_TYPE(split_l, dl_float32);
+  CHECK_INPUT_AND_TYPE(out, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(workspace, dl_uint8);
+  CHECK_DIM(2, q_packed);
+  CHECK_DIM(2, q_scales);
+  CHECK_DIM(2, k_packed);
+  CHECK_DIM(2, k_scales);
+  CHECK_DIM(2, v_pv_packed);
+  CHECK_DIM(2, v_pv_scales);
+  CHECK_DIM(3, partial);
+  CHECK_DIM(2, split_m);
+  CHECK_DIM(2, split_l);
+  CHECK_DIM(2, out);
+  CHECK_DIM(1, workspace);
 
-  ffi::CUDADeviceGuard device_guard(q.device().device_id);
-  const cudaStream_t stream = get_stream(q.device());
-  cudaError_t status = sm120::quantize_q_rowmajor_raw(
-      static_cast<const __nv_bfloat16*>(q.data_ptr()),
-      static_cast<uint8_t*>(q_packed.data_ptr()),
-      static_cast<uint8_t*>(q_scales.data_ptr()), static_cast<int>(q_rows),
-      static_cast<int>(head_dim), stream);
-  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "SM120 NVFP4 Q quantization failed: " << cudaGetErrorString(status);
+  const int64_t q_rows = q_packed.size(0);
+  const int64_t head_dim = q_packed.size(1) * 2;
+  const int64_t scale_cols = head_dim / 16;
+  const int64_t kv_len = k_packed.size(0);
+  TVM_FFI_ICHECK_EQ(head_dim, kernel.head_dim)
+      << "SM120 NVFP4 module/head_dim mismatch";
+  TVM_FFI_ICHECK_EQ(causal, kernel.causal)
+      << "SM120 NVFP4 module dense causal mode mismatch";
+  TVM_FFI_ICHECK_EQ(sliding_window > 0, kernel.use_sliding_window)
+      << "SM120 NVFP4 module dense sliding-window mode mismatch";
+  TVM_FFI_ICHECK_EQ(logits_soft_cap > 0.0, kernel.use_logits_soft_cap)
+      << "SM120 NVFP4 module dense logits-soft-cap mode mismatch";
+  TVM_FFI_ICHECK(q_rows > 0 && q_rows % kernel.tile_m == 0)
+      << "q rows must be a positive multiple of tile_m=" << kernel.tile_m;
+  TVM_FFI_ICHECK(kv_len > 0 && kv_len % 128 == 0)
+      << "KV length must be a positive multiple of 128";
+  TVM_FFI_ICHECK(kv_len <= 262144) << "KV length exceeds 256K";
+  TVM_FFI_ICHECK(split_kv_tiles > 0) << "split_kv_tiles must be positive";
+  TVM_FFI_ICHECK(q_len > 0) << "q_len must be positive";
+  TVM_FFI_ICHECK(group_size > 0) << "group_size must be positive";
+  TVM_FFI_ICHECK(q_len * group_size <= q_rows)
+      << "q_len * group_size must not exceed q_packed rows";
+  TVM_FFI_ICHECK(kv_len_tokens > 0 && kv_len_tokens <= kv_len)
+      << "kv_len_tokens must be positive and not exceed physical KV length";
+  TVM_FFI_ICHECK_EQ(output_group_span, kernel.output_group_span)
+      << "dense output_group_span does not match generated SM120 NVFP4 module";
+  TVM_FFI_ICHECK_EQ(q_scales.size(0), q_rows);
+  TVM_FFI_ICHECK_EQ(q_scales.size(1), scale_cols);
+  TVM_FFI_ICHECK_EQ(k_packed.size(1), head_dim / 2);
+  TVM_FFI_ICHECK_EQ(k_scales.size(0), kv_len);
+  TVM_FFI_ICHECK_EQ(k_scales.size(1), scale_cols);
+  TVM_FFI_ICHECK_EQ(v_pv_packed.size(0), head_dim);
+  TVM_FFI_ICHECK_EQ(v_pv_packed.size(1), kv_len / 2);
+  TVM_FFI_ICHECK_EQ(v_pv_scales.size(0), head_dim);
+  TVM_FFI_ICHECK_EQ(v_pv_scales.size(1), kv_len / 16);
+  const int64_t total_kv_tiles = kv_len / 128;
+  const int64_t num_splits =
+      (total_kv_tiles + split_kv_tiles - 1) / split_kv_tiles;
+  TVM_FFI_ICHECK_EQ(partial.size(0), num_splits);
+  TVM_FFI_ICHECK_EQ(partial.size(1), q_rows);
+  TVM_FFI_ICHECK_EQ(partial.size(2), head_dim);
+  TVM_FFI_ICHECK_EQ(split_m.size(0), num_splits);
+  TVM_FFI_ICHECK_EQ(split_m.size(1), q_rows);
+  TVM_FFI_ICHECK_EQ(split_l.size(0), num_splits);
+  TVM_FFI_ICHECK_EQ(split_l.size(1), q_rows);
+  TVM_FFI_ICHECK_EQ(out.size(0), q_rows);
+  TVM_FFI_ICHECK_EQ(out.size(1), head_dim);
 }
 
-template <typename Kernel>
-void RunPagedBatchImpl(
+static __global__ void DenseSplitKvCombineKernel(const __nv_bfloat16* partial,
+                                                 const float* split_m,
+                                                 const float* split_l,
+                                                 __nv_bfloat16* out,
+                                                 int num_splits, int q_rows,
+                                                 int head_dim) {
+  const int row = static_cast<int>(blockIdx.x);
+  if (row >= q_rows) {
+    return;
+  }
+  extern __shared__ float split_weights[];
+
+  if (threadIdx.x == 0) {
+    float global_m = -INFINITY;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      global_m = fmaxf(global_m, split_m[split * q_rows + row]);
+    }
+
+    float global_l = 0.0f;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      const int stats_idx = split * q_rows + row;
+      const float correction =
+          sm120::finite_f32(global_m) ? __expf(split_m[stats_idx] - global_m)
+                                      : 0.0f;
+      split_weights[split] = correction;
+      global_l += correction * split_l[stats_idx];
+    }
+    const float inv_global_l = global_l > 0.0f ? 1.0f / global_l : 0.0f;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      split_weights[split] *= inv_global_l;
+    }
+  }
+  __syncthreads();
+
+  for (int col = static_cast<int>(threadIdx.x); col < head_dim;
+       col += static_cast<int>(blockDim.x)) {
+    float acc = 0.0f;
+#pragma unroll 1
+    for (int split = 0; split < num_splits; ++split) {
+      const int partial_idx = (split * q_rows + row) * head_dim + col;
+      acc += split_weights[split] * __bfloat162float(partial[partial_idx]);
+    }
+    out[row * head_dim + col] = __float2bfloat16(acc);
+  }
+}
+
+static void RunDenseImpl(
+    const DenseKernelConfig& kernel, TensorView q_packed, TensorView q_scales,
+    TensorView k_packed, TensorView k_scales, TensorView v_pv_packed,
+    TensorView v_pv_scales, TensorView partial, TensorView split_m,
+    TensorView split_l, TensorView out, TensorView workspace, double qk_alpha,
+    double pv_alpha, int64_t split_kv_tiles, int64_t q_len,
+    int64_t group_size, int64_t kv_len_tokens, bool causal,
+    int64_t sliding_window, double logits_soft_cap,
+    int64_t output_group_span) {
+  CheckDenseRunTensors(kernel, q_packed, q_scales, k_packed, k_scales,
+                       v_pv_packed, v_pv_scales, partial, split_m, split_l,
+                       out, workspace, split_kv_tiles, q_len, group_size,
+                       kv_len_tokens, output_group_span, causal,
+                       sliding_window, logits_soft_cap);
+  ffi::CUDADeviceGuard device_guard(q_packed.device().device_id);
+  const cudaStream_t stream = get_stream(q_packed.device());
+  const int q_rows = static_cast<int>(q_packed.size(0));
+  const int kv_len = static_cast<int>(k_packed.size(0));
+  const int head_dim = kernel.head_dim;
+  cudaError_t status = kernel.run(
+      static_cast<uint8_t*>(q_packed.data_ptr()),
+      static_cast<uint8_t*>(q_scales.data_ptr()),
+      static_cast<uint8_t*>(k_packed.data_ptr()),
+      static_cast<uint8_t*>(k_scales.data_ptr()),
+      static_cast<uint8_t*>(v_pv_packed.data_ptr()),
+      static_cast<uint8_t*>(v_pv_scales.data_ptr()),
+      static_cast<__nv_bfloat16*>(partial.data_ptr()),
+      static_cast<float*>(split_m.data_ptr()),
+      static_cast<float*>(split_l.data_ptr()),
+      static_cast<__nv_bfloat16*>(out.data_ptr()),
+      static_cast<uint8_t*>(workspace.data_ptr()),
+      workspace.size(0) * get_element_size(workspace),
+      static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
+      static_cast<int>(split_kv_tiles), static_cast<int>(q_len),
+      static_cast<int>(group_size), static_cast<int>(kv_len_tokens), causal,
+      static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
+      q_rows, kv_len, stream);
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "SM120 NVFP4 FMHA dense run failed: " << cudaGetErrorString(status);
+
+  const int total_kv_tiles = kv_len / 128;
+  const int num_splits =
+      (total_kv_tiles + static_cast<int>(split_kv_tiles) - 1) /
+      static_cast<int>(split_kv_tiles);
+  if (num_splits <= 1) {
+    return;
+  }
+  DenseSplitKvCombineKernel<<<q_rows, 256,
+                              static_cast<size_t>(num_splits) * sizeof(float),
+                              stream>>>(
+      static_cast<const __nv_bfloat16*>(partial.data_ptr()),
+      static_cast<const float*>(split_m.data_ptr()),
+      static_cast<const float*>(split_l.data_ptr()),
+      static_cast<__nv_bfloat16*>(out.data_ptr()), num_splits, q_rows,
+      head_dim);
+  status = cudaGetLastError();
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "SM120 NVFP4 FMHA dense combine failed: " << cudaGetErrorString(status);
+}
+
+static void RunPagedBatchImpl(
+    const PagedKernelConfig& kernel,
     TensorView q_packed, TensorView q_scales, TensorView k_pages,
     TensorView k_sf_pages, TensorView v_pages_pv, TensorView v_sf_pages_pv,
     TensorView block_tables, TensorView qo_indptr, TensorView kv_lens,
@@ -286,8 +414,17 @@ void RunPagedBatchImpl(
   const int64_t packed_dim = k_pages.size(3);
   const int64_t scale_dim = k_sf_pages.size(3);
   const int64_t head_dim = packed_dim * 2;
-  TVM_FFI_ICHECK_EQ(head_dim, Kernel::kHeadDim)
+  TVM_FFI_ICHECK_EQ(head_dim, kernel.head_dim)
       << "SM120 NVFP4 module/head_dim mismatch";
+  TVM_FFI_ICHECK_EQ(causal, kernel.causal)
+      << "SM120 NVFP4 module was generated for causal=" << kernel.causal
+      << " but paged_run received causal=" << causal;
+  TVM_FFI_ICHECK_EQ(sliding_window > 0, kernel.use_sliding_window)
+      << "SM120 NVFP4 module sliding-window mode mismatch";
+  TVM_FFI_ICHECK_EQ(logits_soft_cap > 0.0, kernel.use_logits_soft_cap)
+      << "SM120 NVFP4 module logits-soft-cap mode mismatch";
+  TVM_FFI_ICHECK_EQ(v_cache_uses_pv_layout, kernel.v_cache_uses_pv_layout)
+      << "SM120 NVFP4 module V-cache layout mode mismatch";
   TVM_FFI_ICHECK(!v_cache_uses_pv_layout || !kv_layout_hnd)
       << "PV-layout V pages are currently supported only with NHD layout";
   TVM_FFI_ICHECK_EQ(page_size, 16)
@@ -299,7 +436,7 @@ void RunPagedBatchImpl(
       << "kv_head out of range";
   TVM_FFI_ICHECK(split_kv_tiles > 0) << "split_kv_tiles must be positive";
   TVM_FFI_ICHECK(group_size > 0) << "group_size must be positive";
-  TVM_FFI_ICHECK_EQ(output_group_span, Kernel::kOutputGroupSpan)
+  TVM_FFI_ICHECK_EQ(output_group_span, kernel.output_group_span)
       << "non-default output_group_span is not compiled into the production "
          "SM120 NVFP4 paged module";
   TVM_FFI_ICHECK_EQ(q_packed.size(1), packed_dim);
@@ -332,10 +469,10 @@ void RunPagedBatchImpl(
       << "q scratch rows must be divisible by batch size";
   const int64_t padded_q_rows_per_seq = q_packed_scratch.size(0) / batch;
   TVM_FFI_ICHECK(padded_q_rows_per_seq > 0 &&
-                 padded_q_rows_per_seq % Kernel::kTileM == 0)
+                 padded_q_rows_per_seq % kernel.tile_m == 0)
       << "per-sequence q scratch rows must be a positive multiple of tile_m";
   const int64_t total_padded_q_rows = q_packed_scratch.size(0);
-  const int64_t q_tiles_per_sequence = padded_q_rows_per_seq / Kernel::kTileM;
+  const int64_t q_tiles_per_sequence = padded_q_rows_per_seq / kernel.tile_m;
   const int64_t physical_kv_len = max_physical_kv_len;
   TVM_FFI_ICHECK(physical_kv_len > 0 && physical_kv_len % 128 == 0)
       << "max physical KV length must be a positive multiple of 128";
@@ -364,7 +501,7 @@ void RunPagedBatchImpl(
       << "SM120 NVFP4 batch Q pad copy failed: "
       << cudaGetErrorString(status);
 
-  typename Kernel::PagedParams paged_params{};
+  PagedParams paged_params{};
   paged_params.k_pages = static_cast<const uint8_t*>(k_pages.data_ptr());
   paged_params.k_scales = static_cast<const uint8_t*>(k_sf_pages.data_ptr());
   paged_params.v_pages = static_cast<const uint8_t*>(v_pages_pv.data_ptr());
@@ -399,17 +536,17 @@ void RunPagedBatchImpl(
       normal_v_scales_are_trtllm_interleaved ? 1 : 0;
   paged_params.v_global_scale = static_cast<float>(pv_alpha);
 
-  status = RunRawSpanDispatchPaged<Kernel>(
-      output_group_span, q_scratch_ptr, q_sf_scratch_ptr,
+  status = kernel.run(
+      q_scratch_ptr, q_sf_scratch_ptr,
       static_cast<uint8_t*>(k_pages.data_ptr()),
       static_cast<uint8_t*>(k_sf_pages.data_ptr()),
       static_cast<uint8_t*>(v_pages_pv.data_ptr()),
       static_cast<uint8_t*>(v_sf_pages_pv.data_ptr()), partial_ptr,
       split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
-      workspace_bytes, static_cast<float>(qk_alpha), static_cast<float>(pv_alpha),
-      static_cast<int>(split_kv_tiles), 0, static_cast<int>(group_size), 0,
-      causal, static_cast<int>(sliding_window),
-      static_cast<float>(logits_soft_cap),
+      workspace_bytes, static_cast<float>(qk_alpha),
+      static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles), 0,
+      static_cast<int>(group_size), 0, causal,
+      static_cast<int>(sliding_window), static_cast<float>(logits_soft_cap),
       static_cast<int>(total_padded_q_rows),
       static_cast<int>(physical_kv_len), stream, paged_params, qo_indptr_ptr,
       kv_lens_ptr, static_cast<int>(batch),

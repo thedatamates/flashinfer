@@ -112,7 +112,7 @@ def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]
     output_group_span = fused_output_group_span(args)
     return [
         sys.executable,
-        str(root / "benchmarks" / "bench_fmha_nvfp4_sm120.py"),
+        str(root / "benchmarks" / "bench_sm120_nvfp4_attention.py"),
         "--device",
         str(args.device),
         "--mode",
@@ -199,12 +199,7 @@ def summarize(
     fused_output_group_span: int,
 ) -> dict[str, Any]:
     if kernel == "sm120_fused":
-        bench_keys = [
-            key for key in data if key.startswith("bench_sm120_qkv_online")
-        ]
-        if len(bench_keys) != 1:
-            raise KeyError(f"expected one SM120 fused bench key, got {bench_keys}")
-        bench = data[bench_keys[0]]
+        bench = data["sm120_nvfp4_attention"]
         return {
             "q": cell.q_len,
             "kv": cell.kv_len,
