@@ -45,6 +45,9 @@ from .attention import gen_fmha_cutlass_sm100a_module as gen_fmha_cutlass_sm100a
 from .attention import (
     gen_fmha_nvfp4_sm120_module as gen_fmha_nvfp4_sm120_module,
 )
+from .attention import (
+    gen_fmha_nvfp4_sm120_dense_module as gen_fmha_nvfp4_sm120_dense_module,
+)
 from .attention import gen_batch_pod_module as gen_batch_pod_module
 from .attention import gen_pod_module as gen_pod_module
 from .attention import gen_single_decode_module as gen_single_decode_module

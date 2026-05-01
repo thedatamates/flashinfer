@@ -66,8 +66,8 @@ def _empty_aligned(
 
 
 @functools.cache
-def _get_sm120_nvfp4_fmha_module():
-    return gen_fmha_nvfp4_sm120_module().build_and_load()
+def _get_sm120_nvfp4_fmha_module(head_dim: int):
+    return gen_fmha_nvfp4_sm120_module(head_dim).build_and_load()
 
 
 def _as_uint8_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -107,7 +107,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         self._workspace_buffer = workspace_buffer
         self.device = workspace_buffer.device
         self._kv_layout = kv_layout
-        self._module = _get_sm120_nvfp4_fmha_module()
+        self._module = None
         self._planned = False
 
     def reset_workspace_buffer(self, workspace_buffer: torch.Tensor) -> None:
@@ -192,6 +192,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         self._logits_soft_cap = float(logits_soft_cap)
         self._split_kv_tiles = int(split_kv_len // 128)
         self._output_group_span = int(output_group_span)
+        self._module = _get_sm120_nvfp4_fmha_module(self._head_dim)
 
         tile_m = _tile_m_for_head_dim(head_dim)
         max_q_rows = self._max_q_len * self._group_size
@@ -244,6 +245,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
     ) -> torch.Tensor:
         if not self._planned:
             raise RuntimeError("plan() must be called before run().")
+        if self._module is None:
+            raise RuntimeError("SM120 NVFP4 module was not initialized by plan().")
         if q.dtype != torch.bfloat16 or not q.is_cuda:
             raise ValueError("q must be a CUDA torch.bfloat16 tensor.")
         if q.shape != (

@@ -14429,6 +14429,139 @@ status: ok
 command includes: bench_fmha_nvfp4_sm120.py --mode paged-wrapper
 ```
 
+## Production Header Cleanup: Direct CUTLASS Kernel Args
+
+Removed the remaining dependency on FlashInfer's FP4 GEMM runner facade from
+the production SM120 NVFP4 attention headers.
+
+Changed:
+
+```text
+include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d128.cuh
+include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh
+include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh
+```
+
+Before:
+
+```text
+- Included flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h.
+- Declared GemmUniversalAdapter aliases solely to call prepareGemmArgsImpl.
+- Carried unused runner config aliases from the two-stage GEMM benchmark path.
+```
+
+After:
+
+```text
+- Production headers construct GemmKernel::Arguments directly.
+- QK uses CutlassGemmKernel directly.
+- PV uses CutlassGemmKernelK128Stage2 directly.
+- No FlashInfer FP4 GEMM runner adapter symbols remain in the D headers.
+```
+
+Validation:
+
+```text
+py_compile flashinfer/fmha_nvfp4_sm120.py flashinfer/jit/attention/modules.py:
+  passed
+
+rg guard:
+  no Runner / CutlassGemm adapter / prepareGemmArgsImpl / probe/source-only
+  symbols in production D headers or JIT mirror
+
+fresh JIT smoke:
+  TORCH_EXTENSIONS_DIR=/tmp/torch_extensions_sm120_nvfp4_d128_direct_args
+  bench_fmha_nvfp4_sm120.py --mode paged-wrapper
+    --q-len 128 --kv-len 128 --head-dim 128 --group 2
+    --split-kv-len 32768 --warmup 1 --repeat 1
+
+result:
+  output_finite: true
+  min_ms: 1.098176
+```
+
+## Production Header Cleanup: Paged JIT Specialization
+
+The SM120 NVFP4 production JIT path was cleaned up to remove development
+scaffolding from production headers and reduce accidental kernel emission:
+
+```text
+- Split production paged csrc by head dim:
+  csrc/fmha_nvfp4_sm120_d128.cu
+  csrc/fmha_nvfp4_sm120_d256.cu
+  csrc/fmha_nvfp4_sm120_d512.cu
+
+- Moved shared paged wrapper helpers into:
+  csrc/fmha_nvfp4_sm120_paged_common.cuh
+
+- Kept dense benchmarking behind a separate csrc module:
+  csrc/fmha_nvfp4_sm120_dense.cu
+
+- Removed probe/debug kernels from production D headers.
+
+- Removed runtime dense-vs-paged producer branching from production paged
+  instantiations. `kUsePagedKv=true` now compile-elides dense TMA K/V producer
+  bodies.
+
+- Removed `GemmUniversalAdapter` object initialization from the paged launch
+  path. The wrapper now constructs `GemmKernel::Params` directly via
+  `GemmKernel::to_underlying_arguments()`, avoiding odr-use of standalone
+  CUTLASS GEMM `device_kernel<>` launch surfaces.
+
+- Moved dense split-KV combine out of the production D headers and into
+  `csrc/fmha_nvfp4_sm120_dense.cu`. Paged production already uses the csrc
+  batch combine.
+```
+
+PTX inspection for the D512 production paged module:
+
+```text
+before direct-param cleanup:
+  PTX size:     9.34 MB
+  entry_count: 8
+  extra entries: 2 standalone CUTLASS GemmUniversal device kernels
+
+after direct-param cleanup:
+  PTX size:     9.18 MB
+  entry_count: 6
+  extra CUTLASS GemmUniversal device kernels: 0
+
+after moving dense combine out of headers:
+  PTX size:     9.17 MB
+  entry_count: 5
+  entries:
+    quantize_q_rowmajor_kernel
+    d512 sm120_nvfp4_qkv_online_register_q_stage_kernel<4, true>
+    CopyQToPaddedBatchKernel
+    CopyPaddedBatchOutKernel
+    Sm120Nvfp4SplitKvCombineBatchKernel
+```
+
+Compile status:
+
+```text
+Python syntax check:
+  py_compile flashinfer/fmha_nvfp4_sm120.py
+  py_compile flashinfer/jit/attention/modules.py
+  status: passed
+
+D512 production-paged PTX generation:
+  status: passed
+  ptxas: still very slow on the single fused stage body; stopped after PTX
+         inspection rather than leaving a long ptxas job running.
+```
+
+Learning:
+
+```text
+The large JIT compile is now isolated to the fused attention stage itself, not
+duplicated output spans, dense producer fallback, probe kernels, dense combine,
+or unused standalone CUTLASS GEMM launch kernels. Further compile-time
+improvement requires reducing the fused stage body/inlining/unroll pressure or
+using a lower-optimization dev-build mode; it is no longer a production header
+scaffolding issue.
+```
+
 ## Restore 180-Cell Sweep Defaults
 
 `bench_sm120_nvfp4_attention_grid.py` now treats `--q-lens all --kv-lens all

@@ -1796,29 +1796,47 @@ def gen_fmha_cutlass_sm100a_module(
     )
 
 
-def gen_fmha_nvfp4_sm120_module() -> JitSpec:
-    uri = "fmha_nvfp4_sm120"
+def _get_sm120_nvfp4_cutlass_include_paths():
     cutlass_root = os.environ.get("CUTLASS_ROOT")
     repo_cutlass_root = jit_env.FLASHINFER_DATA.parents[1] / "3rdparty" / "cutlass"
-    source_paths = [
-        jit_env.FLASHINFER_CSRC_DIR / "fmha_nvfp4_sm120.cu",
-    ]
-    extra_include_paths = None
     if cutlass_root:
-        extra_include_paths = [
+        return [
             os.path.join(cutlass_root, "include"),
             os.path.join(cutlass_root, "tools", "util", "include"),
         ]
-    elif repo_cutlass_root.exists():
-        extra_include_paths = [
+    if repo_cutlass_root.exists():
+        return [
             repo_cutlass_root / "include",
             repo_cutlass_root / "tools" / "util" / "include",
         ]
+    return None
+
+
+def gen_fmha_nvfp4_sm120_module(head_dim: int) -> JitSpec:
+    if head_dim not in (128, 256, 512):
+        raise ValueError("SM120 NVFP4 FMHA supports head_dim in {128, 256, 512}.")
+    uri = f"fmha_nvfp4_sm120_d{head_dim}"
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / f"fmha_nvfp4_sm120_d{head_dim}.cu",
+    ]
     return gen_jit_spec(
         uri,
         source_paths,
         extra_cuda_cflags=sm120f_nvcc_flags + ["-DFLASHINFER_ENABLE_BF16"],
-        extra_include_paths=extra_include_paths,
+        extra_include_paths=_get_sm120_nvfp4_cutlass_include_paths(),
+    )
+
+
+def gen_fmha_nvfp4_sm120_dense_module() -> JitSpec:
+    uri = "fmha_nvfp4_sm120_dense"
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_nvfp4_sm120_dense.cu",
+    ]
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=sm120f_nvcc_flags + ["-DFLASHINFER_ENABLE_BF16"],
+        extra_include_paths=_get_sm120_nvfp4_cutlass_include_paths(),
     )
 
 

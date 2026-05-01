@@ -9,7 +9,7 @@ import torch
 import flashinfer
 from flashinfer import SfLayout
 from flashinfer.fmha_nvfp4_sm120 import BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper
-from flashinfer.jit import gen_fmha_nvfp4_sm120_module
+from flashinfer.jit import gen_fmha_nvfp4_sm120_dense_module
 
 
 def default_output_group_span(head_dim: int) -> int:
@@ -262,7 +262,7 @@ def main() -> None:
     split_l = torch.empty((num_splits, q_rows), dtype=torch.float32, device=device)
     out = torch.empty((q_rows, args.head_dim), dtype=torch.bfloat16, device=device)
     workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
-    module = gen_fmha_nvfp4_sm120_module().build_and_load()
+    module = gen_fmha_nvfp4_sm120_dense_module().build_and_load()
 
     def run() -> None:
         module.run_dense(
