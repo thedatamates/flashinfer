@@ -405,10 +405,205 @@ __device__ __forceinline__ uint8_t fp32_to_e2m1_code_hw(float x) {
   return static_cast<uint8_t>(fp32_pair_to_e2m1_byte(x, x) & 0x0Fu);
 }
 
+__device__ __forceinline__ float e2m1_code_to_fp32(uint8_t code) {
+  constexpr float values[16] = {
+      0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+  return values[code & 0x0f];
+}
+
 __device__ __forceinline__ cutlass::float_ue4m3_t make_ue4m3_raw(uint8_t raw) {
   cutlass::float_ue4m3_t value;
   value.storage = raw;
   return value;
+}
+
+struct Sm120Nvfp4PagedKvLoadParams {
+  const uint8_t* k_pages = nullptr;
+  const uint8_t* k_scales = nullptr;
+  const uint8_t* v_pages = nullptr;
+  const uint8_t* v_scales = nullptr;
+  const int32_t* block_table = nullptr;
+  int64_t k_stride_page = 0;
+  int64_t k_stride_dim1 = 0;
+  int64_t k_stride_dim2 = 0;
+  int64_t k_stride_dim3 = 0;
+  int64_t k_scale_stride_page = 0;
+  int64_t k_scale_stride_dim1 = 0;
+  int64_t k_scale_stride_dim2 = 0;
+  int64_t k_scale_stride_dim3 = 0;
+  int64_t v_stride_page = 0;
+  int64_t v_stride_dim1 = 0;
+  int64_t v_stride_dim2 = 0;
+  int64_t v_stride_dim3 = 0;
+  int64_t v_scale_stride_page = 0;
+  int64_t v_scale_stride_dim1 = 0;
+  int64_t v_scale_stride_dim2 = 0;
+  int64_t v_scale_stride_dim3 = 0;
+  int kv_head = 0;
+  int page_size = 16;
+  int packed_dim = kPackedHeadDim;
+  int scale_dim = kScaleCols;
+  int kv_layout_hnd = 0;
+  int v_cache_uses_pv_layout = 0;
+  int v_scales_trtllm_interleaved = 0;
+  int native_k = 1;
+  int native_v = 1;
+  float v_global_scale = kProbGlobalScale;
+
+  __device__ __forceinline__ bool enabled() const {
+    return block_table != nullptr;
+  }
+};
+
+__device__ __forceinline__ int sm120_trtllm_v_scale_offset(int token_offset,
+                                                           int scale_col,
+                                                           int scale_dim) {
+  const int scale_group = scale_dim / 4;
+  const int swizzled_token = (token_offset / 4) * 4 + (scale_col / scale_group);
+  const int swizzled_scale = (scale_col % scale_group) * 4 + (token_offset % 4);
+  return swizzled_token * scale_dim + swizzled_scale;
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_page_code(
+    const uint8_t* pages,
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_token,
+    int dim) {
+  const int logical_page = logical_token / params.page_size;
+  const int page_offset = logical_token - logical_page * params.page_size;
+  const int physical_page = params.block_table[logical_page];
+  const int packed_col = dim >> 1;
+  const int nibble_shift = (dim & 1) * 4;
+  const int64_t src =
+      params.kv_layout_hnd
+          ? (static_cast<int64_t>(physical_page) * params.v_stride_page +
+             static_cast<int64_t>(params.kv_head) * params.v_stride_dim1 +
+             static_cast<int64_t>(page_offset) * params.v_stride_dim2 +
+             static_cast<int64_t>(packed_col) * params.v_stride_dim3)
+          : (static_cast<int64_t>(physical_page) * params.v_stride_page +
+             static_cast<int64_t>(page_offset) * params.v_stride_dim1 +
+             static_cast<int64_t>(params.kv_head) * params.v_stride_dim2 +
+             static_cast<int64_t>(packed_col) * params.v_stride_dim3);
+  const uint8_t byte = pages[src];
+  return static_cast<uint8_t>((byte >> nibble_shift) & 0x0f);
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_v_pv_page_scale(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_page,
+    int dim) {
+  const int physical_page = params.block_table[logical_page];
+  const int scale_row = dim / params.scale_dim;
+  const int scale_col = dim - scale_row * params.scale_dim;
+  const int64_t src =
+      static_cast<int64_t>(physical_page) * params.v_scale_stride_page +
+      static_cast<int64_t>(scale_row) * params.v_scale_stride_dim1 +
+      static_cast<int64_t>(params.kv_head) * params.v_scale_stride_dim2 +
+      static_cast<int64_t>(scale_col) * params.v_scale_stride_dim3;
+  return params.v_scales[src];
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_k_page_code(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_token,
+    int dim) {
+  const int logical_page = logical_token / params.page_size;
+  const int page_offset = logical_token - logical_page * params.page_size;
+  const int physical_page = params.block_table[logical_page];
+  const int packed_col = dim >> 1;
+  const int nibble_shift = (dim & 1) * 4;
+  const int64_t src =
+      params.kv_layout_hnd
+          ? (static_cast<int64_t>(physical_page) * params.k_stride_page +
+             static_cast<int64_t>(params.kv_head) * params.k_stride_dim1 +
+             static_cast<int64_t>(page_offset) * params.k_stride_dim2 +
+             static_cast<int64_t>(packed_col) * params.k_stride_dim3)
+          : (static_cast<int64_t>(physical_page) * params.k_stride_page +
+             static_cast<int64_t>(page_offset) * params.k_stride_dim1 +
+             static_cast<int64_t>(params.kv_head) * params.k_stride_dim2 +
+             static_cast<int64_t>(packed_col) * params.k_stride_dim3);
+  const uint8_t byte = params.k_pages[src];
+  return static_cast<uint8_t>((byte >> nibble_shift) & 0x0f);
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_k_page_scale(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_token,
+    int scale_col) {
+  const int logical_page = logical_token / params.page_size;
+  const int page_offset = logical_token - logical_page * params.page_size;
+  const int physical_page = params.block_table[logical_page];
+  const int64_t src =
+      params.kv_layout_hnd
+          ? (static_cast<int64_t>(physical_page) * params.k_scale_stride_page +
+             static_cast<int64_t>(params.kv_head) * params.k_scale_stride_dim1 +
+             static_cast<int64_t>(page_offset) * params.k_scale_stride_dim2 +
+             static_cast<int64_t>(scale_col) * params.k_scale_stride_dim3)
+          : (static_cast<int64_t>(physical_page) * params.k_scale_stride_page +
+             static_cast<int64_t>(page_offset) * params.k_scale_stride_dim1 +
+             static_cast<int64_t>(params.kv_head) * params.k_scale_stride_dim2 +
+             static_cast<int64_t>(scale_col) * params.k_scale_stride_dim3);
+  return params.k_scales[src];
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_v_page_scale(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_token,
+    int scale_col) {
+  const int logical_page = logical_token / params.page_size;
+  const int page_offset = logical_token - logical_page * params.page_size;
+  const int physical_page = params.block_table[logical_page];
+  int scale_offset = page_offset * params.scale_dim + scale_col;
+  if (params.v_scales_trtllm_interleaved) {
+    scale_offset = sm120_trtllm_v_scale_offset(page_offset, scale_col,
+                                               params.scale_dim);
+  }
+  const int scale_t = scale_offset / params.scale_dim;
+  const int scale_s = scale_offset - scale_t * params.scale_dim;
+  const int64_t src =
+      params.kv_layout_hnd
+          ? (static_cast<int64_t>(physical_page) * params.v_scale_stride_page +
+             static_cast<int64_t>(params.kv_head) * params.v_scale_stride_dim1 +
+             static_cast<int64_t>(scale_t) * params.v_scale_stride_dim2 +
+             static_cast<int64_t>(scale_s) * params.v_scale_stride_dim3)
+          : (static_cast<int64_t>(physical_page) * params.v_scale_stride_page +
+             static_cast<int64_t>(scale_t) * params.v_scale_stride_dim1 +
+             static_cast<int64_t>(params.kv_head) * params.v_scale_stride_dim2 +
+             static_cast<int64_t>(scale_s) * params.v_scale_stride_dim3);
+  return params.v_scales[src];
+}
+
+__device__ __forceinline__ float sm120_nvfp4_v_standard_value(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_token,
+    int dim) {
+  const uint8_t code =
+      sm120_nvfp4_page_code(params.v_pages, params, logical_token, dim);
+  const uint8_t scale =
+      sm120_nvfp4_v_page_scale(params, logical_token, dim >> 4);
+  return e2m1_code_to_fp32(code) * e4m3_byte_to_fp32(scale) *
+         params.v_global_scale;
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_v_standard_pv_page_scale(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_page,
+    int dim,
+    int real_kv_len) {
+  float max_abs = 0.0f;
+#pragma unroll
+  for (int t = 0; t < 16; ++t) {
+    const int token = logical_page * params.page_size + t;
+    const float value =
+        token < real_kv_len
+            ? sm120_nvfp4_v_standard_value(params, token, dim)
+            : 0.0f;
+    max_abs = fmaxf(max_abs, fabsf(value));
+  }
+  return fp32_to_e4m3_byte(
+      fmaxf(max_abs / fmaxf(6.0f * params.v_global_scale, 1.0e-20f),
+            1.0e-8f));
 }
 
 __device__ __forceinline__ void sm120_cp_async_16(void* smem_ptr,
@@ -992,7 +1187,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     float* split_m,
     float* split_l,
     int split_stats_stride_rows,
-    int split_output_stride_elems) {
+    int split_output_stride_elems,
+    Sm120Nvfp4PagedKvLoadParams paged_kv_params) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
   using cute::_;
   static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
@@ -1200,6 +1396,142 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto pv_tBsB = pv_block_tma_b.partition_D(pv_sB);
   auto pv_tBsSFB = pv_block_tma_sfb.partition_D(pv_sSFB);
 
+  auto complete_manual_tma_pipeline_stage = [](auto& pipeline,
+                                               auto const& state,
+                                               uint32_t transaction_bytes) {
+    cutlass::arch::fence_view_shared();
+    auto* barrier = pipeline.producer_get_barrier(state);
+    cutlass::arch::ClusterTransactionBarrier::complete_transaction(
+        barrier, cute::block_rank_in_cluster(), transaction_bytes);
+  };
+
+  auto stage_paged_k_tile = [&](int kv_tile, int k_outer, int write_stage) {
+    auto smem_tiled_copy_B = cute::make_tiled_copy_B(
+        typename CutlassCollectiveMainloop::SmemCopyAtomB{}, qk_tiled_mma);
+    auto cB = cute::make_identity_tensor(
+        cute::make_shape(cute::Int<kCutlassTileN>{},
+                         cute::Int<kCutlassTileK>{}, cute::Int<1>{}));
+
+    if (lane_idx == 0) {
+      for (int copy_thread = 0;
+           copy_thread < CutlassCollectiveMainloop::ThreadCount;
+           ++copy_thread) {
+        auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(copy_thread);
+        auto tBsB_prod = smem_thr_copy_B.partition_D(qk_sB);
+        auto tBcB_prod = smem_thr_copy_B.partition_D(cB);
+        auto K_BLOCK_MAX_PROD = cute::size<2>(tBsB_prod);
+        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
+                       [&](auto k_block) {
+          auto dst = tBsB_prod(_, _, k_block, write_stage);
+          auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+          for (int i = 0; i < int(cute::size(dst)); ++i) {
+            auto coord = coord_tensor(i);
+            const int row = int(cute::get<0>(coord));
+            const int k = int(cute::get<1>(coord));
+            const int token = kv_tile * kCutlassTileN + row;
+            const int dim = k_outer * kCutlassTileK + k;
+            const uint8_t code =
+                token < kv_len_tokens
+                    ? sm120_nvfp4_k_page_code(paged_kv_params, token, dim)
+                    : 0;
+            dst(i) = cute::uint4_t(code);
+          }
+        });
+      }
+    }
+
+    if (lane_idx == 0) {
+      for (int idx = 0; idx < kCutlassTileN * kCutlassTileK / 2; ++idx) {
+        const int row = idx / (kCutlassTileK / 2);
+        const int packed_k = idx - row * (kCutlassTileK / 2);
+        const int k0 = 2 * packed_k;
+        const int token = kv_tile * kCutlassTileN + row;
+        const int scale_col = (k_outer * kCutlassTileK + k0) >> 4;
+        const uint8_t scale =
+            token < kv_len_tokens
+                ? sm120_nvfp4_k_page_scale(paged_kv_params, token, scale_col)
+                : 0x38;
+        qk_sSFB(row, k0, write_stage) = make_ue4m3_raw(scale);
+      }
+    }
+  };
+
+  auto stage_paged_v_tile = [&](int kv_tile, int effective_out_group_idx,
+                                int write_stage) {
+    auto smem_tiled_copy_B = cute::make_tiled_copy_B(
+        typename CutlassCollectiveMainloopK128Stage2::SmemCopyAtomB{},
+        pv_tiled_mma);
+    auto cB = cute::make_identity_tensor(
+        cute::make_shape(cute::Int<kOutputTileN>{},
+                         cute::Int<kCutlassTileN>{}, cute::Int<1>{}));
+
+    auto pv_scale_for = [&](int token, int dim) {
+      const int logical_page = token / paged_kv_params.page_size;
+      if (paged_kv_params.v_cache_uses_pv_layout) {
+        return sm120_nvfp4_v_pv_page_scale(paged_kv_params, logical_page, dim);
+      }
+      return sm120_nvfp4_v_standard_pv_page_scale(
+          paged_kv_params, logical_page, dim, kv_len_tokens);
+    };
+
+    auto pv_code_for = [&](int token, int dim, uint8_t scale) {
+      if (paged_kv_params.v_cache_uses_pv_layout) {
+        if (token >= kv_len_tokens) {
+          return uint8_t{0};
+        }
+        return sm120_nvfp4_page_code(paged_kv_params.v_pages, paged_kv_params,
+                                     token, dim);
+      }
+      if (token >= kv_len_tokens) {
+        return uint8_t{0};
+      }
+      const float value =
+          sm120_nvfp4_v_standard_value(paged_kv_params, token, dim);
+      const float quant_scale =
+          fmaxf(e4m3_byte_to_fp32(scale) * paged_kv_params.v_global_scale,
+                1.0e-8f);
+      return nearest_e2m1_code(value / quant_scale);
+    };
+
+    if (lane_idx == 0) {
+      for (int copy_thread = 0;
+           copy_thread < CutlassCollectiveMainloopK128Stage2::ThreadCount;
+           ++copy_thread) {
+        auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(copy_thread);
+        auto tBsB_prod = smem_thr_copy_B.partition_D(pv_sB);
+        auto tBcB_prod = smem_thr_copy_B.partition_D(cB);
+        auto K_BLOCK_MAX_PROD = cute::size<2>(tBsB_prod);
+        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
+                       [&](auto k_block) {
+          auto dst = tBsB_prod(_, _, k_block, write_stage);
+          auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+          for (int i = 0; i < int(cute::size(dst)); ++i) {
+            auto coord = coord_tensor(i);
+            const int col = int(cute::get<0>(coord));
+            const int k = int(cute::get<1>(coord));
+            const int token = kv_tile * kCutlassTileN + k;
+            const int dim = effective_out_group_idx * kOutputTileN + col;
+            const uint8_t scale = pv_scale_for(token, dim);
+            dst(i) = cute::uint4_t(pv_code_for(token, dim, scale));
+          }
+        });
+      }
+    }
+
+    if (lane_idx == 0) {
+      for (int idx = 0; idx < kOutputTileN * kCutlassTileN / 2; ++idx) {
+        const int col = idx / (kCutlassTileN / 2);
+        const int packed_k = idx - col * (kCutlassTileN / 2);
+        const int k0 = 2 * packed_k;
+        const int token = kv_tile * kCutlassTileN + k0;
+        const int dim = effective_out_group_idx * kOutputTileN + col;
+        const uint8_t scale =
+            token < kv_len_tokens ? pv_scale_for(token, dim) : 0x38;
+        pv_sSFB(col, k0, write_stage) = make_ue4m3_raw(scale);
+      }
+    }
+  };
+
   auto load_q_chunk = [&](int k_outer) {
     if (is_load && lane_predicate) {
       auto gA = qk_gA_mkl(_, _, effective_q_tile, _, 0);
@@ -1232,7 +1564,22 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   };
 
   auto load_k_chunk = [&](int kv_tile, int k_outer) {
-    if (is_load && lane_predicate) {
+    if (is_load && paged_kv_params.enabled() && paged_kv_params.native_k) {
+      if (lane_predicate) {
+        k_pipeline.producer_acquire(k_pipe_write);
+      }
+      __syncwarp();
+      const int write_stage = k_pipe_write.index();
+      stage_paged_k_tile(kv_tile, k_outer, write_stage);
+      cutlass::arch::fence_view_shared();
+      __syncwarp();
+      if (lane_predicate) {
+        complete_manual_tma_pipeline_stage(
+            k_pipeline, k_pipe_write,
+            qk_params.mainloop.tma_transaction_bytes_nk);
+        ++k_pipe_write;
+      }
+    } else if (is_load && lane_predicate) {
       auto gB = qk_gB_nkl(_, _, kv_tile, _, 0);
       auto gSFB = qk_gSFB_nkl(_, _, kv_tile, _, 0);
       auto tBgB = qk_block_tma_b.partition_S(gB);
@@ -1258,7 +1605,22 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto load_v_chunk = [&](int kv_tile, int group_offset) {
     const int effective_out_group_idx =
         effective_out_group_base + group_offset;
-    if (is_load && lane_predicate) {
+    if (is_load && paged_kv_params.enabled() && paged_kv_params.native_v) {
+      if (lane_predicate) {
+        v_pipeline.producer_acquire(v_pipe_write);
+      }
+      __syncwarp();
+      const int write_stage = v_pipe_write.index();
+      stage_paged_v_tile(kv_tile, effective_out_group_idx, write_stage);
+      cutlass::arch::fence_view_shared();
+      __syncwarp();
+      if (lane_predicate) {
+        complete_manual_tma_pipeline_stage(
+            v_pipeline, v_pipe_write,
+            pv_params.mainloop.tma_transaction_bytes_nk);
+        ++v_pipe_write;
+      }
+    } else if (is_load && lane_predicate) {
       auto gB = pv_gB_nkl(_, _, effective_out_group_idx, _, 0);
       auto gSFB = pv_gSFB_nkl(_, _, effective_out_group_idx, _, 0);
       auto tBgB = pv_block_tma_b.partition_S(gB);
@@ -2229,7 +2591,8 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
     int q_rows,
     int head_dim,
     int kv_len,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    Sm120Nvfp4PagedKvLoadParams paged_kv_params = {}) {
   static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
                     kOutputGroupSpan == 4,
                 "SM120 split-KV launcher supports span 1, 2, or 4");
@@ -2290,7 +2653,8 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
       qk_params, pv_params, stage_out, qk_alpha, pv_alpha, 0, 0,
       split_kv_tiles, total_kv_tiles, q_len, group_size, kv_len_tokens,
       causal ? 1 : 0, sliding_window, logits_soft_cap, 0, head_dim,
-      stage_split_m, stage_split_l, q_rows, stage_output_stride);
+      stage_split_m, stage_split_l, q_rows, stage_output_stride,
+      paged_kv_params);
   status = cudaGetLastError();
   if (status != cudaSuccess || direct_single_split) {
     return status;

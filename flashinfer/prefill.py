@@ -36,6 +36,7 @@ from .jit import (
     gen_trtllm_fmha_v2_sm120_module,
 )
 from .cudnn import cudnn_batch_prefill_with_kv_cache
+from .fmha_nvfp4_sm120 import BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
 from .utils import (
@@ -1678,7 +1679,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask will be used in attention computation.
 
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn`` or ``trtllm-gen``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cudnn``/``trtllm-gen``
+            or ``sm120-nvfp4``.
             Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
@@ -1773,8 +1775,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._mask_indptr_buf = mask_indptr_buf
         self._max_total_num_rows: Optional[int] = None
         self._backend = backend
+        if self._backend == "sm120_nvfp4":
+            self._backend = "sm120-nvfp4"
         self._plan_info = None
         self._cached_module = None
+        self._sm120_nvfp4_wrapper = None
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
@@ -1811,6 +1816,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             device="cpu",
             pin_memory=True,
         )
+        if self._sm120_nvfp4_wrapper is not None:
+            if float_workspace_buffer.dtype != torch.uint8:
+                raise ValueError(
+                    "backend='sm120-nvfp4' requires a torch.uint8 workspace buffer."
+                )
+            self._sm120_nvfp4_wrapper.reset_workspace_buffer(float_workspace_buffer)
 
     @flashinfer_api
     def plan(
@@ -2193,6 +2204,39 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._fmha_v2_num_kv_splits = ceil_div(
                         self._max_kv_len, split_tokens
                     )
+            elif self._backend == "sm120-nvfp4":
+                if self._kv_layout not in ("NHD", "HND"):
+                    raise ValueError("backend='sm120-nvfp4' requires NHD or HND KV layout.")
+                if self._float_workspace_buffer.dtype != torch.uint8:
+                    raise ValueError(
+                        "backend='sm120-nvfp4' requires a torch.uint8 workspace buffer."
+                    )
+                if q_data_type != torch.bfloat16:
+                    raise ValueError("backend='sm120-nvfp4' requires BF16 query tensors.")
+                if kv_data_type != torch.uint8:
+                    raise ValueError("backend='sm120-nvfp4' requires packed uint8 NVFP4 KV tensors.")
+                if o_data_type != torch.bfloat16:
+                    raise ValueError("backend='sm120-nvfp4' requires BF16 output tensors.")
+                if head_dim_qk != head_dim_vo or head_dim_qk not in (128, 256, 512):
+                    raise ValueError(
+                        "backend='sm120-nvfp4' requires head_dim_qk == head_dim_vo "
+                        "and head_dim in {128, 256, 512}."
+                    )
+                if page_size != 16:
+                    raise ValueError("backend='sm120-nvfp4' currently requires page_size=16.")
+                if custom_mask is not None or packed_custom_mask is not None:
+                    raise NotImplementedError(
+                        "backend='sm120-nvfp4' supports causal/sliding-window masks, "
+                        "but not custom masks yet."
+                    )
+                if pos_encoding_mode != "NONE":
+                    raise NotImplementedError(
+                        "backend='sm120-nvfp4' expects RoPE/position encoding to be applied before attention."
+                    )
+                if prefix_len_ptr is not None or token_pos_in_items_ptr is not None or max_item_len_ptr is not None:
+                    raise NotImplementedError(
+                        "backend='sm120-nvfp4' does not support multi-item scoring metadata yet."
+                    )
             elif self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -2212,7 +2256,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
 
         self._block_tables = block_tables
-        if self._backend in ("trtllm-gen", "fmha_v2"):
+        if self._backend in ("trtllm-gen", "fmha_v2", "sm120-nvfp4"):
             if self._backend == "trtllm-gen":
                 if not causal:
                     raise NotImplementedError(
@@ -2241,6 +2285,31 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         block_id : block_id + num_blocks_needed
                     ]
                     block_id += num_blocks_needed
+
+        if self._backend == "sm120-nvfp4":
+            assert self._block_tables is not None
+            split_kv_len = (
+                fixed_split_size * page_size
+                if fixed_split_size > 0 and not disable_split_kv
+                else 8192
+            )
+            self._sm120_nvfp4_wrapper = BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(
+                self._float_workspace_buffer,
+                kv_layout=self._kv_layout,
+            )
+            self._sm120_nvfp4_wrapper.plan(
+                qo_indptr_host.to(torch.int32),
+                self._block_tables.to(torch.int32),
+                kv_lens_arr_host.to(torch.int32),
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim_qk,
+                page_size=page_size,
+                causal=causal,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                split_kv_len=split_kv_len,
+            )
 
         if self._cached_module is not None:
             args = [
@@ -2440,11 +2509,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             For the trtllm-gen backend with ``NHD`` layout, scale tensors are transposed
             to HND internally (incurring a copy). Use ``HND`` for better performance.
 
-            Currently, NVFP4 KV supports `fa2`, `fmha_v2`, and `trtllm-gen` backend.
+            Currently, NVFP4 KV supports `fa2`, `fmha_v2`, `trtllm-gen`, and
+            `sm120-nvfp4` backend.
         nvfp4_v_cache_uses_pv_layout : bool
             Whether the NVFP4 V cache is already stored in the K-major physical
-            layout consumed by the FMHAv2 PV MMA. Only valid with
-            ``backend="fmha_v2"`` and NVFP4 KV cache.
+            layout consumed by the PV MMA path. Valid with ``backend="fmha_v2"``
+            or ``backend="sm120-nvfp4"`` and NVFP4 KV cache. When this is
+            ``False``, ``backend="sm120-nvfp4"`` reblocks normal V pages into
+            PV scratch internally.
         nvfp4_v_cache_sf_layout : Literal["trtllm_interleaved", "linear"]
             Physical layout of the NVFP4 V scale tensor. ``"trtllm_interleaved"``
             is the default layout returned by
@@ -2487,9 +2559,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ) and kv_cache_sf is None:
             raise ValueError("kv_cache_sf must be provided for NVFP4 KV cache.")
         if nvfp4_v_cache_uses_pv_layout:
-            if self._backend != "fmha_v2":
+            if self._backend not in ("fmha_v2", "sm120-nvfp4"):
                 raise ValueError(
-                    "nvfp4_v_cache_uses_pv_layout is only supported by backend='fmha_v2'."
+                    "nvfp4_v_cache_uses_pv_layout is only supported by "
+                    "backend='fmha_v2' or backend='sm120-nvfp4'."
                 )
             if kv_cache_sf is None:
                 raise ValueError(
@@ -2499,9 +2572,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             raise ValueError(
                 "nvfp4_v_cache_sf_layout must be 'trtllm_interleaved' or 'linear'."
             )
-        if nvfp4_v_cache_sf_layout == "linear" and self._backend != "fa2":
+        if nvfp4_v_cache_sf_layout == "linear" and self._backend not in (
+            "fa2",
+            "sm120-nvfp4",
+        ):
             raise ValueError(
-                "nvfp4_v_cache_sf_layout='linear' is currently only supported by backend='fa2'."
+                "nvfp4_v_cache_sf_layout='linear' is currently only supported by "
+                "backend='fa2' or backend='sm120-nvfp4'."
             )
         v_cache_sf_layout_code = 1 if nvfp4_v_cache_sf_layout == "linear" else 0
         key_block_scales, value_block_scales = (
@@ -2568,6 +2645,42 @@ class BatchPrefillWithPagedKVCacheWrapper:
             check_shape_dtype_device(
                 out, q.shape[:-1] + (out_head_dim,), out_dtype, q.device, "out"
             )
+
+        if self._backend == "sm120-nvfp4":
+            if return_lse:
+                raise NotImplementedError(
+                    "return_lse is not yet supported for backend='sm120-nvfp4'."
+                )
+            if self._sm120_nvfp4_wrapper is None:
+                raise ValueError("SM120 NVFP4 paged prefill plan data is not initialized.")
+
+            def _scalar_scale(name: str, scale: Optional[Union[float, torch.Tensor]]) -> float:
+                if scale is None:
+                    return 1.0
+                if isinstance(scale, torch.Tensor):
+                    if scale.numel() != 1 or scale.is_cuda:
+                        raise ValueError(
+                            f"backend='sm120-nvfp4' currently requires scalar host {name}."
+                        )
+                    return float(scale.item())
+                return float(scale)
+
+            effective_k_scale = _scalar_scale("k_scale", k_scale) * _scalar_scale(
+                "q_scale", q_scale
+            )
+            effective_v_scale = _scalar_scale("v_scale", v_scale)
+            assert key_block_scales is not None and value_block_scales is not None
+            out = self._sm120_nvfp4_wrapper.run(
+                q,
+                (k_cache, v_cache),
+                (key_block_scales, value_block_scales),
+                k_scale=effective_k_scale,
+                v_scale=effective_v_scale,
+                v_cache_uses_pv_layout=nvfp4_v_cache_uses_pv_layout,
+                v_cache_sf_layout=nvfp4_v_cache_sf_layout,
+                out=out,
+            )
+            return out
 
         # Convert NHD layout to HND for trtllm-gen backend
         if self._backend == "trtllm-gen" and self._kv_layout == "NHD":

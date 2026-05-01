@@ -1796,18 +1796,6 @@ def gen_fmha_cutlass_sm100a_module(
     )
 
 
-def gen_fmha_nvfp4_sm120_utils_module() -> JitSpec:
-    uri = "fmha_nvfp4_sm120_utils"
-    source_paths = [
-        jit_env.FLASHINFER_CSRC_DIR / "fmha_nvfp4_sm120_utils.cu",
-    ]
-    return gen_jit_spec(
-        uri,
-        source_paths,
-        extra_cuda_cflags=sm120f_nvcc_flags + ["-DFLASHINFER_ENABLE_BF16"],
-    )
-
-
 def gen_fmha_nvfp4_sm120_module() -> JitSpec:
     uri = "fmha_nvfp4_sm120"
     cutlass_root = os.environ.get("CUTLASS_ROOT")

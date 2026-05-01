@@ -36,9 +36,6 @@ from .modules import gen_fmha_cutlass_sm100a_module as gen_fmha_cutlass_sm100a_m
 from .modules import (
     gen_fmha_nvfp4_sm120_module as gen_fmha_nvfp4_sm120_module,
 )
-from .modules import (
-    gen_fmha_nvfp4_sm120_utils_module as gen_fmha_nvfp4_sm120_utils_module,
-)
 from .modules import gen_batch_pod_module as gen_batch_pod_module
 from .modules import gen_pod_module as gen_pod_module
 from .modules import gen_single_decode_module as gen_single_decode_module

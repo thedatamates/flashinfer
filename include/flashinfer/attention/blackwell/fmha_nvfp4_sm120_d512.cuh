@@ -25,6 +25,7 @@
 #include <flashinfer/gemm/cutlass_gemm_configs.h>
 #include <flashinfer/gemm/fp4_gemm_cutlass.h>
 #include <flashinfer/gemm/fp4_gemm_cutlass_template_sm120.h>
+#include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh>
 #include <flashinfer/mma.cuh>
 
 namespace flashinfer::attention::blackwell::sm120_nvfp4::d512 {
@@ -785,7 +786,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     float* split_m,
     float* split_l,
     int split_stats_stride_rows,
-    int split_output_stride_elems) {
+    int split_output_stride_elems,
+    Sm120Nvfp4PagedKvLoadParams paged_kv_params) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
   using cute::_;
   static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
@@ -977,6 +979,134 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto pv_tBsB = pv_block_tma_b.partition_D(pv_sB);
   auto pv_tBsSFB = pv_block_tma_sfb.partition_D(pv_sSFB);
 
+  auto complete_manual_tma_pipeline_stage = [](auto& pipeline,
+                                               auto const& state,
+                                               uint32_t transaction_bytes) {
+    cutlass::arch::fence_view_shared();
+    auto* barrier = pipeline.producer_get_barrier(state);
+    cutlass::arch::ClusterTransactionBarrier::complete_transaction(
+        barrier, cute::block_rank_in_cluster(), transaction_bytes);
+  };
+
+  auto stage_paged_k_tile = [&](int kv_tile, int k_outer, int write_stage) {
+    auto smem_tiled_copy_B = cute::make_tiled_copy_B(
+        typename CutlassCollectiveMainloop::SmemCopyAtomB{}, qk_tiled_mma);
+    auto cB = cute::make_identity_tensor(
+        cute::make_shape(cute::Int<kCutlassTileN>{},
+                         cute::Int<kCutlassTileK>{}, cute::Int<1>{}));
+
+    if (lane_idx == 0) {
+      for (int copy_thread = 0;
+           copy_thread < CutlassCollectiveMainloop::ThreadCount;
+           ++copy_thread) {
+        auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(copy_thread);
+        auto tBsB_prod = smem_thr_copy_B.partition_D(qk_sB);
+        auto tBcB_prod = smem_thr_copy_B.partition_D(cB);
+        auto K_BLOCK_MAX_PROD = cute::size<2>(tBsB_prod);
+        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
+                       [&](auto k_block) {
+          auto dst = tBsB_prod(_, _, k_block, write_stage);
+          auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+          for (int i = 0; i < int(cute::size(dst)); ++i) {
+            auto coord = coord_tensor(i);
+            const int row = int(cute::get<0>(coord));
+            const int k = int(cute::get<1>(coord));
+            const int token = kv_tile * kCutlassTileN + row;
+            const int dim = k_outer * kCutlassTileK + k;
+            const uint8_t code =
+                token < kv_len_tokens
+                    ? sm120_nvfp4_paged_k_code(paged_kv_params, token, dim)
+                    : 0;
+            dst(i) = cute::uint4_t(code);
+          }
+        });
+      }
+    }
+
+    if (lane_idx == 0) {
+      for (int idx = 0; idx < kCutlassTileN * kCutlassTileK / 2; ++idx) {
+        const int row = idx / (kCutlassTileK / 2);
+        const int packed_k = idx - row * (kCutlassTileK / 2);
+        const int k0 = 2 * packed_k;
+        const int token = kv_tile * kCutlassTileN + row;
+        const int scale_col = (k_outer * kCutlassTileK + k0) >> 4;
+        const uint8_t scale =
+            token < kv_len_tokens
+                ? sm120_nvfp4_paged_k_scale(paged_kv_params, token, scale_col)
+                : 0x38;
+        qk_sSFB(row, k0, write_stage) = make_ue4m3_raw(scale);
+      }
+    }
+  };
+
+  auto stage_paged_v_tile = [&](int kv_tile, int effective_out_group_idx,
+                                int write_stage) {
+    auto smem_tiled_copy_B = cute::make_tiled_copy_B(
+        typename CutlassCollectiveMainloopK128Stage2::SmemCopyAtomB{},
+        pv_tiled_mma);
+    auto cB = cute::make_identity_tensor(
+        cute::make_shape(cute::Int<kCutlassTileN>{},
+                         cute::Int<kCutlassTileN>{}, cute::Int<1>{}));
+
+    auto pv_scale_for = [&](int token, int dim) {
+      const int logical_page = token / paged_kv_params.page_size;
+      if (paged_kv_params.v_cache_uses_pv_layout) {
+        return sm120_nvfp4_paged_v_pv_scale(paged_kv_params, logical_page,
+                                            dim);
+      }
+      return sm120_nvfp4_paged_v_standard_pv_scale(
+          paged_kv_params, logical_page, dim, kv_len_tokens);
+    };
+
+    auto pv_code_for = [&](int token, int dim, uint8_t scale) {
+      if (paged_kv_params.v_cache_uses_pv_layout) {
+        return token < kv_len_tokens
+                   ? sm120_nvfp4_paged_v_code(paged_kv_params, token, dim)
+                   : uint8_t{0};
+      }
+      return sm120_nvfp4_paged_v_standard_pv_code(
+          paged_kv_params, token, dim, scale, kv_len_tokens);
+    };
+
+    if (lane_idx == 0) {
+      for (int copy_thread = 0;
+           copy_thread < CutlassCollectiveMainloopK128Stage2::ThreadCount;
+           ++copy_thread) {
+        auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(copy_thread);
+        auto tBsB_prod = smem_thr_copy_B.partition_D(pv_sB);
+        auto tBcB_prod = smem_thr_copy_B.partition_D(cB);
+        auto K_BLOCK_MAX_PROD = cute::size<2>(tBsB_prod);
+        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
+                       [&](auto k_block) {
+          auto dst = tBsB_prod(_, _, k_block, write_stage);
+          auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+          for (int i = 0; i < int(cute::size(dst)); ++i) {
+            auto coord = coord_tensor(i);
+            const int col = int(cute::get<0>(coord));
+            const int k = int(cute::get<1>(coord));
+            const int token = kv_tile * kCutlassTileN + k;
+            const int dim = effective_out_group_idx * kCutlassTileN + col;
+            const uint8_t scale = pv_scale_for(token, dim);
+            dst(i) = cute::uint4_t(pv_code_for(token, dim, scale));
+          }
+        });
+      }
+    }
+
+    if (lane_idx == 0) {
+      for (int idx = 0; idx < kCutlassTileN * kCutlassTileN / 2; ++idx) {
+        const int col = idx / (kCutlassTileN / 2);
+        const int packed_k = idx - col * (kCutlassTileN / 2);
+        const int k0 = 2 * packed_k;
+        const int token = kv_tile * kCutlassTileN + k0;
+        const int dim = effective_out_group_idx * kCutlassTileN + col;
+        const uint8_t scale = token < kv_len_tokens ? pv_scale_for(token, dim)
+                                                    : 0x38;
+        pv_sSFB(col, k0, write_stage) = make_ue4m3_raw(scale);
+      }
+    }
+  };
+
   auto load_q_chunk = [&](int k_outer) {
     if (is_load && lane_predicate) {
       auto gA = qk_gA_mkl(_, _, effective_q_tile, _, 0);
@@ -1002,7 +1132,22 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   };
 
   auto load_k_chunk = [&](int kv_tile, int k_outer) {
-    if (is_load && lane_predicate) {
+    if (is_load && paged_kv_params.enabled() && paged_kv_params.native_k) {
+      if (lane_predicate) {
+        k_pipeline.producer_acquire(k_pipe_write);
+      }
+      __syncwarp();
+      const int write_stage = k_pipe_write.index();
+      stage_paged_k_tile(kv_tile, k_outer, write_stage);
+      cutlass::arch::fence_view_shared();
+      __syncwarp();
+      if (lane_predicate) {
+        complete_manual_tma_pipeline_stage(
+            k_pipeline, k_pipe_write,
+            qk_params.mainloop.tma_transaction_bytes_nk);
+        ++k_pipe_write;
+      }
+    } else if (is_load && lane_predicate) {
       auto gB = qk_gB_nkl(_, _, kv_tile, _, 0);
       auto gSFB = qk_gSFB_nkl(_, _, kv_tile, _, 0);
       auto tBgB = qk_block_tma_b.partition_S(gB);
@@ -1026,9 +1171,24 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   };
 
   auto load_v_chunk = [&](int kv_tile, int group_offset) {
-    if (is_load && lane_predicate) {
-      const int effective_out_group_idx =
-          effective_out_group_base + group_offset;
+    const int effective_out_group_idx =
+        effective_out_group_base + group_offset;
+    if (is_load && paged_kv_params.enabled() && paged_kv_params.native_v) {
+      if (lane_predicate) {
+        v_pipeline.producer_acquire(v_pipe_write);
+      }
+      __syncwarp();
+      const int write_stage = v_pipe_write.index();
+      stage_paged_v_tile(kv_tile, effective_out_group_idx, write_stage);
+      cutlass::arch::fence_view_shared();
+      __syncwarp();
+      if (lane_predicate) {
+        complete_manual_tma_pipeline_stage(
+            v_pipeline, v_pipe_write,
+            pv_params.mainloop.tma_transaction_bytes_nk);
+        ++v_pipe_write;
+      }
+    } else if (is_load && lane_predicate) {
       auto gB = pv_gB_nkl(_, _, effective_out_group_idx, _, 0);
       auto gSFB = pv_gSFB_nkl(_, _, effective_out_group_idx, _, 0);
       auto tBgB = pv_block_tma_b.partition_S(gB);
@@ -1957,7 +2117,8 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
     int q_rows,
     int head_dim,
     int kv_len,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    Sm120Nvfp4PagedKvLoadParams paged_kv_params = {}) {
   static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
                     kOutputGroupSpan == 4,
                 "SM120 split-KV launcher supports span 1, 2, or 4");
@@ -2013,7 +2174,7 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
       qk_params, pv_params, partial, qk_alpha, pv_alpha, 0, 0,
       split_kv_tiles, total_kv_tiles, q_len, group_size, kv_len_tokens,
       causal ? 1 : 0, sliding_window, logits_soft_cap, 0, head_dim,
-      split_m, split_l, q_rows, q_rows * head_dim);
+      split_m, split_l, q_rows, q_rows * head_dim, paged_kv_params);
   status = cudaGetLastError();
   if (status != cudaSuccess) {
     return status;

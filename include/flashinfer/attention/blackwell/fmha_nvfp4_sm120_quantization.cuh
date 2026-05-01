@@ -44,6 +44,13 @@ __device__ __forceinline__ uint8_t nearest_e2m1_code(float x) {
   return best;
 }
 
+__device__ __forceinline__ float e2m1_code_to_fp32(uint8_t code) {
+  constexpr float values[16] = {
+      0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+  return values[code & 0x0f];
+}
+
 __global__ void quantize_q_rowmajor_kernel(const __nv_bfloat16* q,
                                            uint8_t* q_packed,
                                            uint8_t* q_scales,

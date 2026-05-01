@@ -13599,3 +13599,515 @@ bench_gemma4_attention_grid.py Shape A smoke with sm120_fused + BF16 baseline
   sm120_fused min_ms=0.068352, status=ok
   flashinfer_bf16 min_ms=0.069024, status=ok
 ```
+
+## Standard Paged Prefill Backend Integration
+
+The SM120 NVFP4 paged-prefill path is now reachable through FlashInfer's
+standard paged prefill wrapper:
+
+```text
+flashinfer.BatchPrefillWithPagedKVCacheWrapper(..., backend="sm120-nvfp4")
+```
+
+Accepted alias:
+
+```text
+backend="sm120_nvfp4"
+```
+
+The standard wrapper delegates to:
+
+```text
+BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper
+```
+
+with the same production constraints as the direct wrapper:
+
+```text
+- NHD layout
+- page_size=16
+- BF16 Q/O
+- packed uint8 NVFP4 KV
+- head_dim in {128, 256, 512}
+- no custom masks or multi-item scoring metadata yet
+- RoPE/position encoding must be applied before attention
+- V cache and V scales must be in PV layout
+```
+
+Call-site requirement:
+
+```python
+nvfp4_quantize_paged_kv_cache(
+    k,
+    v,
+    "NHD",
+    v_data_layout="pv",
+    v_scale_layout="pv",
+)
+wrapper.run(..., nvfp4_v_cache_uses_pv_layout=True)
+```
+
+The standard wrapper builds or accepts `block_tables`, forwards host
+`qo_indptr`/`kv_lens` into the nested SM120 wrapper, and uses the same source-tree
+csrc/JIT kernels as the direct wrapper. This removes the benchmark-only API
+dependency for callers that already use FlashInfer's paged prefill wrapper.
+
+Scratch allocation update:
+
+```text
+BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper now allocates 4096-byte-aligned
+scratch views backed by uint8 base buffers.
+```
+
+Reason: the SM120 block-scaled CUTLASS/TMA path is alignment-sensitive. Relying
+on incidental PyTorch allocator alignment made nested-wrapper scratch placement
+fragile.
+
+Validation:
+
+```text
+pytest -q \
+  tests/attention/test_nvfp4_kv_head_dim_512.py::test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x \
+  tests/attention/test_nvfp4_kv_head_dim_512.py::test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x
+
+6 passed
+```
+
+The standard-wrapper test uses non-contiguous physical page tables and validates
+D128/D256/D512 against the direct SM120 wrapper.
+
+Known follow-up:
+
+```text
+D256 with small non-CTA-shaped q segments, e.g. q_lens=[96, 160], can differ
+between otherwise equivalent wrapper instantiations by ~1.0 max absolute
+on a small fraction of elements. Tile-shaped q segments reproduce exactly.
+This needs a kernel-level ragged-q audit before declaring the host-loop gather
+bridge fully general.
+```
+
+This does not change the next structural target: replace the internal
+gather-to-dense bridge with native page-table-aware K/V loading in the fused
+mainloop, or prove the gather bridge is the shippable vLLM tradeoff for the
+target workload.
+
+## vLLM Integration Blocker: V Cache Layout
+
+2026-04-30
+
+The FlashInfer standard wrapper is production-shaped, but vLLM cannot be routed
+to `backend="sm120-nvfp4"` until the KV-cache writer can emit the V side in the
+layout required by the SM120 PV MMA path.
+
+Current vLLM NVFP4 cache writer:
+
+```text
+csrc/nvfp4_kv_cache_kernels.cu
+  K data:    normal per-token/per-head FP4 blocks
+  K scales:  normal per-token/per-head scale groups
+  V data:    normal per-token/per-head FP4 blocks
+  V scales:  SM100/TRTLLM swizzled scale sidecar
+```
+
+SM120 fused prefill wrapper requirement:
+
+```text
+K data:    normal NHD pages
+K scales:  normal NHD pages
+V data:    PV-reblocked NHD pages
+V scales:  PV-reblocked NHD pages
+```
+
+This is not a view-only transformation. Normal V scales are grouped along the
+head dimension for one token, while PV scales are grouped along the page-token
+dimension for one output column. The cache writer has to quantize/store V in
+PV layout directly, or the runtime has to keep a second PV V representation.
+Passing vLLM's current NVFP4 cache to the SM120 wrapper would read incorrect V
+data and incorrect V scales.
+
+Immediate production integration target:
+
+```text
+1. Extend the vLLM NVFP4 cache writer with an explicit SM120 PV-V layout mode.
+2. Keep the default/current normal-V layout unchanged for existing FA2/XQA paths.
+3. Expose split-view helpers that identify PV-layout V pages explicitly, so the
+   attention backend cannot accidentally route normal V into the SM120 wrapper.
+4. Only enable vLLM prefill dispatch to backend="sm120-nvfp4" after the cache
+   writer test proves byte/scale equivalence against FlashInfer's public
+   nvfp4_quantize_paged_kv_cache(..., v_data_layout="pv", v_scale_layout="pv").
+```
+
+Update:
+
+The first production paged path is implemented in FlashInfer rather than vLLM's
+persistent cache writer. `backend="sm120-nvfp4"` now accepts both:
+
+```text
+1. PV-layout V pages/scales:
+   nvfp4_v_cache_uses_pv_layout=True
+
+2. Historical normal V pages with TRTLLM-interleaved or linear V scales:
+   nvfp4_v_cache_uses_pv_layout=False
+   nvfp4_v_cache_sf_layout in {"trtllm_interleaved", "linear"}
+```
+
+For the normal-V path, paged staging dequantizes V from the normal
+NVFP4 page layout and re-quantizes/reblocks it into the dense PV scratch layout
+that the SM120 fused kernel consumes. This keeps vLLM's current persistent
+NVFP4 cache format usable for correctness while preserving the faster PV-input
+path for callers that can produce PV pages directly.
+
+Validation:
+
+```text
+pytest -q \
+  tests/attention/test_nvfp4_kv_head_dim_512.py::test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x \
+  tests/attention/test_nvfp4_kv_head_dim_512.py::test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x
+
+6 passed
+```
+
+The normal-V staged path is not byte-equivalent to direct PV quantization because it
+reblocks from an already-quantized normal V cache. The measured D128/D256/D512
+test delta against the direct PV path is small:
+
+```text
+mean_abs < 0.003
+p99_abs  < 0.008
+max_abs  < 0.02
+```
+
+Remaining production decision:
+
+```text
+The normal-V staged path is a correctness path for vLLM's current cache writer.
+If its runtime cost is too high in serving, the next step is either native
+page-table PV loading in the fused mainloop or a deliberate dual-layout cache
+design. A one-token incremental cache writer cannot maintain exact PV scales
+without page-level requantization, because each PV V scale covers 16 tokens for
+one output column.
+```
+
+Update 2026-04-30:
+
+The paged path now accepts the actual vLLM SM120 HND split-view cache shape. vLLM's
+NVFP4 cache stores each side as `[data | scale]`, and
+`nvfp4_kv_cache_split_views()` returns non-contiguous data and scale views.
+The SM120 paged gather path no longer requires contiguous K/V page tensors; it
+requires only last-dimension contiguity and uses the incoming element strides
+for K data, K scales, V data, and V scales.
+
+vLLM integration routing, when explicitly enabled with
+`attention_config.use_flashinfer_sm120_nvfp4_prefill=True`, uses:
+
+```text
+SM120/SM121 + NVFP4 + BF16 + page_size=16 + head_dim in {128,256,512}
+  if max prefill query length >= 128:
+      native FlashInfer wrapper backend="sm120-nvfp4"
+      nvfp4_v_cache_uses_pv_layout=False
+      nvfp4_v_cache_sf_layout="trtllm_interleaved"
+  else:
+      FlashInfer auto/FA2 fallback
+```
+
+The q<128 fallback is deliberate. The SM120 fused kernels were optimized and
+validated for large prefill chunks; tiny prefill segments do not sit in the
+measured win zone, and the normal-V path adds an extra V requantization step.
+Small prefills stay on FA2 for correctness/latency stability. Without the
+explicit attention-config flag, vLLM does not select this SM120 sub-backend.
+
+Validation:
+
+```text
+# FlashInfer wrapper path: PV direct, NHD normal-V, HND normal-V
+pytest -q \
+  tests/attention/test_nvfp4_kv_head_dim_512.py::test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x \
+  tests/attention/test_nvfp4_kv_head_dim_512.py::test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x
+
+6 passed
+
+# vLLM routing/integration with local FlashInfer worktree
+pytest -q \
+  tests/v1/attention/test_trtllm_attention_integration.py::test_trtllm_gen_nvfp4_kv_integration \
+  tests/v1/attention/test_trtllm_attention_integration.py::test_sm12x_nvfp4_large_prefill_selects_sm120_wrapper
+
+4 passed
+```
+
+Full validation pass after stride-aware HND support:
+
+```text
+# FlashInfer NVFP4 attention regression file
+CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2 \
+TORCH_CUDA_ARCH_LIST=12.0f FLASHINFER_CUDA_ARCH_LIST=12.0f \
+PYTHONPATH=/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv \
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
+/home/josh/tdm/infer/current/.venv/bin/python -m pytest -q \
+  tests/attention/test_nvfp4_kv_head_dim_512.py
+
+35 passed in 74.98s
+
+# vLLM FlashInfer/TRTLLM attention integration file
+CUDA_VISIBLE_DEVICES=2 CUDA_HOME=/usr/local/cuda-13.2 \
+TORCH_CUDA_ARCH_LIST=12.0f FLASHINFER_CUDA_ARCH_LIST=12.0f \
+PYTHONPATH=/home/josh/tdm/infer/worktrees/flashinfer-nvfp4-kv:/home/josh/tdm/infer/current \
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
+/home/josh/tdm/infer/current/.venv/bin/python -m pytest -q \
+  tests/v1/attention/test_trtllm_attention_integration.py
+
+8 passed in 110.61s
+
+# Static checks
+/home/josh/tdm/infer/current/.venv/bin/python -m py_compile \
+  flashinfer/fmha_nvfp4_sm120.py flashinfer/prefill.py \
+  tests/attention/test_nvfp4_kv_head_dim_512.py
+git diff --check
+
+/home/josh/tdm/infer/current/.venv/bin/python -m py_compile \
+  vllm/v1/attention/backends/flashinfer.py \
+  tests/v1/attention/test_trtllm_attention_integration.py
+git diff --check
+
+passed
+```
+
+Current production boundary:
+
+```text
+External API:
+  FlashInfer paged prefill wrapper backend="sm120-nvfp4"
+  vLLM routes large SM120/SM121 NVFP4 BF16 prefills to that backend.
+
+Internal implementation:
+  page-table K/V gather and normal-V-to-PV reblock into dense scratch,
+  then D128/D256/D512 fused SM120 dense kernels.
+
+Known follow-up:
+  replace gather-to-dense internals with native block-table loads in the fused
+  mainloop if serving profiles show the staging cost dominates. This should not
+  require a vLLM call-site/API change.
+```
+
+API cleanup after validation:
+
+```text
+- Renamed the SM120 paged helper header from
+  fmha_nvfp4_sm120_paged_adapter.cuh to fmha_nvfp4_sm120_paged_kv.cuh.
+- Removed the backend-specific SM120 wrapper from flashinfer.__init__; callers
+  should use the existing public wrapper:
+    BatchPrefillWithPagedKVCacheWrapper(..., backend="sm120-nvfp4")
+- Kept the backend-specific Python class in flashinfer.fmha_nvfp4_sm120 for the
+  standard wrapper implementation and focused tests only.
+- Folded Q quantization into the main fmha_nvfp4_sm120 JIT module and removed
+  the separate fmha_nvfp4_sm120_utils module.
+```
+
+Manual backend selection update:
+
+```text
+Do not route SM120 NVFP4 paged prefill from FlashInfer backend="auto".
+The backend is manually selected with:
+
+  BatchPrefillWithPagedKVCacheWrapper(..., backend="sm120-nvfp4")
+
+vLLM selection is also explicit. The FlashInfer backend remains the top-level
+vLLM backend, but the SM120 NVFP4 prefill sub-backend requires:
+
+  attention_config.use_flashinfer_sm120_nvfp4_prefill = True
+
+Default vLLM FlashInfer behavior stays on the existing backend path.
+```
+
+V-cache writer constraint:
+
+```text
+The current vLLM NVFP4 cache writer is token-granular:
+
+  reshape_and_cache_flash(key, value, ..., slot_mapping, "nvfp4", ...)
+
+It can write standard per-token V data and TRT-LLM-interleaved V scales
+directly. The SM120 PV layout is different: V data/scales are quantized per
+output column across the 16-token page. That gives one scale per
+(page, kv_head, output_column), not one scale per (token, kv_head, 16-dim
+head block).
+
+So a drop-in writer flag is not correct for incremental vLLM cache updates.
+Updating one slot in a page would require recomputing that page's PV V scales
+from all 16 tokens, including tokens not present in the current key/value
+input. The production-safe vLLM path therefore keeps the standard NVFP4 V
+layout and lets the SM120 attention backend consume it. The current
+implementation does that by reblocking into PV scratch during paged staging;
+the next production step is moving that transformation into native in-kernel
+paged loads rather than forcing vLLM's writer to own PV layout.
+```
+
+Native paged producer pass (historical, superseded by native V completion pass
+below):
+
+```text
+Target:
+  Remove dense K/V scratch staging from the SM120 fused mainloop while keeping
+  the public backend="sm120-nvfp4" API unchanged.
+
+Current landed state:
+  D128/D256/D512 have a paged-load descriptor threaded into the fused stage
+  kernel.
+  Q still uses the existing contiguous TMA path.
+  K is staged directly from block_tables into the CUTLASS SM120 block-scaled
+  smem layout for all three head-dim specializations.
+  V remains on the dense-correct PV staging path in the active production
+  route.
+
+Validation:
+  tests/attention/test_nvfp4_kv_head_dim_512.py::
+    test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x
+  tests/attention/test_nvfp4_kv_head_dim_512.py::
+    test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x
+
+  6 passed with D128/D256/D512 native K enabled and native V disabled.
+
+Important implementation detail:
+  The native FP4 producer must not have multiple lanes racing on separate
+  nibbles of the same smem byte. The first multi-lane K/V producer produced
+  page-order-dependent non-finite outputs and wrapper-to-wrapper drift.
+  Serializing the subbyte producer made K deterministic. Native V improved
+  from NaNs to finite output, but still missed the dense PV correctness
+  tolerance:
+
+    dense standard-V fallback vs native PV V staging, D256:
+      diff.mean ~= 0.0035, gate is < 0.003
+
+  Therefore native V is deliberately not active yet. The next V fix should be
+  a pair-packed producer that writes whole smem bytes according to the same
+  CuTe/CUTLASS destination partition, not independent uint4 nibble stores.
+
+Active production switch:
+  native K: enabled for D128/D256/D512
+  native V: disabled, dense PV staging retained
+```
+
+Current production-readiness pass (historical native-paging state, superseded
+by native V completion pass below):
+
+```text
+Manual selection:
+  FlashInfer: BatchPrefillWithPagedKVCacheWrapper(..., backend="sm120-nvfp4")
+  vLLM: attention_config.use_flashinfer_sm120_nvfp4_prefill = True
+
+Default behavior:
+  FlashInfer backend="auto" does not select sm120-nvfp4.
+  vLLM does not select the SM120 NVFP4 prefill sub-backend unless the manual
+  attention-config flag is set.
+
+Native paging state:
+  D128/D256/D512 native K is active for paged caches.
+  V remains dense-PV staged.
+
+Remaining implementation blockers:
+  Native V needs pair-packed byte stores into the CUTLASS PV destination
+  partition; independent uint4 nibble writes were rejected.
+  Full device-side varlen batching is still blocked on the current host-side
+  CUTLASS params initialization per sequence.
+```
+
+Validation after the D256 native-K pass:
+
+```text
+# FlashInfer direct/standard wrapper checks
+tests/attention/test_nvfp4_kv_head_dim_512.py::
+  test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x
+tests/attention/test_nvfp4_kv_head_dim_512.py::
+  test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x
+
+6 passed
+
+# vLLM manual selection/default non-selection checks
+tests/v1/attention/test_trtllm_attention_integration.py::
+  test_sm12x_nvfp4_large_prefill_selects_sm120_wrapper
+tests/v1/attention/test_trtllm_attention_integration.py::
+  test_sm12x_nvfp4_large_prefill_does_not_select_sm120_wrapper_by_default
+
+2 passed
+
+# Full FlashInfer NVFP4 attention regression file
+tests/attention/test_nvfp4_kv_head_dim_512.py
+
+35 passed
+
+# Full vLLM FlashInfer/TRTLLM attention integration file
+tests/v1/attention/test_trtllm_attention_integration.py
+
+9 passed
+```
+
+Native V probe after D128/D512 producer port (historical, superseded by native
+V completion pass below):
+
+```text
+Change tested:
+  native_v=true for PV-layout V pages only
+  normal-V pages still use dense normal-V-to-PV reblock because their scale
+  sidecar is not PV-layout.
+
+Result:
+  standard wrapper parity stayed finite, but the normal-V-vs-PV comparison
+  failed the existing mean-abs gate on D128:
+
+    diff.mean ~= 0.0035, gate is < 0.003
+
+Decision:
+  Native V remains disabled. The V producer code exists for all three
+  specializations, but the active production path keeps dense PV V staging until
+  the producer is made numerically/layout-equivalent to the dense PV staging
+  path under the existing tests.
+```
+
+Native V completion pass:
+
+```text
+Correction to the previous native-V conclusion:
+  The dense PV scratch path was the layout-drifted path. A structured-V
+  diagnostic showed native PV V staging matches the dequantized PV reference,
+  while dense PV scratch output permutes output columns. The earlier
+  normal-V-vs-PV failure was therefore not proof that native V was wrong.
+
+Implementation:
+  - D128/D256/D512 now stage K directly from block_tables.
+  - D128/D256/D512 now stage V directly from block_tables.
+  - PV-layout V pages are consumed directly by the stage producer.
+  - Normal-layout V pages are dequantized and re-quantized into the PV MMA
+    operand inside the stage producer, using the same CUTLASS destination
+    partition as the native PV path.
+  - The active production path no longer launches dense K or dense V gather
+    kernels when native paging is enabled.
+
+Important detail:
+  The native producers write through the CUTLASS/CuTe destination partition.
+  That is the convention that made the PV path match the reference. The old
+  dense scratch layout remains useful as a fallback/debug path, but it is not
+  the active paged production route.
+
+Validation:
+  # Focused standard wrapper parity, PV-layout and normal-layout V, D128/D256/D512
+  tests/attention/test_nvfp4_kv_head_dim_512.py::
+    test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x
+  tests/attention/test_nvfp4_kv_head_dim_512.py::
+    test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x
+
+  6 passed in 471.97s
+
+  # Full FlashInfer NVFP4 attention regression file
+  tests/attention/test_nvfp4_kv_head_dim_512.py
+
+  35 passed in 240.09s
+
+  # vLLM FlashInfer/TRTLLM attention integration with FlashInfer worktree first
+  # on PYTHONPATH
+  tests/v1/attention/test_trtllm_attention_integration.py
+
+  9 passed in 12.19s
+
+Current production switch:
+  native K: enabled for D128/D256/D512
+  native V: enabled for D128/D256/D512
+```

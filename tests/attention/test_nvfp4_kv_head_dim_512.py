@@ -18,6 +18,7 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.fmha_nvfp4_sm120 import BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper
 from flashinfer.fp4_quantization import fp4_quantize, nvfp4_quantize_paged_kv_cache
 from flashinfer.utils import get_compute_capability
 from tests.test_helpers.utils_fp4 import E2M1_TO_FLOAT32, nvfp4_to_float
@@ -1157,7 +1158,7 @@ def test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x(head_dim, group):
     )
 
     workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
-    wrapper = flashinfer.BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(workspace)
+    wrapper = BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(workspace)
     wrapper.plan(
         qo_indptr,
         block_tables,
@@ -1176,7 +1177,7 @@ def test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x(head_dim, group):
 
     expected_slices = []
     for kv_head in range(num_kv_heads):
-        single_wrapper = flashinfer.BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(
+        single_wrapper = BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(
             workspace
         )
         single_wrapper.plan(
@@ -1210,3 +1211,277 @@ def test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x(head_dim, group):
     expected = torch.cat(expected_slices, dim=1)
     assert torch.isfinite(out.float()).all()
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("head_dim,group", [(128, 4), (256, 6), (512, 4)])
+def test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x(
+    head_dim, group
+):
+    _requires_sm12x_nvfp4()
+
+    device = torch.device("cuda")
+    page_size = 16
+    q_lens = [128, 256]
+    kv_lens = [1024, 768]
+    num_kv_heads = 2
+    num_qo_heads = group * num_kv_heads
+    pages_per_seq = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    total_pages = sum(pages_per_seq)
+    table_width = max(pages_per_seq)
+    physical_pages = total_pages + 7
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(120512 + head_dim)
+    q = (
+        torch.randn(
+            (sum(q_lens), num_qo_heads, head_dim), device=device, generator=gen
+        )
+        / 4
+    ).to(torch.bfloat16)
+    k = (
+        torch.randn(
+            (physical_pages, page_size, num_kv_heads, head_dim),
+            device=device,
+            generator=gen,
+        )
+        / 4
+    ).to(torch.bfloat16)
+    v = (
+        torch.randn(
+            (physical_pages, page_size, num_kv_heads, head_dim),
+            device=device,
+            generator=gen,
+        )
+        / 4
+    ).to(torch.bfloat16)
+
+    page_order = torch.randperm(physical_pages, device=device)[:total_pages].to(
+        torch.int32
+    )
+    block_tables = torch.full(
+        (len(q_lens), table_width), -1, dtype=torch.int32, device=device
+    )
+    offset = 0
+    for batch_idx, pages in enumerate(pages_per_seq):
+        block_tables[batch_idx, :pages] = page_order[offset : offset + pages]
+        offset += pages
+
+    qo_indptr = torch.tensor(
+        [0, q_lens[0], sum(q_lens)], dtype=torch.int32, device="cpu"
+    )
+    paged_kv_indptr = torch.tensor(
+        [0, pages_per_seq[0], total_pages], dtype=torch.int32, device="cpu"
+    )
+    paged_kv_indices = page_order.contiguous()
+    paged_kv_last_page_len = torch.full(
+        (len(q_lens),), page_size, dtype=torch.int32, device="cpu"
+    )
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
+    (k_fp4, v_fp4), (k_sf, v_sf), k_scale, v_scale = (
+        nvfp4_quantize_paged_kv_cache(
+            k, v, "NHD", v_data_layout="pv", v_scale_layout="pv"
+        )
+    )
+
+    workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
+    standard = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "NHD", backend="sm120-nvfp4"
+    )
+    standard.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        window_left=512,
+        logits_soft_cap=50.0,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.uint8,
+        o_data_type=torch.bfloat16,
+        seq_lens=kv_lens_t,
+        block_tables=block_tables,
+    )
+    out = standard.run(
+        q,
+        (k_fp4, v_fp4),
+        kv_cache_sf=(k_sf, v_sf),
+        k_scale=k_scale,
+        v_scale=v_scale,
+        nvfp4_v_cache_uses_pv_layout=True,
+    )
+
+    direct = BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(workspace)
+    direct.plan(
+        qo_indptr,
+        block_tables,
+        kv_lens_t,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        causal=True,
+        window_left=512,
+        logits_soft_cap=50.0,
+        split_kv_len=8192,
+    )
+    expected = direct.run(
+        q, (k_fp4, v_fp4), (k_sf, v_sf), k_scale=k_scale, v_scale=v_scale
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(out.float()).all()
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("head_dim,group", [(128, 4), (256, 6), (512, 4)])
+def test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x(head_dim, group):
+    _requires_sm12x_nvfp4()
+
+    device = torch.device("cuda")
+    page_size = 16
+    q_lens = [128, 128]
+    kv_lens = [1024, 1024]
+    num_kv_heads = 2
+    num_qo_heads = group * num_kv_heads
+    pages_per_seq = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    total_pages = sum(pages_per_seq)
+    table_width = max(pages_per_seq)
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(130120 + head_dim)
+    q = (
+        torch.randn(
+            (sum(q_lens), num_qo_heads, head_dim), device=device, generator=gen
+        )
+        / 4
+    ).to(torch.bfloat16)
+    k = (
+        torch.randn(
+            (total_pages, page_size, num_kv_heads, head_dim),
+            device=device,
+            generator=gen,
+        )
+        / 4
+    ).to(torch.bfloat16)
+    v = (
+        torch.randn(
+            (total_pages, page_size, num_kv_heads, head_dim),
+            device=device,
+            generator=gen,
+        )
+        / 4
+    ).to(torch.bfloat16)
+
+    block_tables = torch.arange(total_pages, device=device, dtype=torch.int32).view(
+        len(q_lens), table_width
+    )
+    qo_indptr = torch.tensor(
+        [0, q_lens[0], sum(q_lens)], dtype=torch.int32, device="cpu"
+    )
+    paged_kv_indptr = torch.tensor(
+        [0, pages_per_seq[0], total_pages], dtype=torch.int32, device="cpu"
+    )
+    paged_kv_indices = torch.arange(total_pages, device=device, dtype=torch.int32)
+    paged_kv_last_page_len = torch.full(
+        (len(q_lens),), page_size, dtype=torch.int32, device="cpu"
+    )
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
+
+    (k_normal, v_normal), (k_sf, v_sf_normal), k_scale, v_scale = (
+        nvfp4_quantize_paged_kv_cache(k, v, "NHD")
+    )
+    (k_pv, v_pv), (k_sf_pv, v_sf_pv), k_scale_pv, v_scale_pv = (
+        nvfp4_quantize_paged_kv_cache(
+            k, v, "NHD", v_data_layout="pv", v_scale_layout="pv"
+        )
+    )
+    assert torch.equal(k_normal, k_pv)
+    assert torch.equal(k_sf.view(torch.uint8), k_sf_pv.view(torch.uint8))
+    assert k_scale == k_scale_pv
+    assert v_scale == v_scale_pv
+
+    workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    def run(v_cache, v_sf, use_pv_layout):
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "NHD", backend="sm120-nvfp4"
+        )
+        wrapper.plan(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            causal=True,
+            window_left=512,
+            logits_soft_cap=50.0,
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.uint8,
+            o_data_type=torch.bfloat16,
+            seq_lens=kv_lens_t,
+            block_tables=block_tables,
+        )
+        return wrapper.run(
+            q,
+            (k_normal, v_cache),
+            kv_cache_sf=(k_sf, v_sf),
+            k_scale=k_scale,
+            v_scale=v_scale,
+            nvfp4_v_cache_uses_pv_layout=use_pv_layout,
+        )
+
+    out_normal = run(v_normal, v_sf_normal, False)
+    out_pv = run(v_pv, v_sf_pv, True)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(out_normal.float()).all()
+    diff = (out_normal.float() - out_pv.float()).abs().flatten()
+    assert diff.mean() < 3e-3
+    assert torch.quantile(diff, 0.99) < 8e-3
+    assert diff.max() < 2e-2
+
+    k_hnd = k_normal.permute(0, 2, 1, 3).contiguous()
+    v_hnd = v_normal.permute(0, 2, 1, 3).contiguous()
+    k_sf_hnd = k_sf.permute(0, 2, 1, 3).contiguous()
+    v_sf_hnd = v_sf_normal.permute(0, 2, 1, 3).contiguous()
+    wrapper_hnd = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "HND", backend="sm120-nvfp4"
+    )
+    wrapper_hnd.plan(
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        window_left=512,
+        logits_soft_cap=50.0,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.uint8,
+        o_data_type=torch.bfloat16,
+        seq_lens=kv_lens_t,
+        block_tables=block_tables,
+    )
+    out_hnd = wrapper_hnd.run(
+        q,
+        (k_hnd, v_hnd),
+        kv_cache_sf=(k_sf_hnd, v_sf_hnd),
+        k_scale=k_scale,
+        v_scale=v_scale,
+        nvfp4_v_cache_uses_pv_layout=False,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(out_hnd.float()).all()
+    diff_hnd = (out_hnd.float() - out_normal.float()).abs().flatten()
+    assert diff_hnd.mean() < 1e-6
+    assert diff_hnd.max() < 1e-5

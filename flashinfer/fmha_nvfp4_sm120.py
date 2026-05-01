@@ -23,10 +23,7 @@ from typing import Optional, Tuple
 import torch
 
 from .api_logging import flashinfer_api
-from .jit import (
-    gen_fmha_nvfp4_sm120_module,
-    gen_fmha_nvfp4_sm120_utils_module,
-)
+from .jit import gen_fmha_nvfp4_sm120_module
 from .utils import check_shape_dtype_device
 
 
@@ -52,14 +49,25 @@ def _round_up(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
 
+def _empty_aligned(
+    shape: Tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    alignment: int = 4096,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    numel = math.prod(shape)
+    elem_size = torch.empty((), dtype=dtype).element_size()
+    nbytes = numel * elem_size
+    base = torch.empty(nbytes + alignment, dtype=torch.uint8, device=device)
+    offset = (-base.data_ptr()) % alignment
+    tensor = base[offset : offset + nbytes].view(dtype).view(shape)
+    return tensor, base
+
+
 @functools.cache
 def _get_sm120_nvfp4_fmha_module():
     return gen_fmha_nvfp4_sm120_module().build_and_load()
-
-
-@functools.cache
-def _get_sm120_nvfp4_fmha_utils_module():
-    return gen_fmha_nvfp4_sm120_utils_module().build_and_load()
 
 
 def _as_uint8_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -74,27 +82,31 @@ def _as_uint8_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
-    r"""SM120 NVFP4 paged prefill wrapper for BF16 Q/O and PV-layout NVFP4 KV.
+    r"""SM120 NVFP4 paged prefill wrapper for BF16 Q/O and NVFP4 KV.
 
     This wrapper is intentionally narrow: it exposes the productionized SM120
-    fused FMHA kernels for D128/D256/D512 and the PV-reblocked NVFP4 V layout
-    produced by :func:`flashinfer.nvfp4_quantize_paged_kv_cache` with
-    ``v_data_layout="pv"`` and ``v_scale_layout="pv"``.
+    fused FMHA kernels for D128/D256/D512. It can consume the PV-reblocked V
+    layout produced by :func:`flashinfer.nvfp4_quantize_paged_kv_cache` with
+    ``v_data_layout="pv"`` and ``v_scale_layout="pv"``, or the historical
+    normal V layout by reblocking V into PV scratch during the paged gather.
 
     The current implementation uses the source-tree csrc/JIT ``run_paged_batch``
-    bridge: paged K/V are gathered into dense scratch per sequence before the
-    fused dense SM120 kernel runs. The API boundary is the production boundary;
-    replacing the internal gather bridge with native block-table loads should
-    not require vLLM-side call-site changes.
+    path. D128/D256/D512 stage K and V directly from the paged block table.
+    PV-layout V is consumed directly, while normal-layout V is converted into
+    the PV MMA operand inside the stage producer. The API boundary is the
+    production boundary; callers do not need a different vLLM-side call site for
+    the native block-table load path.
     """
 
-    def __init__(self, workspace_buffer: torch.Tensor) -> None:
+    def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD") -> None:
         if workspace_buffer.dtype != torch.uint8 or not workspace_buffer.is_cuda:
             raise ValueError("workspace_buffer must be a CUDA torch.uint8 tensor.")
+        if kv_layout not in ("NHD", "HND"):
+            raise ValueError("kv_layout must be 'NHD' or 'HND'.")
         self._workspace_buffer = workspace_buffer
         self.device = workspace_buffer.device
+        self._kv_layout = kv_layout
         self._module = _get_sm120_nvfp4_fmha_module()
-        self._utils_module = _get_sm120_nvfp4_fmha_utils_module()
         self._planned = False
 
     def reset_workspace_buffer(self, workspace_buffer: torch.Tensor) -> None:
@@ -181,54 +193,43 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         num_splits = math.ceil((physical_kv_len // 128) / self._split_kv_tiles)
         total_q_rows = self._total_q_len * self._group_size
 
-        self._q_group = torch.empty(
-            (self._total_q_len, self._group_size, head_dim),
-            dtype=torch.bfloat16,
-            device=self.device,
+        self._scratch_bases = []
+
+        def alloc(shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            tensor, base = _empty_aligned(shape, dtype=dtype, device=self.device)
+            self._scratch_bases.append(base)
+            return tensor
+
+        self._q_group = alloc(
+            (self._total_q_len, self._group_size, head_dim), torch.bfloat16
         )
-        self._q_packed = torch.empty(
-            (total_q_rows, head_dim // 2), dtype=torch.uint8, device=self.device
+        self._q_packed = alloc((total_q_rows, head_dim // 2), torch.uint8)
+        self._q_scales = alloc((total_q_rows, head_dim // 16), torch.uint8)
+        self._q_packed_scratch = alloc(
+            (padded_q_rows, head_dim // 2), torch.uint8
         )
-        self._q_scales = torch.empty(
-            (total_q_rows, head_dim // 16), dtype=torch.uint8, device=self.device
+        self._q_scales_scratch = alloc(
+            (padded_q_rows, head_dim // 16), torch.uint8
         )
-        self._q_packed_scratch = torch.empty(
-            (padded_q_rows, head_dim // 2), dtype=torch.uint8, device=self.device
+        self._k_dense_scratch = alloc(
+            (physical_kv_len, head_dim // 2), torch.uint8
         )
-        self._q_scales_scratch = torch.empty(
-            (padded_q_rows, head_dim // 16), dtype=torch.uint8, device=self.device
+        self._k_sf_dense_scratch = alloc(
+            (physical_kv_len, head_dim // 16), torch.uint8
         )
-        self._k_dense_scratch = torch.empty(
-            (physical_kv_len, head_dim // 2), dtype=torch.uint8, device=self.device
+        self._v_pv_dense_scratch = alloc(
+            (head_dim, physical_kv_len // 2), torch.uint8
         )
-        self._k_sf_dense_scratch = torch.empty(
-            (physical_kv_len, head_dim // 16), dtype=torch.uint8, device=self.device
+        self._v_pv_sf_dense_scratch = alloc(
+            (head_dim, physical_kv_len // page_size), torch.uint8
         )
-        self._v_pv_dense_scratch = torch.empty(
-            (head_dim, physical_kv_len // 2), dtype=torch.uint8, device=self.device
+        self._partial = alloc(
+            (num_splits, padded_q_rows, head_dim), torch.bfloat16
         )
-        self._v_pv_sf_dense_scratch = torch.empty(
-            (head_dim, physical_kv_len // page_size),
-            dtype=torch.uint8,
-            device=self.device,
-        )
-        self._partial = torch.empty(
-            (num_splits, padded_q_rows, head_dim),
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        self._split_m = torch.empty(
-            (num_splits, padded_q_rows), dtype=torch.float32, device=self.device
-        )
-        self._split_l = torch.empty(
-            (num_splits, padded_q_rows), dtype=torch.float32, device=self.device
-        )
-        self._out_scratch = torch.empty(
-            (padded_q_rows, head_dim), dtype=torch.bfloat16, device=self.device
-        )
-        self._out_group = torch.empty(
-            (total_q_rows, head_dim), dtype=torch.bfloat16, device=self.device
-        )
+        self._split_m = alloc((num_splits, padded_q_rows), torch.float32)
+        self._split_l = alloc((num_splits, padded_q_rows), torch.float32)
+        self._out_scratch = alloc((padded_q_rows, head_dim), torch.bfloat16)
+        self._out_group = alloc((total_q_rows, head_dim), torch.bfloat16)
         self._planned = True
 
     @flashinfer_api
@@ -240,6 +241,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         *,
         k_scale: float,
         v_scale: float,
+        v_cache_uses_pv_layout: bool = True,
+        v_cache_sf_layout: str = "trtllm_interleaved",
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._planned:
@@ -261,28 +264,29 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         k_sf_pages, v_sf_pages_pv = kv_cache_sf
         k_sf_pages_u8 = _as_uint8_scale(k_sf_pages)
         v_sf_pages_pv_u8 = _as_uint8_scale(v_sf_pages_pv)
+        if v_cache_sf_layout not in ("trtllm_interleaved", "linear"):
+            raise ValueError("v_cache_sf_layout must be 'trtllm_interleaved' or 'linear'.")
+        if v_cache_uses_pv_layout and self._kv_layout != "NHD":
+            raise ValueError("PV-layout V cache is currently supported only with NHD layout.")
 
         expected_page_shape = (
-            None,
-            self._page_size,
-            self._num_kv_heads,
-            self._head_dim // 2,
+            (None, self._num_kv_heads, self._page_size, self._head_dim // 2)
+            if self._kv_layout == "HND"
+            else (None, self._page_size, self._num_kv_heads, self._head_dim // 2)
         )
         if k_pages.dtype != torch.uint8 or v_pages_pv.dtype != torch.uint8:
             raise ValueError("paged_kv_cache tensors must have dtype torch.uint8.")
         if k_pages.shape[1:] != expected_page_shape[1:]:
             raise ValueError(
                 "k_pages must have shape "
-                f"[num_pages, {self._page_size}, {self._num_kv_heads}, "
-                f"{self._head_dim // 2}], got {tuple(k_pages.shape)}."
+                f"{expected_page_shape}, got {tuple(k_pages.shape)}."
             )
         if v_pages_pv.shape != k_pages.shape:
             raise ValueError("v_pages_pv must have the same shape as k_pages.")
         expected_sf_shape = (
-            k_pages.shape[0],
-            self._page_size,
-            self._num_kv_heads,
-            self._head_dim // 16,
+            (k_pages.shape[0], self._num_kv_heads, self._page_size, self._head_dim // 16)
+            if self._kv_layout == "HND"
+            else (k_pages.shape[0], self._page_size, self._num_kv_heads, self._head_dim // 16)
         )
         if k_sf_pages_u8.shape != expected_sf_shape:
             raise ValueError(
@@ -304,9 +308,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             qo_start = kv_head * self._group_size
             qo_stop = qo_start + self._group_size
             self._q_group.copy_(q[:, qo_start:qo_stop, :])
-            self._utils_module.quantize_q(
-                self._q_group, self._q_packed, self._q_scales
-            )
+            self._module.quantize_q(self._q_group, self._q_packed, self._q_scales)
             self._module.run_paged_batch(
                 self._q_packed,
                 self._q_scales,
@@ -338,6 +340,9 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 self._window_left,
                 self._logits_soft_cap,
                 self._output_group_span,
+                bool(v_cache_uses_pv_layout),
+                v_cache_sf_layout == "trtllm_interleaved",
+                self._kv_layout == "HND",
             )
             out[:, qo_start:qo_stop, :].copy_(
                 self._out_group.view(
