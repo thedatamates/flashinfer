@@ -7,6 +7,7 @@ import math
 import torch
 
 import flashinfer
+from flashinfer.fmha_nvfp4_sm120 import BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper
 from flashinfer.jit import gen_fmha_nvfp4_sm120_module
 
 from bench_sm120_nvfp4_cutlass_fused_attention import (
@@ -59,7 +60,7 @@ def main() -> None:
         help=(
             "dense benchmarks the low-level prepacked run_dense binding; "
             "paged-wrapper benchmarks the production Python wrapper, including "
-            "Q quantization, paged gather, fused attention, and output scatter."
+            "Q quantization, native paged KV loads, fused attention, and output scatter."
         ),
     )
     parser.add_argument("--num-kv-heads", type=int, default=1)
@@ -135,9 +136,7 @@ def main() -> None:
         kv_lens = torch.tensor([args.kv_len], dtype=torch.int32, device="cpu")
         out = torch.empty_like(q)
         workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
-        wrapper = flashinfer.BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(
-            workspace
-        )
+        wrapper = BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(workspace)
         wrapper.plan(
             qo_indptr,
             block_tables,
@@ -173,6 +172,7 @@ def main() -> None:
             "group": args.group,
             "num_kv_heads": args.num_kv_heads,
             "output_group_span": output_group_span,
+            "split_kv_len": args.split_kv_len,
             "causal": bool(args.causal),
             "sliding_window": args.sliding_window,
             "logits_soft_cap": args.logits_soft_cap,

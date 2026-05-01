@@ -14248,3 +14248,85 @@ tests/v1/attention/test_trtllm_attention_integration.py::
 
 5 passed in 7.13s
 ```
+
+## Production Benchmark Path Cleanup
+
+Benchmarks now use the same production FlashInfer wrapper/JIT boundary as the
+vLLM integration path instead of the removed benchmark-only paged bridge.
+
+Changed benchmark ownership:
+
+```text
+- bench_gemma4_attention_grid.py: sm120_fused already routes through
+  bench_fmha_nvfp4_sm120.py --mode paged-wrapper.
+- bench_sm120_d256_hillclimb.py: sm120_fused now routes through
+  bench_fmha_nvfp4_sm120.py --mode paged-wrapper instead of the old
+  benchmark extension dense path.
+- bench_fmha_nvfp4_sm120.py: imports
+  BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper from the production module
+  directly and reports split_kv_len for production wrapper runs.
+```
+
+Removed benchmark-only legacy bridge code:
+
+```text
+- benchmarks/sm120_nvfp4_paged_adapter.cuh
+- benchmarks/sm120_nvfp4_paged_attention_bridge.cuh
+- sm120_nvfp4_gather_paged_kv_to_dense_pv debug export
+- sm120_nvfp4_paged_qkv_online_register_q_splitkv_full_grid debug export
+- sm120_nvfp4_varlen_paged_qkv_online_register_q_splitkv_full_grid debug export
+- --paged-adapter-check / --paged-bridge-check /
+  --varlen-paged-bridge-check flags
+```
+
+The remaining `bench_sm120_nvfp4_cutlass_fused_attention.py` extension is now
+dense/atom-debug only. Production paged, varlen, causal, sliding-window, and
+logit-softcap benchmarking goes through `BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper`.
+
+Sanity grep over active benchmark/source/test files found no remaining matches
+for:
+
+```text
+paged_adapter | paged_bridge | varlen_paged | gather_paged |
+k_dense_scratch | v_pv_dense_scratch | paged gather
+```
+
+Validation:
+
+```text
+# Python benchmark syntax
+benchmarks/bench_sm120_d256_hillclimb.py
+benchmarks/bench_fmha_nvfp4_sm120.py
+benchmarks/bench_gemma4_attention_grid.py
+benchmarks/bench_sm120_nvfp4_cutlass_fused_attention.py
+
+py_compile: passed
+
+# Direct production wrapper smoke
+bench_fmha_nvfp4_sm120.py --mode paged-wrapper
+  --q-len 512 --kv-len 8192 --head-dim 256 --group 6
+  --split-kv-len 1024 --output-group-span 2 --causal
+  --logits-soft-cap 50.0 --warmup 0 --repeat 1
+
+output_finite: true
+production_paged_wrapper: true
+
+# Hillclimb one-cell route smoke
+bench_sm120_d256_hillclimb.py --kernels sm120_fused
+  --q-lens 512 --kv-lens 8192 --groups 6 --warmup 1 --repeat 1
+
+status: ok
+command includes: bench_fmha_nvfp4_sm120.py --mode paged-wrapper
+
+# Gemma4 grid one-cell route smoke
+bench_gemma4_attention_grid.py --kernels sm120_fused
+  --shapes A --q-lens 512 --kv-lens 1024 --warmup 1 --repeat 1
+
+status: ok
+
+# Clean-cache dense/atom debug extension compile smoke
+bench_sm120_nvfp4_cutlass_fused_attention.py
+  --head-dim 256 --sm120-role-schedule-check-only
+
+sm120_role_schedule_smoke: true
+```

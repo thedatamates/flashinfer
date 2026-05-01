@@ -10,9 +10,6 @@
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_d128.cuh>
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_quantization.cuh>
 
-#include "sm120_nvfp4_paged_adapter.cuh"
-#include "sm120_nvfp4_paged_attention_bridge.cuh"
-
 namespace {
 
 using namespace flashinfer::attention::blackwell::sm120_nvfp4::d128;
@@ -351,7 +348,8 @@ void sm120_nvfp4_qkv_online_register_q_stage(torch::Tensor q_packed,
       static_cast<int>(q_tile), static_cast<int>(kv_tile_start),
       static_cast<int>(num_kv_tiles), kKvLen / kCutlassTileN,
       kQLen, kGroup, kKvLen, 0, -1, 0.0f,
-      static_cast<int>(out_group_idx), kOutputTileN, nullptr, nullptr, 0, 0);
+      static_cast<int>(out_group_idx), kOutputTileN, nullptr, nullptr, 0, 0,
+      Sm120Nvfp4PagedKvLoadParams{}, nullptr, nullptr, 1, 0);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -452,7 +450,8 @@ void sm120_nvfp4_qkv_online_register_q_full_grid(torch::Tensor q_packed,
       static_cast<float>(qk_alpha), static_cast<float>(pv_alpha), 0, 0,
       kKvLen / kCutlassTileN, kKvLen / kCutlassTileN,
       kQLen, kGroup, kKvLen, 0, -1, 0.0f,
-      0, kHeadDim, nullptr, nullptr, 0, 0);
+      0, kHeadDim, nullptr, nullptr, 0, 0,
+      Sm120Nvfp4PagedKvLoadParams{}, nullptr, nullptr, 1, 0);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -596,111 +595,6 @@ void sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
       partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
       split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
       sliding_window, logits_soft_cap);
-}
-
-void sm120_nvfp4_paged_qkv_online_register_q_splitkv_full_grid(
-    torch::Tensor q_packed,
-    torch::Tensor q_scales,
-    torch::Tensor k_pages,
-    torch::Tensor k_sf_pages,
-    torch::Tensor v_pages_pv,
-    torch::Tensor v_sf_pages_pv,
-    torch::Tensor block_table,
-    torch::Tensor k_dense_scratch,
-    torch::Tensor k_sf_dense_scratch,
-    torch::Tensor v_pv_dense_scratch,
-    torch::Tensor v_pv_sf_dense_scratch,
-    torch::Tensor partial,
-    torch::Tensor split_m,
-    torch::Tensor split_l,
-    torch::Tensor out,
-    torch::Tensor workspace,
-    double qk_alpha,
-    double pv_alpha,
-    int64_t kv_head,
-    int64_t split_kv_tiles,
-    int64_t q_len,
-    int64_t group_size,
-    int64_t kv_len_tokens,
-    bool causal,
-    int64_t sliding_window,
-    double logits_soft_cap,
-    int64_t output_group_span) {
-  TORCH_CHECK(output_group_span == 1,
-              "D128 paged bridge supports output_group_span=1 only");
-  auto run_dense = [](torch::Tensor q_packed, torch::Tensor q_scales,
-                      torch::Tensor k_packed, torch::Tensor k_scales,
-                      torch::Tensor v_pv_packed, torch::Tensor v_pv_scales,
-                      torch::Tensor partial, torch::Tensor split_m,
-                      torch::Tensor split_l, torch::Tensor out,
-                      torch::Tensor workspace, double qk_alpha,
-                      double pv_alpha, int64_t split_kv_tiles, int64_t q_len,
-                      int64_t group_size, int64_t kv_len_tokens, bool causal,
-                      int64_t sliding_window, double logits_soft_cap,
-                      int64_t output_group_span) {
-    TORCH_CHECK(output_group_span == 1,
-                "D128 dense runner supports output_group_span=1 only");
-    sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
-        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
-        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-        split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
-        sliding_window, logits_soft_cap);
-  };
-  sm120_nvfp4_paged_bridge::paged_qkv_attention_single(
-      q_packed, q_scales, k_pages, k_sf_pages, v_pages_pv, v_sf_pages_pv,
-      block_table, k_dense_scratch, k_sf_dense_scratch, v_pv_dense_scratch,
-      v_pv_sf_dense_scratch, partial, split_m, split_l, out, workspace,
-      qk_alpha, pv_alpha, kv_head, split_kv_tiles, q_len, group_size,
-      kv_len_tokens, causal, sliding_window, logits_soft_cap,
-      output_group_span, run_dense);
-}
-
-void sm120_nvfp4_varlen_paged_qkv_online_register_q_splitkv_full_grid(
-    torch::Tensor q_packed,
-    torch::Tensor q_scales,
-    torch::Tensor k_pages,
-    torch::Tensor k_sf_pages,
-    torch::Tensor v_pages_pv,
-    torch::Tensor v_sf_pages_pv,
-    torch::Tensor block_tables,
-    torch::Tensor cu_seqlens_q,
-    torch::Tensor kv_lens,
-    torch::Tensor out,
-    torch::Tensor workspace,
-    double qk_alpha,
-    double pv_alpha,
-    int64_t kv_head,
-    int64_t group_size,
-    int64_t split_kv_tiles,
-    bool causal,
-    int64_t sliding_window,
-    double logits_soft_cap,
-    int64_t output_group_span) {
-  TORCH_CHECK(output_group_span == 1,
-              "D128 varlen paged bridge supports output_group_span=1 only");
-  auto run_dense = [](torch::Tensor q_packed, torch::Tensor q_scales,
-                      torch::Tensor k_packed, torch::Tensor k_scales,
-                      torch::Tensor v_pv_packed, torch::Tensor v_pv_scales,
-                      torch::Tensor partial, torch::Tensor split_m,
-                      torch::Tensor split_l, torch::Tensor out,
-                      torch::Tensor workspace, double qk_alpha,
-                      double pv_alpha, int64_t split_kv_tiles, int64_t q_len,
-                      int64_t group_size, int64_t kv_len_tokens, bool causal,
-                      int64_t sliding_window, double logits_soft_cap,
-                      int64_t output_group_span) {
-    TORCH_CHECK(output_group_span == 1,
-                "D128 dense runner supports output_group_span=1 only");
-    sm120_nvfp4_qkv_online_register_q_splitkv_full_grid(
-        q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
-        partial, split_m, split_l, out, workspace, qk_alpha, pv_alpha,
-        split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
-        sliding_window, logits_soft_cap);
-  };
-  sm120_nvfp4_paged_bridge::varlen_paged_qkv_attention(
-      q_packed, q_scales, k_pages, k_sf_pages, v_pages_pv, v_sf_pages_pv,
-      block_tables, cu_seqlens_q, kv_lens, out, workspace, qk_alpha, pv_alpha,
-      kv_head, group_size, split_kv_tiles, causal, sliding_window,
-      logits_soft_cap, output_group_span, run_dense);
 }
 
 RunnerConfig runner_config_from_tactic(int64_t tactic) {
@@ -1172,15 +1066,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sm120_nvfp4_qkv_online_register_q_splitkv_full_grid",
         &sm120_nvfp4_qkv_online_register_q_splitkv_full_grid,
         "SM120 NVFP4 split-KV online-softmax full Shape-B tile grid");
-  m.def("sm120_nvfp4_gather_paged_kv_to_dense_pv",
-        &sm120_nvfp4_paged_adapter::gather_paged_kv_to_dense_pv,
-        "Gather one paged NVFP4 K/V head into dense K and PV-ready V operands");
-  m.def("sm120_nvfp4_paged_qkv_online_register_q_splitkv_full_grid",
-        &sm120_nvfp4_paged_qkv_online_register_q_splitkv_full_grid,
-        "SM120 NVFP4 paged-KV bridge into the dense split-KV fused attention kernel");
-  m.def("sm120_nvfp4_varlen_paged_qkv_online_register_q_splitkv_full_grid",
-        &sm120_nvfp4_varlen_paged_qkv_online_register_q_splitkv_full_grid,
-        "SM120 NVFP4 varlen paged-KV bridge into the dense split-KV fused attention kernel");
   m.def("cutlass_runner_fp4_gemm", &cutlass_runner_fp4_gemm,
         "FlashInfer SM120 CUTLASS FP4 GEMM runner smoke hook");
   m.def("cutlass_active_tile_fp4_gemm", &cutlass_active_tile_fp4_gemm,

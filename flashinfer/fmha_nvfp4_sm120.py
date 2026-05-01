@@ -88,7 +88,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
     fused FMHA kernels for D128/D256/D512. It can consume the PV-reblocked V
     layout produced by :func:`flashinfer.nvfp4_quantize_paged_kv_cache` with
     ``v_data_layout="pv"`` and ``v_scale_layout="pv"``, or the historical
-    normal V layout by reblocking V into PV scratch during the paged gather.
+    normal V layout by reblocking V into the PV MMA operand in the stage
+    producer.
 
     The current implementation uses the source-tree csrc/JIT ``run_paged_batch``
     path. D128/D256/D512 stage K and V directly from the paged block table.

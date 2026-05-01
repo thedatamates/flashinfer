@@ -91,18 +91,15 @@ def run_json(command: list[str], *, env: dict[str, str], timeout_sec: int) -> di
 
 
 def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]:
-    bench_flag = {
-        1: "--sm120-qkv-online-splitkv-full-grid-bench",
-        2: "--sm120-qkv-online-splitkv-reuse2-full-grid-bench",
-        4: "--sm120-qkv-online-splitkv-reuse4-full-grid-bench",
-    }.get(args.fused_output_group_span)
-    if bench_flag is None:
+    if args.fused_output_group_span not in (1, 2, 4):
         raise ValueError("--fused-output-group-span must be one of 1, 2, or 4")
     return [
         sys.executable,
-        str(root / "benchmarks" / "bench_sm120_nvfp4_cutlass_fused_attention.py"),
+        str(root / "benchmarks" / "bench_fmha_nvfp4_sm120.py"),
         "--device",
         str(args.device),
+        "--mode",
+        "paged-wrapper",
         "--q-len",
         str(cell.q_len),
         "--kv-len",
@@ -117,7 +114,13 @@ def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]
         str(args.warmup),
         "--repeat",
         str(args.repeat),
-        bench_flag,
+        "--output-group-span",
+        str(args.fused_output_group_span),
+        "--causal",
+        "--sliding-window",
+        str(args.sliding_window),
+        "--logits-soft-cap",
+        str(args.logits_soft_cap),
     ]
 
 
@@ -159,6 +162,10 @@ def flashinfer_command(
         "linear",
         "--bf16-backend",
         "fa2",
+        "--window-left",
+        str(args.sliding_window),
+        "--logits-soft-cap",
+        str(args.logits_soft_cap),
         "--warmup",
         str(args.warmup),
         "--repeat",
@@ -217,6 +224,10 @@ def summarize(
         "storage_bytes": None,
         "command": " ".join(command),
     }
+
+
+def format_optional_float(value: Any) -> str:
+    return "-" if value is None else f"{float(value):.6f}"
 
 
 def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
@@ -317,7 +328,7 @@ def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
                 f"{'-' if fp8_ms is None else f'{fp8_ms:.6f}'} | "
                 f"{'-' if bf16_ms is None else f'{bf16_ms:.6f}'} | "
                 f"{row['fused_vs_nvfp4_fa2_speedup']:.3f}x | "
-                f"{row['fused_cosine']:.6f} | "
+                f"{format_optional_float(row['fused_cosine'])} | "
                 f"{'yes' if row['passes_2x'] else 'no'} |\n"
             )
 
@@ -455,7 +466,7 @@ def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
                 f"{'-' if fp8_ms is None else f'{fp8_ms:.6f}'} | "
                 f"{'-' if bf16_ms is None else f'{bf16_ms:.6f}'} | "
                 f"{row['fused_vs_nvfp4_fa2_speedup']:.3f}x | "
-                f"{row['fused_cosine']:.6f} | "
+                f"{format_optional_float(row['fused_cosine'])} | "
                 f"{'yes' if row['passes_2x'] else 'no'} |\n"
             )
 
@@ -510,6 +521,8 @@ def main() -> None:
     parser.add_argument("--head-dim", type=int, default=256)
     parser.add_argument("--fused-split-kv-len", type=int, default=6656)
     parser.add_argument("--fused-output-group-span", type=int, default=2)
+    parser.add_argument("--sliding-window", type=int, default=-1)
+    parser.add_argument("--logits-soft-cap", type=float, default=50.0)
     parser.add_argument(
         "--q-lens",
         type=str,
