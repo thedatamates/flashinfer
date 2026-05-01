@@ -14428,3 +14428,50 @@ bench_sm120_d256_hillclimb.py --kernels sm120_fused
 status: ok
 command includes: bench_fmha_nvfp4_sm120.py --mode paged-wrapper
 ```
+
+## Restore 180-Cell Sweep Defaults
+
+`bench_sm120_d256_hillclimb.py` now treats `--q-lens all --kv-lens all
+--groups all` as the 180-cell validation matrix again:
+
+```text
+q_len:  {128, 256, 512, 1024, 2048, 4096}
+kv_len: {8192, 32768, 65536, 131072, 262144}
+group:  {2, 4, 6, 8, 12, 16}
+
+6 * 5 * 6 = 180 cells
+```
+
+The fused output-group span now defaults from the selected head dimension:
+
+```text
+--fused-output-group-span 0
+  D128 -> 1
+  D256 -> 2
+  D512 -> 4
+```
+
+That means the same harness invocation shape can validate all three
+specializations by changing only `--head-dim`:
+
+```text
+bench_sm120_d256_hillclimb.py --kernels sm120_fused --head-dim 128
+bench_sm120_d256_hillclimb.py --kernels sm120_fused --head-dim 256
+bench_sm120_d256_hillclimb.py --kernels sm120_fused --head-dim 512
+```
+
+Validation:
+
+```text
+py_compile benchmarks/bench_sm120_d256_hillclimb.py: passed
+
+cell_count: 180
+default spans: D128=1, D256=2, D512=4
+
+Smoke:
+bench_sm120_d256_hillclimb.py --kernels sm120_fused --head-dim 128
+  --q-lens 128 --kv-lens 8192 --groups 2 --warmup 1 --repeat 1
+
+status: ok
+command includes: --output-group-span 1
+```

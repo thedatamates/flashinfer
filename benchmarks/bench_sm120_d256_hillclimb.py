@@ -20,9 +20,9 @@ class Cell:
     group: int = 2
 
 
-DEFAULT_Q_LENS = (2048, 4096, 8192, 16384, 32768)
-DEFAULT_KV_LENS = (16384, 32768, 65536, 131072, 262144)
-DEFAULT_GROUPS = (2, 4, 6, 8)
+DEFAULT_Q_LENS = (128, 256, 512, 1024, 2048, 4096)
+DEFAULT_KV_LENS = (8192, 32768, 65536, 131072, 262144)
+DEFAULT_GROUPS = (2, 4, 6, 8, 12, 16)
 
 KERNELS = ("sm120_fused", "nvfp4_fa2", "fp8_fa2", "bf16_fa2")
 
@@ -34,6 +34,24 @@ def parse_int_list(value: str, *, default: tuple[int, ...]) -> tuple[int, ...]:
     if not parsed:
         raise ValueError("empty integer list")
     return parsed
+
+
+def default_output_group_span(head_dim: int) -> int:
+    if head_dim == 128:
+        return 1
+    if head_dim == 256:
+        return 2
+    if head_dim == 512:
+        return 4
+    raise ValueError("--head-dim must be one of 128, 256, or 512")
+
+
+def fused_output_group_span(args: argparse.Namespace) -> int:
+    if args.fused_output_group_span == 0:
+        return default_output_group_span(args.head_dim)
+    if args.fused_output_group_span not in (1, 2, 4):
+        raise ValueError("--fused-output-group-span must be 0, 1, 2, or 4")
+    return int(args.fused_output_group_span)
 
 
 def build_cells(args: argparse.Namespace) -> list[Cell]:
@@ -91,8 +109,7 @@ def run_json(command: list[str], *, env: dict[str, str], timeout_sec: int) -> di
 
 
 def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]:
-    if args.fused_output_group_span not in (1, 2, 4):
-        raise ValueError("--fused-output-group-span must be one of 1, 2, or 4")
+    output_group_span = fused_output_group_span(args)
     return [
         sys.executable,
         str(root / "benchmarks" / "bench_fmha_nvfp4_sm120.py"),
@@ -115,7 +132,7 @@ def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]
         "--repeat",
         str(args.repeat),
         "--output-group-span",
-        str(args.fused_output_group_span),
+        str(output_group_span),
         "--causal",
         "--sliding-window",
         str(args.sliding_window),
@@ -520,7 +537,12 @@ def main() -> None:
     parser.add_argument("--timeout-sec", type=int, default=900)
     parser.add_argument("--head-dim", type=int, default=256)
     parser.add_argument("--fused-split-kv-len", type=int, default=6656)
-    parser.add_argument("--fused-output-group-span", type=int, default=2)
+    parser.add_argument(
+        "--fused-output-group-span",
+        type=int,
+        default=0,
+        help="0 selects the default span for --head-dim: D128=1, D256=2, D512=4.",
+    )
     parser.add_argument("--sliding-window", type=int, default=-1)
     parser.add_argument("--logits-soft-cap", type=float, default=50.0)
     parser.add_argument(
@@ -556,6 +578,7 @@ def main() -> None:
     unknown = sorted(set(kernels) - set(KERNELS))
     if unknown:
         raise ValueError(f"unknown kernels: {unknown}")
+    output_group_span = fused_output_group_span(args)
     cells = build_cells(args)
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -600,7 +623,7 @@ def main() -> None:
                     kernel=kernel,
                     data=data,
                     command=command,
-                    fused_output_group_span=args.fused_output_group_span,
+                    fused_output_group_span=output_group_span,
                 )
                 row["status"] = "ok"
                 row["error"] = None
@@ -609,7 +632,7 @@ def main() -> None:
                     cell=cell,
                     kernel=kernel,
                     command=command,
-                    fused_output_group_span=args.fused_output_group_span,
+                    fused_output_group_span=output_group_span,
                     error=exc,
                 )
             rows.append(row)
