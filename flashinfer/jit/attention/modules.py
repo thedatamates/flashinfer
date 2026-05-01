@@ -26,6 +26,7 @@ from ..core import (
     gen_jit_spec,
     logger,
     sm90a_nvcc_flags,
+    sm120f_nvcc_flags,
     current_compilation_context,
 )
 from ...jit.cubin_loader import get_artifact, get_meta_hash
@@ -1792,6 +1793,44 @@ def gen_fmha_cutlass_sm100a_module(
         uri,
         source_paths,
         extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_fmha_nvfp4_sm120_utils_module() -> JitSpec:
+    uri = "fmha_nvfp4_sm120_utils"
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_nvfp4_sm120_utils.cu",
+    ]
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=sm120f_nvcc_flags + ["-DFLASHINFER_ENABLE_BF16"],
+    )
+
+
+def gen_fmha_nvfp4_sm120_module() -> JitSpec:
+    uri = "fmha_nvfp4_sm120"
+    cutlass_root = os.environ.get("CUTLASS_ROOT")
+    repo_cutlass_root = jit_env.FLASHINFER_DATA.parents[1] / "3rdparty" / "cutlass"
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_nvfp4_sm120.cu",
+    ]
+    extra_include_paths = None
+    if cutlass_root:
+        extra_include_paths = [
+            os.path.join(cutlass_root, "include"),
+            os.path.join(cutlass_root, "tools", "util", "include"),
+        ]
+    elif repo_cutlass_root.exists():
+        extra_include_paths = [
+            repo_cutlass_root / "include",
+            repo_cutlass_root / "tools" / "util" / "include",
+        ]
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=sm120f_nvcc_flags + ["-DFLASHINFER_ENABLE_BF16"],
+        extra_include_paths=extra_include_paths,
     )
 
 

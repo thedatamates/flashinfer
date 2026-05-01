@@ -13239,3 +13239,220 @@ shape scalars, and stream. The Torch adapter remains as validation/plumbing but
 now delegates the actual page gather to that source-tree launcher. D256 paged
 and varlen bridge validation was rerun after this extraction and remained
 bit-identical to the dense path.
+
+## Integration Phase: Source-Tree Utility JIT Module
+
+2026-04-30T20:05:00-05:00
+
+The Q quantizer and paged K/V gather now have FlashInfer source-tree entry
+points that do not depend on the benchmark pybind extension:
+
+```text
+include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_quantization.cuh
+  quantize_q_rowmajor_raw(...)
+
+include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_adapter.cuh
+  gather_paged_kv_to_dense_pv_raw(...)
+
+csrc/fmha_nvfp4_sm120_utils.cu
+  TVM-FFI exports:
+    quantize_q(...)
+    gather_paged_kv_to_dense_pv(...)
+
+flashinfer.jit.gen_fmha_nvfp4_sm120_utils_module()
+```
+
+The benchmark D128/D256/D512 extensions now call the source-tree Q quantizer
+instead of their local launch body. The local benchmark helpers remain only as
+validation scaffolding until the fused attention kernels themselves move out of
+`benchmarks/`.
+
+Validation:
+
+```text
+JIT module build:
+  gen_fmha_nvfp4_sm120_utils_module().build_and_load()
+  exports quantize_q=true, gather_paged_kv_to_dense_pv=true
+
+SM120 functional check on RTX PRO 6000 Blackwell:
+  quantize_q: launched on BF16 q=[4,2,128], produced nonzero packed/scales
+  paged gather: deterministic K/K-scale/V-PV/V-scale references all matched
+                exactly with shuffled physical pages and kv_head=1
+
+D256 bridge smoke after source-tree Q quantizer:
+  paged bridge vs dense cosine=1.0000001
+  varlen paged bridge vs dense cosine=1.0000001
+  exact-ref cosine=0.990931
+```
+
+Remaining production migration:
+
+```text
+1. Move the fused attention raw launchers and kernel implementation out of
+   benchmark .cu files.
+2. Replace Torch-only paged/varlen bridge allocation with caller-managed
+   workspace layout.
+3. Add a TVM-FFI fused attention run binding for D128/D256/D512.
+4. Wire backend dispatch only after the source-tree run binding compiles and
+   passes the same D128/D256/D512 paged/varlen correctness gates.
+```
+
+Layering correction:
+
+```text
+Rejected: dual-purpose benchmark files controlled by a SOURCE_ONLY-style macro.
+
+Expected FlashInfer production structure:
+  include/flashinfer/attention/blackwell/...
+    reusable CUDA implementation and raw launch helpers
+
+  csrc/...
+    thin TVM-FFI production bindings that validate TensorView and call the
+    launch helpers
+
+  benchmarks/...
+    Torch/pybind benchmark wrappers that call the same launch helpers
+
+Benchmarks should measure the production kernel implementation, but the
+benchmark .cu file should not become the production translation unit. Extract
+the shared implementation into headers first, then wire csrc and benchmarks to
+that shared implementation.
+```
+
+## Integration Phase: Production Header And Run Binding
+
+2026-04-30T18:45:55-05:00
+
+The fused D128/D256/D512 kernels have been extracted from benchmark-owned
+translation units into reusable FlashInfer include headers:
+
+```text
+include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d128.cuh
+include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh
+include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh
+```
+
+The benchmark `.cu` files are now thin Torch/pybind wrappers around the same
+source-tree implementation. They no longer own the production kernels. The
+shared implementation headers are free of Torch and pybind symbols.
+
+The Gemma grid's `sm120_fused` column now benchmarks the csrc/JIT production
+module through:
+
+```text
+benchmarks/bench_fmha_nvfp4_sm120.py
+```
+
+The old pybind benchmark extension remains available for low-level diagnostics,
+but it is no longer the grid path for the fused-kernel column.
+
+A production TVM-FFI fused attention module now exists:
+
+```text
+csrc/fmha_nvfp4_sm120.cu
+  TVM-FFI exports:
+    run_dense(...)
+    run_paged_single(...)
+    run_paged_batch(...)
+
+flashinfer.jit.gen_fmha_nvfp4_sm120_module()
+```
+
+`run_dense` dispatches D128/D256/D512 by `head_dim` and selects the
+specialized output-group span. `run_paged_single` gathers one sequence's paged
+K/V cache into caller-managed dense scratch and then launches the same dense
+fused kernel.
+
+`run_paged_batch` adds the source-tree varlen production boundary. It accepts
+block tables, `qo_indptr`, `kv_lens`, and caller-managed scratch tensors. The
+csrc layer does host-side sequence scheduling, gathers each sequence's paged
+K/V into scratch, pads Q rows to the head-dim specialization's tile-M
+requirement, launches the fused dense kernel, and copies only real rows back to
+the output tensor. This removes the Torch-only benchmark bridge from the
+validation path. It is still a gather-bridge implementation, not the final
+native in-mainloop block-table load path.
+
+Validation:
+
+```text
+JIT module build:
+  gen_fmha_nvfp4_sm120_module().build_and_load()
+  exports run_dense=true, run_paged_single=true
+
+D256 production FFI dense vs benchmark wrapper:
+  q=512 kv=8192 group=6 head_dim=256 causal sliding_window=1024 softcap=50
+  ffi_vs_ext_equal=true
+  ffi_vs_ext_max_abs=0.0
+
+D256 production FFI paged_single vs dense:
+  paged_vs_dense_equal=true
+  paged_vs_dense_max_abs=0.0
+  scratch K/K-scale/V-PV/V-scale all matched the paged adapter reference
+
+D256 production FFI paged_batch, two sequences:
+  q_lens=[256,512], kv_lens=[8192,8192], group=6
+  paged_batch_vs_single_equal=true
+  paged_batch_vs_single_max_abs=0.0
+
+D256 production FFI paged_batch with Q padding:
+  q_lens=[257,511], kv_lens=[8192,8192], group=6
+  paged_batch_padding_vs_manual_dense_equal=true
+  paged_batch_padding_vs_manual_dense_max_abs=0.0
+
+D128/D512 production FFI paged_batch with Q padding:
+  D128 q_lens=[129,257], kv_lens=[8192,8192], group=8
+    paged_batch_padding_equal=true, max_abs=0.0
+  D512 q_lens=[129,257], kv_lens=[8192,8192], group=4
+    paged_batch_padding_equal=true, max_abs=0.0
+
+D128 benchmark smoke after extraction:
+  q=512 kv=8192 group=8 causal sliding_window=1024 softcap=50
+  paged bridge vs dense cosine=1.0
+  varlen paged bridge vs dense cosine=1.0
+  exact-ref cosine=0.994457
+
+D512 benchmark smoke after extraction:
+  q=512 kv=8192 group=4 causal sliding_window=1024 softcap=50
+  paged bridge vs dense cosine=1.0000001
+  varlen paged bridge vs dense cosine=1.0000001
+  exact-ref cosine=0.988548
+
+csrc/JIT benchmark smoke:
+  D256 q=512 kv=8192 group=6 output_group_span=2
+    min_ms=0.491840, output_finite=true
+  D256 q=512 kv=8192 group=6 output_group_span=2 without CUTLASS_ROOT
+    min_ms=0.490816, output_finite=true
+  Gemma grid sm120_fused smoke:
+    Shape B q=512 kv=8192 D512 group=8
+    min_ms=1.943552, status=ok
+```
+
+Important dependency note:
+
+```text
+The fused JIT module originally needed CUTLASS_ROOT=/home/josh/tdm/cutlass so
+the build could see the SM120 cooperative/block-scaled CUTLASS fixes. The repo
+submodule has now been moved to the patched local CUTLASS commit:
+
+  e095a676 Support M32 SM120 blockscaled NVFP4 GEMM
+
+`gen_fmha_nvfp4_sm120_module()` now prefers `3rdparty/cutlass` when running
+from a source checkout, and falls back to packaged `flashinfer.data.cutlass` in
+installed builds. Clean JIT validation without CUTLASS_ROOT:
+
+  fmha_module_loaded_no_cutlass_root=true
+
+For PR hygiene, the CUTLASS submodule commit must be reachable by whichever
+remote the FlashInfer fork uses before this branch is shared.
+```
+
+Remaining production migration:
+
+```text
+1. Replace the paged gather bridge with native block-table loads inside the
+   fused mainloop if the bridge is not fast enough for vLLM serving.
+2. Wire backend dispatch only after the source-tree run binding is wrapped by a
+   FlashInfer Python API and benchmarked against the real vLLM call shape.
+3. Remove any benchmark-only debug kernels or exports that are no longer part
+   of the production validation surface.
+```
