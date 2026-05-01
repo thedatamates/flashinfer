@@ -7,15 +7,9 @@ import math
 import torch
 
 import flashinfer
+from flashinfer import SfLayout
 from flashinfer.fmha_nvfp4_sm120 import BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper
 from flashinfer.jit import gen_fmha_nvfp4_sm120_module
-
-from bench_sm120_nvfp4_cutlass_fused_attention import (
-    event_ms,
-    make_shape_inputs,
-    quantize_cutlass,
-)
-from bench_sm120_nvfp4_ref_attention import nvfp4_rowmajor_to_fp32
 
 
 def default_output_group_span(head_dim: int) -> int:
@@ -35,6 +29,64 @@ def bench_key(output_group_span: int) -> str:
         f"bench_sm120_qkv_online_register_q_splitkv_reuse"
         f"{output_group_span}_full_grid"
     )
+
+
+def event_ms(fn, *, warmup: int, repeat: int) -> dict[str, float]:
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    samples = []
+    for _ in range(repeat):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end))
+    return {
+        "min_ms": min(samples),
+        "mean_ms": sum(samples) / len(samples),
+        "max_ms": max(samples),
+    }
+
+
+def global_scale(x: torch.Tensor) -> torch.Tensor:
+    return ((448.0 * 6.0) / x.float().abs().nan_to_num().max()).reshape(1).float()
+
+
+def quantize_cutlass(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    scale = global_scale(x)
+    packed, block_scale = flashinfer.nvfp4_quantize(
+        x,
+        scale,
+        sfLayout=SfLayout.layout_128x4,
+        do_shuffle=False,
+    )
+    return packed, block_scale, scale
+
+
+def make_bf16_shape_inputs(
+    device: torch.device,
+    *,
+    q_len: int,
+    group: int,
+    kv_len: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1234)
+    q = (torch.randn((q_len, group, head_dim), device=device, generator=gen) / 4).to(
+        torch.bfloat16
+    )
+    k = (torch.randn((kv_len, head_dim), device=device, generator=gen) / 4).to(
+        torch.bfloat16
+    )
+    v = (torch.randn((kv_len, head_dim), device=device, generator=gen) / 4).to(
+        torch.bfloat16
+    )
+    return q.contiguous(), k.contiguous(), v.contiguous()
 
 
 def main() -> None:
@@ -182,21 +234,19 @@ def main() -> None:
         print(json.dumps(result, sort_keys=True))
         return
 
-    q, k, v, k_scales_ref, v_scales_ref = make_shape_inputs(
+    q, k_bf16, v_bf16 = make_bf16_shape_inputs(
         device,
         q_len=args.q_len,
         group=args.group,
         kv_len=args.kv_len,
         head_dim=args.head_dim,
     )
-    k_ref = nvfp4_rowmajor_to_fp32(k, k_scales_ref).to(torch.bfloat16)
-    v_ref = nvfp4_rowmajor_to_fp32(v, v_scales_ref).to(torch.bfloat16)
     q_packed, q_scales, q_global = quantize_cutlass(
         q.reshape(q_rows, args.head_dim)
     )
-    k_packed, k_scales, k_global = quantize_cutlass(k_ref)
+    k_packed, k_scales, k_global = quantize_cutlass(k_bf16)
     v_pv_packed, v_pv_scales, v_global = quantize_cutlass(
-        v_ref.T.contiguous()
+        v_bf16.T.contiguous()
     )
     qk_alpha = float((1.0 / (q_global * k_global)).item())
     pv_alpha = float((1.0 / v_global).item())

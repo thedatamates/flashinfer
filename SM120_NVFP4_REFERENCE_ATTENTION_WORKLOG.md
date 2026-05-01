@@ -14330,3 +14330,101 @@ bench_sm120_nvfp4_cutlass_fused_attention.py
 
 sm120_role_schedule_smoke: true
 ```
+
+## Remove SM120 NVFP4 Probe Benchmark Scaffolding
+
+The benchmark directory is now trimmed back to production and comparator entry
+points. The old SM120 NVFP4 probe/debug extension files were useful during
+layout discovery and hill-climbing, but they are no longer part of the
+production validation path and made the benchmark surface confusing.
+
+Kept as active SM120 NVFP4 benchmark entry points:
+
+```text
+benchmarks/bench_fmha_nvfp4_sm120.py
+  Single-cell source-tree JIT / production paged-wrapper benchmark.
+
+benchmarks/bench_gemma4_attention_grid.py
+  Gemma4 grid sweep.
+
+benchmarks/bench_sm120_d256_hillclimb.py
+  Focused D256 sweep, routed through the production paged wrapper.
+
+benchmarks/bench_gemma4_paged_workload_scenarios.py
+  Paged workload scenario validation.
+```
+
+Kept as baseline/comparator benches:
+
+```text
+benchmarks/bench_nvfp4_fmha_v2_gqa_grouped_attention.py
+benchmarks/bench_nvfp4_gqa_grouped_attention.py
+benchmarks/bench_nvfp4_native_attention_gemm.py
+benchmarks/bench_nvfp4_xqa_gqa_decode.py
+benchmarks/bench_hopper_fp8_attention.py
+benchmarks/bench_blackwell_attention.py
+```
+
+Removed:
+
+```text
+- bench_sm120_nvfp4_cutlass_fused_attention.py
+- bench_sm120_nvfp4_ref_attention.py
+- sm120_nvfp4_cutlass_fused_attention_d128.cu
+- sm120_nvfp4_cutlass_fused_attention_d256.cu
+- sm120_nvfp4_cutlass_fused_attention_d512.cu
+- sm120_nvfp4_cutlass_runner_bf16_inst.cu
+- sm120_nvfp4_ref_attention.cu
+- SM120 NVFP4 MMA/layout/source-map probe .cu files
+- FMHA-v2 NVF4 source-map and softmax probe .cu files
+```
+
+`bench_fmha_nvfp4_sm120.py` now owns its small timing and CUTLASS-layout
+quantization helpers directly, so it no longer imports from deleted debug
+benchmark modules.
+
+Post-cleanup benchmark inventory:
+
+```text
+benchmarks top-level files: 65
+Python bench*.py files:     62
+SM120 NVFP4 probe/debug files matching *sm120*nvfp4* / probe_fmha_v2*.cu: 0
+```
+
+Validation:
+
+```text
+# Python syntax
+py_compile:
+  benchmarks/bench_fmha_nvfp4_sm120.py
+  benchmarks/bench_gemma4_attention_grid.py
+  benchmarks/bench_sm120_d256_hillclimb.py
+  benchmarks/bench_gemma4_paged_workload_scenarios.py
+  benchmarks/bench_nvfp4_fmha_v2_gqa_grouped_attention.py
+
+passed
+
+# Production paged wrapper smoke
+bench_fmha_nvfp4_sm120.py --mode paged-wrapper
+  --q-len 512 --kv-len 1024 --head-dim 256 --group 2
+  --split-kv-len 128 --output-group-span 2 --causal
+  --sliding-window 1024 --logits-soft-cap 50.0 --warmup 1 --repeat 1
+
+output_finite: true
+production_paged_wrapper: true
+
+# Dense source-tree JIT smoke
+bench_fmha_nvfp4_sm120.py --mode dense
+  --q-len 512 --kv-len 8192 --head-dim 256 --group 6
+  --split-kv-len 1024 --output-group-span 2 --causal
+  --logits-soft-cap 50.0 --warmup 1 --repeat 1
+
+output_finite: true
+
+# Hillclimb route smoke
+bench_sm120_d256_hillclimb.py --kernels sm120_fused
+  --q-lens 512 --kv-lens 8192 --groups 6 --warmup 1 --repeat 1
+
+status: ok
+command includes: bench_fmha_nvfp4_sm120.py --mode paged-wrapper
+```
