@@ -197,6 +197,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         padded_q_rows_per_seq = _round_up(max_q_rows, tile_m)
         batch_padded_q_rows = batch_size * padded_q_rows_per_seq
         physical_kv_len = _round_up(self._max_kv_len, 128)
+        self._physical_kv_len = physical_kv_len
         num_splits = math.ceil((physical_kv_len // 128) / self._split_kv_tiles)
         total_q_rows = self._total_q_len * self._group_size
 
@@ -217,18 +218,6 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         )
         self._q_scales_scratch = alloc(
             (batch_padded_q_rows, head_dim // 16), torch.uint8
-        )
-        self._k_dense_scratch = alloc(
-            (physical_kv_len, head_dim // 2), torch.uint8
-        )
-        self._k_sf_dense_scratch = alloc(
-            (physical_kv_len, head_dim // 16), torch.uint8
-        )
-        self._v_pv_dense_scratch = alloc(
-            (head_dim, physical_kv_len // 2), torch.uint8
-        )
-        self._v_pv_sf_dense_scratch = alloc(
-            (head_dim, physical_kv_len // page_size), torch.uint8
         )
         self._partial = alloc(
             (num_splits, batch_padded_q_rows, head_dim), torch.bfloat16
@@ -328,16 +317,13 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 self._kv_lens_device,
                 self._q_packed_scratch,
                 self._q_scales_scratch,
-                self._k_dense_scratch,
-                self._k_sf_dense_scratch,
-                self._v_pv_dense_scratch,
-                self._v_pv_sf_dense_scratch,
                 self._partial,
                 self._split_m,
                 self._split_l,
                 self._out_scratch,
                 self._out_group,
                 self._workspace_buffer,
+                self._physical_kv_len,
                 float(k_scale),
                 float(v_scale),
                 kv_head,

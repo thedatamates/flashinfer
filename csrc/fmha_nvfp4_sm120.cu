@@ -596,141 +596,15 @@ void SM120Nvfp4FmhaRunDense(TensorView q_packed, TensorView q_scales,
       << "SM120 NVFP4 FMHA dense run failed: " << cudaGetErrorString(status);
 }
 
-void SM120Nvfp4FmhaRunPagedSingle(
-    TensorView q_packed, TensorView q_scales, TensorView k_pages,
-    TensorView k_sf_pages, TensorView v_pages_pv, TensorView v_sf_pages_pv,
-    TensorView block_table, TensorView k_dense_scratch,
-    TensorView k_sf_dense_scratch, TensorView v_pv_dense_scratch,
-    TensorView v_pv_sf_dense_scratch, TensorView partial, TensorView split_m,
-    TensorView split_l, TensorView out, TensorView workspace, double qk_alpha,
-    double pv_alpha, int64_t kv_head, int64_t split_kv_tiles, int64_t q_len,
-    int64_t group_size, int64_t kv_len_tokens, bool causal,
-    int64_t sliding_window, double logits_soft_cap,
-    int64_t output_group_span, bool v_cache_uses_pv_layout,
-    bool normal_v_scales_are_trtllm_interleaved, bool kv_layout_hnd) {
-  CheckCudaTypeLastDimContiguous(k_pages, dl_uint8, "k_pages");
-  CheckCudaTypeLastDimContiguous(k_sf_pages, dl_uint8, "k_sf_pages");
-  CheckCudaTypeLastDimContiguous(v_pages_pv, dl_uint8, "v_pages");
-  CheckCudaTypeLastDimContiguous(v_sf_pages_pv, dl_uint8, "v_sf_pages");
-  CHECK_INPUT_AND_TYPE(block_table, dl_int32);
-  CHECK_INPUT_AND_TYPE(k_dense_scratch, dl_uint8);
-  CHECK_INPUT_AND_TYPE(k_sf_dense_scratch, dl_uint8);
-  CHECK_INPUT_AND_TYPE(v_pv_dense_scratch, dl_uint8);
-  CHECK_INPUT_AND_TYPE(v_pv_sf_dense_scratch, dl_uint8);
-  CHECK_DIM(1, block_table);
-  CHECK_DIM(4, k_pages);
-  CHECK_DIM(4, k_sf_pages);
-  CHECK_DIM(4, v_pages_pv);
-  CHECK_DIM(4, v_sf_pages_pv);
-  CHECK_DIM(2, k_dense_scratch);
-  CHECK_DIM(2, k_sf_dense_scratch);
-  CHECK_DIM(2, v_pv_dense_scratch);
-  CHECK_DIM(2, v_pv_sf_dense_scratch);
-  CHECK_SHAPE(k_pages, v_pages_pv);
-  CHECK_SHAPE(k_sf_pages, v_sf_pages_pv);
-
-  const int64_t num_pages = k_pages.size(0);
-  const int64_t page_size = kv_layout_hnd ? k_pages.size(2) : k_pages.size(1);
-  const int64_t num_kv_heads = kv_layout_hnd ? k_pages.size(1) : k_pages.size(2);
-  const int64_t packed_dim = k_pages.size(3);
-  const int64_t scale_dim = k_sf_pages.size(3);
-  const int64_t head_dim = packed_dim * 2;
-  TVM_FFI_ICHECK(!v_cache_uses_pv_layout || !kv_layout_hnd)
-      << "PV-layout V pages are currently supported only with NHD layout";
-  TVM_FFI_ICHECK_EQ(page_size, 16)
-      << "SM120 NVFP4 paged run currently supports page_size=16";
-  TVM_FFI_ICHECK_EQ(k_sf_pages.size(0), num_pages);
-  TVM_FFI_ICHECK_EQ(k_sf_pages.size(kv_layout_hnd ? 2 : 1), page_size);
-  TVM_FFI_ICHECK_EQ(k_sf_pages.size(kv_layout_hnd ? 1 : 2), num_kv_heads);
-  TVM_FFI_ICHECK_EQ(scale_dim * 16, head_dim);
-  TVM_FFI_ICHECK(kv_head >= 0 && kv_head < num_kv_heads)
-      << "kv_head out of range";
-  const int64_t physical_kv_len = k_dense_scratch.size(0);
-  TVM_FFI_ICHECK(physical_kv_len >= kv_len_tokens);
-  TVM_FFI_ICHECK(physical_kv_len % 128 == 0);
-  TVM_FFI_ICHECK(block_table.size(0) >=
-                 (physical_kv_len + page_size - 1) / page_size)
-      << "block_table does not cover physical scratch KV length";
-  TVM_FFI_ICHECK_EQ(k_dense_scratch.size(1), packed_dim);
-  TVM_FFI_ICHECK_EQ(k_sf_dense_scratch.size(0), physical_kv_len);
-  TVM_FFI_ICHECK_EQ(k_sf_dense_scratch.size(1), scale_dim);
-  TVM_FFI_ICHECK_EQ(v_pv_dense_scratch.size(0), head_dim);
-  TVM_FFI_ICHECK_EQ(v_pv_dense_scratch.size(1), physical_kv_len / 2);
-  TVM_FFI_ICHECK_EQ(v_pv_sf_dense_scratch.size(0), head_dim);
-  TVM_FFI_ICHECK_EQ(v_pv_sf_dense_scratch.size(1), physical_kv_len / page_size);
-
-  ffi::CUDADeviceGuard device_guard(k_pages.device().device_id);
-  const cudaStream_t stream = get_stream(k_pages.device());
-  cudaError_t gather_status = cudaSuccess;
-  if (v_cache_uses_pv_layout) {
-    gather_status =
-        attention::blackwell::sm120_nvfp4::gather_paged_kv_to_dense_pv_raw(
-            static_cast<const uint8_t*>(k_pages.data_ptr()),
-            static_cast<const uint8_t*>(k_sf_pages.data_ptr()),
-            static_cast<const uint8_t*>(v_pages_pv.data_ptr()),
-            static_cast<const uint8_t*>(v_sf_pages_pv.data_ptr()),
-            static_cast<const int32_t*>(block_table.data_ptr()),
-            static_cast<uint8_t*>(k_dense_scratch.data_ptr()),
-            static_cast<uint8_t*>(k_sf_dense_scratch.data_ptr()),
-            static_cast<uint8_t*>(v_pv_dense_scratch.data_ptr()),
-            static_cast<uint8_t*>(v_pv_sf_dense_scratch.data_ptr()),
-            static_cast<int>(kv_head), static_cast<int>(physical_kv_len),
-            static_cast<int>(page_size), static_cast<int>(num_kv_heads),
-            static_cast<int>(packed_dim), static_cast<int>(scale_dim),
-            k_pages.stride(0), k_pages.stride(1), k_pages.stride(2),
-            k_pages.stride(3), k_sf_pages.stride(0), k_sf_pages.stride(1),
-            k_sf_pages.stride(2), k_sf_pages.stride(3),
-            v_pages_pv.stride(0), v_pages_pv.stride(1),
-            v_pages_pv.stride(2), v_pages_pv.stride(3),
-            v_sf_pages_pv.stride(0), v_sf_pages_pv.stride(1),
-            v_sf_pages_pv.stride(2), v_sf_pages_pv.stride(3), false, stream);
-  } else {
-    gather_status = attention::blackwell::sm120_nvfp4::
-        gather_paged_kv_normal_v_to_dense_pv_raw(
-            static_cast<const uint8_t*>(k_pages.data_ptr()),
-            static_cast<const uint8_t*>(k_sf_pages.data_ptr()),
-            static_cast<const uint8_t*>(v_pages_pv.data_ptr()),
-            static_cast<const uint8_t*>(v_sf_pages_pv.data_ptr()),
-            static_cast<const int32_t*>(block_table.data_ptr()),
-            static_cast<uint8_t*>(k_dense_scratch.data_ptr()),
-            static_cast<uint8_t*>(k_sf_dense_scratch.data_ptr()),
-            static_cast<uint8_t*>(v_pv_dense_scratch.data_ptr()),
-            static_cast<uint8_t*>(v_pv_sf_dense_scratch.data_ptr()),
-            static_cast<int>(kv_head), static_cast<int>(kv_len_tokens),
-            static_cast<int>(physical_kv_len), static_cast<int>(page_size),
-            static_cast<int>(num_kv_heads), static_cast<int>(packed_dim),
-            static_cast<int>(scale_dim), static_cast<float>(pv_alpha),
-            k_pages.stride(0), k_pages.stride(1), k_pages.stride(2),
-            k_pages.stride(3), k_sf_pages.stride(0), k_sf_pages.stride(1),
-            k_sf_pages.stride(2), k_sf_pages.stride(3),
-            v_pages_pv.stride(0), v_pages_pv.stride(1),
-            v_pages_pv.stride(2), v_pages_pv.stride(3),
-            v_sf_pages_pv.stride(0), v_sf_pages_pv.stride(1),
-            v_sf_pages_pv.stride(2), v_sf_pages_pv.stride(3),
-            kv_layout_hnd, normal_v_scales_are_trtllm_interleaved, stream);
-  }
-  TVM_FFI_ICHECK_EQ(gather_status, cudaSuccess)
-      << "SM120 NVFP4 paged gather failed: "
-      << cudaGetErrorString(gather_status);
-  SM120Nvfp4FmhaRunDense(
-      q_packed, q_scales, k_dense_scratch, k_sf_dense_scratch,
-      v_pv_dense_scratch, v_pv_sf_dense_scratch, partial, split_m, split_l,
-      out, workspace, qk_alpha, pv_alpha, split_kv_tiles, q_len, group_size,
-      kv_len_tokens, causal, sliding_window, logits_soft_cap,
-      output_group_span);
-}
-
 void SM120Nvfp4FmhaRunPagedBatch(
     TensorView q_packed, TensorView q_scales, TensorView k_pages,
     TensorView k_sf_pages, TensorView v_pages_pv, TensorView v_sf_pages_pv,
     TensorView block_tables, TensorView qo_indptr, TensorView kv_lens,
     TensorView q_packed_scratch, TensorView q_scales_scratch,
-    TensorView k_dense_scratch, TensorView k_sf_dense_scratch,
-    TensorView v_pv_dense_scratch, TensorView v_pv_sf_dense_scratch,
     TensorView partial, TensorView split_m, TensorView split_l,
     TensorView out_scratch, TensorView out, TensorView workspace,
-    double qk_alpha, double pv_alpha, int64_t kv_head,
-    int64_t split_kv_tiles, int64_t group_size, bool causal,
+    int64_t max_physical_kv_len, double qk_alpha, double pv_alpha,
+    int64_t kv_head, int64_t split_kv_tiles, int64_t group_size, bool causal,
     int64_t sliding_window, double logits_soft_cap,
     int64_t output_group_span, bool v_cache_uses_pv_layout,
     bool normal_v_scales_are_trtllm_interleaved, bool kv_layout_hnd) {
@@ -743,10 +617,6 @@ void SM120Nvfp4FmhaRunPagedBatch(
   CHECK_INPUT_AND_TYPE(block_tables, dl_int32);
   CHECK_INPUT_AND_TYPE(q_packed_scratch, dl_uint8);
   CHECK_INPUT_AND_TYPE(q_scales_scratch, dl_uint8);
-  CHECK_INPUT_AND_TYPE(k_dense_scratch, dl_uint8);
-  CHECK_INPUT_AND_TYPE(k_sf_dense_scratch, dl_uint8);
-  CHECK_INPUT_AND_TYPE(v_pv_dense_scratch, dl_uint8);
-  CHECK_INPUT_AND_TYPE(v_pv_sf_dense_scratch, dl_uint8);
   CHECK_INPUT_AND_TYPE(partial, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(split_m, dl_float32);
   CHECK_INPUT_AND_TYPE(split_l, dl_float32);
@@ -762,10 +632,6 @@ void SM120Nvfp4FmhaRunPagedBatch(
   CHECK_DIM(2, block_tables);
   CHECK_DIM(2, q_packed_scratch);
   CHECK_DIM(2, q_scales_scratch);
-  CHECK_DIM(2, k_dense_scratch);
-  CHECK_DIM(2, k_sf_dense_scratch);
-  CHECK_DIM(2, v_pv_dense_scratch);
-  CHECK_DIM(2, v_pv_sf_dense_scratch);
   CHECK_DIM(3, partial);
   CHECK_DIM(2, split_m);
   CHECK_DIM(2, split_l);
@@ -816,10 +682,6 @@ void SM120Nvfp4FmhaRunPagedBatch(
   TVM_FFI_ICHECK_EQ(out.size(1), head_dim);
   TVM_FFI_ICHECK_EQ(q_packed_scratch.size(1), packed_dim);
   TVM_FFI_ICHECK_EQ(q_scales_scratch.size(1), scale_dim);
-  TVM_FFI_ICHECK_EQ(k_dense_scratch.size(1), packed_dim);
-  TVM_FFI_ICHECK_EQ(k_sf_dense_scratch.size(1), scale_dim);
-  TVM_FFI_ICHECK_EQ(v_pv_dense_scratch.size(0), head_dim);
-  TVM_FFI_ICHECK_EQ(v_pv_sf_dense_scratch.size(0), head_dim);
   TVM_FFI_ICHECK_EQ(partial.size(1), q_packed_scratch.size(0));
   TVM_FFI_ICHECK_EQ(partial.size(2), head_dim);
   TVM_FFI_ICHECK_EQ(split_m.size(0), partial.size(0));
@@ -834,13 +696,10 @@ void SM120Nvfp4FmhaRunPagedBatch(
   uint8_t* q_scratch_ptr = static_cast<uint8_t*>(q_packed_scratch.data_ptr());
   uint8_t* q_sf_scratch_ptr =
       static_cast<uint8_t*>(q_scales_scratch.data_ptr());
-  uint8_t* k_scratch_ptr = static_cast<uint8_t*>(k_dense_scratch.data_ptr());
-  uint8_t* k_sf_scratch_ptr =
-      static_cast<uint8_t*>(k_sf_dense_scratch.data_ptr());
-  uint8_t* v_scratch_ptr =
-      static_cast<uint8_t*>(v_pv_dense_scratch.data_ptr());
-  uint8_t* v_sf_scratch_ptr =
-      static_cast<uint8_t*>(v_pv_sf_dense_scratch.data_ptr());
+  uint8_t* k_dummy_ptr = static_cast<uint8_t*>(k_pages.data_ptr());
+  uint8_t* k_sf_dummy_ptr = static_cast<uint8_t*>(k_sf_pages.data_ptr());
+  uint8_t* v_dummy_ptr = static_cast<uint8_t*>(v_pages_pv.data_ptr());
+  uint8_t* v_sf_dummy_ptr = static_cast<uint8_t*>(v_sf_pages_pv.data_ptr());
   __nv_bfloat16* partial_ptr =
       static_cast<__nv_bfloat16*>(partial.data_ptr());
   float* split_m_ptr = static_cast<float*>(split_m.data_ptr());
@@ -857,14 +716,9 @@ void SM120Nvfp4FmhaRunPagedBatch(
       << "per-sequence q scratch rows must be a positive multiple of tile_m";
   const int64_t total_padded_q_rows = q_packed_scratch.size(0);
   const int64_t q_tiles_per_sequence = padded_q_rows_per_seq / tile_m;
-  const int64_t physical_kv_len = k_dense_scratch.size(0);
+  const int64_t physical_kv_len = max_physical_kv_len;
   TVM_FFI_ICHECK(physical_kv_len > 0 && physical_kv_len % 128 == 0)
-      << "K scratch rows must encode the max physical KV length";
-  TVM_FFI_ICHECK_EQ(k_sf_dense_scratch.size(0), physical_kv_len);
-  TVM_FFI_ICHECK(v_pv_dense_scratch.size(1) >= physical_kv_len / 2)
-      << "V scratch is too small for max physical KV length";
-  TVM_FFI_ICHECK(v_pv_sf_dense_scratch.size(1) >= physical_kv_len / page_size)
-      << "V scale scratch is too small for max physical KV length";
+      << "max physical KV length must be a positive multiple of 128";
   const int64_t max_total_kv_tiles = physical_kv_len / 128;
   const int64_t max_splits =
       (max_total_kv_tiles + split_kv_tiles - 1) / split_kv_tiles;
@@ -891,9 +745,6 @@ void SM120Nvfp4FmhaRunPagedBatch(
       << "SM120 NVFP4 batch Q pad copy failed: "
       << cudaGetErrorString(status);
 
-  constexpr bool kUseNativePagedK = true;
-  constexpr bool kUseNativePagedV = true;
-  const bool use_native_paged_v = kUseNativePagedV;
   auto fill_paged_params = [&](auto& paged_params) {
     paged_params.k_pages = static_cast<const uint8_t*>(k_pages.data_ptr());
     paged_params.k_scales =
@@ -930,8 +781,6 @@ void SM120Nvfp4FmhaRunPagedBatch(
         v_cache_uses_pv_layout ? 1 : 0;
     paged_params.v_scales_trtllm_interleaved =
         normal_v_scales_are_trtllm_interleaved ? 1 : 0;
-    paged_params.native_k = kUseNativePagedK ? 1 : 0;
-    paged_params.native_v = use_native_paged_v ? 1 : 0;
     paged_params.v_global_scale = static_cast<float>(pv_alpha);
   };
 
@@ -940,8 +789,8 @@ void SM120Nvfp4FmhaRunPagedBatch(
         paged_params{};
     fill_paged_params(paged_params);
     status = RunCommonRawSpanDispatchPaged<128>(
-        output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_scratch_ptr,
-        k_sf_scratch_ptr, v_scratch_ptr, v_sf_scratch_ptr, partial_ptr,
+        output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_dummy_ptr,
+        k_sf_dummy_ptr, v_dummy_ptr, v_sf_dummy_ptr, partial_ptr,
         split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
         workspace_bytes, static_cast<float>(qk_alpha),
         static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles), 0,
@@ -955,8 +804,8 @@ void SM120Nvfp4FmhaRunPagedBatch(
         paged_params{};
     fill_paged_params(paged_params);
     status = RunD256RawSpanDispatchPaged(
-        output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_scratch_ptr,
-        k_sf_scratch_ptr, v_scratch_ptr, v_sf_scratch_ptr, partial_ptr,
+        output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_dummy_ptr,
+        k_sf_dummy_ptr, v_dummy_ptr, v_sf_dummy_ptr, partial_ptr,
         split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
         workspace_bytes, static_cast<float>(qk_alpha),
         static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles), 0,
@@ -970,8 +819,8 @@ void SM120Nvfp4FmhaRunPagedBatch(
         paged_params{};
     fill_paged_params(paged_params);
     status = RunCommonRawSpanDispatchPaged<512>(
-        output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_scratch_ptr,
-        k_sf_scratch_ptr, v_scratch_ptr, v_sf_scratch_ptr, partial_ptr,
+        output_group_span, q_scratch_ptr, q_sf_scratch_ptr, k_dummy_ptr,
+        k_sf_dummy_ptr, v_dummy_ptr, v_sf_dummy_ptr, partial_ptr,
         split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
         workspace_bytes, static_cast<float>(qk_alpha),
         static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles), 0,
@@ -1011,7 +860,5 @@ void SM120Nvfp4FmhaRunPagedBatch(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(quantize_q, flashinfer::SM120Nvfp4QuantizeQ);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_dense, flashinfer::SM120Nvfp4FmhaRunDense);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_paged_single,
-                              flashinfer::SM120Nvfp4FmhaRunPagedSingle);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_paged_batch,
                               flashinfer::SM120Nvfp4FmhaRunPagedBatch);

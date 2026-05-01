@@ -63,7 +63,6 @@ constexpr int kBenchRows = 128;
 constexpr int kBenchQTiles = kBenchRows / kTileM;
 constexpr int kColumnGroups = kHeadDim / (kTileN * kFusedWarpsPerCta);
 constexpr float kProbGlobalScale = 6.0f * 448.0f;
-constexpr float kQkScale = 0.08838834764831845f;  // legacy fixed D128 path
 
 enum class Sm120Nvfp4FmhaRole : int {
   Softmax0 = 0,
@@ -1356,7 +1355,7 @@ template <int kOutputGroupSpan>
   };
 
   auto load_k_chunk = [&](int kv_tile, int k_outer) {
-    if (is_load && paged_kv_params.enabled() && paged_kv_params.native_k) {
+    if (is_load && paged_kv_params.enabled()) {
       if (lane_predicate) {
         k_pipeline.producer_acquire(k_pipe_write);
       }
@@ -1397,7 +1396,7 @@ template <int kOutputGroupSpan>
   auto load_v_chunk = [&](int kv_tile, int group_offset) {
     const int effective_out_group_idx =
         effective_out_group_base + group_offset;
-    if (is_load && paged_kv_params.enabled() && paged_kv_params.native_v) {
+    if (is_load && paged_kv_params.enabled()) {
       if (lane_predicate) {
         v_pipeline.producer_acquire(v_pipe_write);
       }

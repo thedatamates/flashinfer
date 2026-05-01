@@ -14174,3 +14174,77 @@ tests/v1/attention/test_trtllm_attention_integration.py
 
 9 passed in 12.22s
 ```
+
+## Remove Legacy Dense Paged-Gather Path
+
+The production paged wrapper no longer allocates dense K/V scratch and no
+longer calls a gather-to-dense bridge before launching the SM120 NVFP4
+attention kernels. This removes the legacy transitional path that remained
+after native paged K/V producers were wired into D128/D256/D512.
+
+Removed from the active FlashInfer source path:
+
+```text
+- run_paged_single FFI export
+- gather_k_pages_kernel
+- gather_v_pv_pages_kernel
+- gather_v_normal_pages_to_dense_pv_kernel
+- gather_paged_kv_to_dense_pv_raw
+- gather_paged_v_to_dense_pv_raw
+- gather_paged_kv_normal_v_to_dense_pv_raw
+- gather_paged_normal_v_to_dense_pv_raw
+- k_dense_scratch / k_sf_dense_scratch / v_pv_dense_scratch /
+  v_pv_sf_dense_scratch parameters from run_paged_batch
+- Python-side dense scratch allocations in BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper
+- native_k / native_v compatibility switches
+- legacy fixed-D qk-scale constants
+```
+
+The paged batch FFI now receives `max_physical_kv_len` explicitly for split
+scratch sizing and block-table coverage checks. K/V page tensors are passed
+directly through `Sm120Nvfp4PagedKvLoadParams`; the D128/D256/D512 producers
+always use native paged loads when `paged_kv_params.enabled()` is true. The
+explicit dense API is unchanged and remains available only through `run_dense`.
+
+Sanity grep over active package/test files found no remaining production-path
+matches for:
+
+```text
+gather_paged | gather_.*dense | k_dense_scratch | v_pv_dense_scratch |
+run_paged_single | kQkScale | native_k | native_v | legacy fixed |
+_k_dense | _v_pv_dense
+```
+
+Validation:
+
+```text
+# Focused multi-sequence direct wrapper parity, clean extension rebuild
+tests/attention/test_nvfp4_kv_head_dim_512.py::
+  test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x
+
+3 passed in 253.73s
+
+# Standard wrapper parity and normal-V layout, D128/D256/D512
+tests/attention/test_nvfp4_kv_head_dim_512.py::
+  test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x
+tests/attention/test_nvfp4_kv_head_dim_512.py::
+  test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x
+
+6 passed in 113.43s
+
+# Full FlashInfer NVFP4 attention regression file
+tests/attention/test_nvfp4_kv_head_dim_512.py
+
+35 passed in 121.17s
+
+# vLLM FlashInfer/TRTLLM attention integration with FlashInfer worktree first
+# on PYTHONPATH
+tests/v1/attention/test_trtllm_attention_integration.py::
+  test_trtllm_gen_nvfp4_kv_integration
+tests/v1/attention/test_trtllm_attention_integration.py::
+  test_sm12x_nvfp4_large_prefill_selects_sm120_wrapper
+tests/v1/attention/test_trtllm_attention_integration.py::
+  test_sm12x_nvfp4_large_prefill_does_not_select_sm120_wrapper_by_default
+
+5 passed in 7.13s
+```

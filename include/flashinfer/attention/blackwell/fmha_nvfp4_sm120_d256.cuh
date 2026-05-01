@@ -62,7 +62,6 @@ constexpr int kBenchRows = 128;
 constexpr int kBenchQTiles = kBenchRows / kTileM;
 constexpr int kColumnGroups = kHeadDim / (kTileN * kFusedWarpsPerCta);
 constexpr float kProbGlobalScale = 6.0f * 448.0f;
-constexpr float kQkScale = 0.0625f;  // legacy fixed D256 path
 
 enum class Sm120Nvfp4FmhaRole : int {
   Softmax0 = 0,
@@ -448,8 +447,6 @@ struct Sm120Nvfp4PagedKvLoadParams {
   int kv_layout_hnd = 0;
   int v_cache_uses_pv_layout = 0;
   int v_scales_trtllm_interleaved = 0;
-  int native_k = 1;
-  int native_v = 1;
   float v_global_scale = kProbGlobalScale;
 
   __device__ __forceinline__ bool enabled() const {
@@ -1597,7 +1594,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   };
 
   auto load_k_chunk = [&](int kv_tile, int k_outer) {
-    if (is_load && paged_kv_params.enabled() && paged_kv_params.native_k) {
+    if (is_load && paged_kv_params.enabled()) {
       if (lane_predicate) {
         k_pipeline.producer_acquire(k_pipe_write);
       }
@@ -1638,7 +1635,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto load_v_chunk = [&](int kv_tile, int group_offset) {
     const int effective_out_group_idx =
         effective_out_group_base + group_offset;
-    if (is_load && paged_kv_params.enabled() && paged_kv_params.native_v) {
+    if (is_load && paged_kv_params.enabled()) {
       if (lane_predicate) {
         v_pipeline.producer_acquire(v_pipe_write);
       }
