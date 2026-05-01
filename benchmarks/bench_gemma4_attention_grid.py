@@ -282,6 +282,8 @@ def command_for_kernel(
             py,
             str(root / "benchmarks" / "bench_fmha_nvfp4_sm120.py"),
             *common,
+            "--mode",
+            "paged-wrapper",
             "--q-len",
             str(cell.q_len),
             "--kv-len",
@@ -294,6 +296,11 @@ def command_for_kernel(
             str(split_kv_len),
             "--output-group-span",
             str(output_group_span),
+            "--causal",
+            "--logits-soft-cap",
+            "50.0",
+            "--sliding-window",
+            "1024" if cell.shape == "A" else "-1",
         ]
 
     if kernel == "cutlass_two_stage":
@@ -322,6 +329,8 @@ def command_for_kernel(
         "flashinfer_fp8_fa2",
         "flashinfer_bf16",
     ):
+        if kernel == "flashinfer_nvfp4_fmha_v2" and cell.shape == "A":
+            return unsupported("FMHAv2 on SM120 does not support sliding-window prefill")
         only = {
             "flashinfer_nvfp4_fmha_v2": "grouped-fp4",
             "flashinfer_nvfp4_fa2": "grouped-fp4",
@@ -329,6 +338,7 @@ def command_for_kernel(
             "flashinfer_bf16": "bf16",
         }[kernel]
         fp4_backend = "fa2" if kernel == "flashinfer_nvfp4_fa2" else "fmha_v2"
+        bf16_backend = "fa2" if cell.shape == "A" else "fmha_v2"
         fp4_v_layout = "nhd" if kernel == "flashinfer_nvfp4_fa2" else "pv"
         fp4_v_sf_layout = (
             "linear" if kernel == "flashinfer_nvfp4_fa2" else "trtllm_interleaved"
@@ -354,10 +364,16 @@ def command_for_kernel(
             only,
             "--fp4-backend",
             fp4_backend,
+            "--bf16-backend",
+            bf16_backend,
             "--fp4-v-layout",
             fp4_v_layout,
             "--fp4-v-sf-layout",
             fp4_v_sf_layout,
+            "--logits-soft-cap",
+            "50.0",
+            "--window-left",
+            "1024" if cell.shape == "A" else "-1",
         ]
 
     raise ValueError(f"unknown kernel: {kernel}")

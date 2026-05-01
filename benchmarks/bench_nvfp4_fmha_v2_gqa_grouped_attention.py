@@ -112,6 +112,8 @@ def _make_wrapper(
     plan_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     fixed_split_size: int | None,
     disable_split_kv: bool,
+    window_left: int,
+    logits_soft_cap: float,
 ) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
     qo_indptr, paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len, block_tables = (
         plan_tensors
@@ -131,6 +133,8 @@ def _make_wrapper(
         head_dim,
         page_size,
         causal=True,
+        window_left=window_left,
+        logits_soft_cap=logits_soft_cap,
         q_data_type=q_data_type,
         kv_data_type=kv_data_type,
         o_data_type=o_data_type,
@@ -230,6 +234,8 @@ def main() -> None:
         action="store_true",
         help="Forward disable_split_kv=True to FlashInfer prefill planning.",
     )
+    parser.add_argument("--window-left", type=int, default=None)
+    parser.add_argument("--logits-soft-cap", type=float, default=None)
     args = parser.parse_args()
 
     presets = {
@@ -258,6 +264,12 @@ def main() -> None:
     args.head_dim = (
         args.head_dim if args.head_dim is not None else preset["head_dim"]
     )
+    if args.window_left is None:
+        args.window_left = 1024 if args.gemma4_shape == "sliding" else -1
+    if args.logits_soft_cap is None:
+        args.logits_soft_cap = (
+            50.0 if args.gemma4_shape in ("global", "sliding") else 0.0
+        )
     if args.group_sizes is None:
         args.group_sizes = preset["group_sizes"]
 
@@ -370,6 +382,8 @@ def main() -> None:
                 plan_tensors=plan_tensors,
                 fixed_split_size=args.fixed_split_size,
                 disable_split_kv=args.disable_split_kv,
+                window_left=args.window_left,
+                logits_soft_cap=args.logits_soft_cap,
             )
             if need_grouped_fp4
             else None
@@ -391,6 +405,8 @@ def main() -> None:
                 plan_tensors=plan_tensors,
                 fixed_split_size=args.fixed_split_size,
                 disable_split_kv=args.disable_split_kv,
+                window_left=args.window_left,
+                logits_soft_cap=args.logits_soft_cap,
             )
             if need_fp8
             else None
@@ -412,6 +428,8 @@ def main() -> None:
                 plan_tensors=plan_tensors,
                 fixed_split_size=args.fixed_split_size,
                 disable_split_kv=args.disable_split_kv,
+                window_left=args.window_left,
+                logits_soft_cap=args.logits_soft_cap,
             )
             if need_bf16
             else None
@@ -446,6 +464,8 @@ def main() -> None:
                         plan_tensors=plan_tensors,
                         fixed_split_size=args.fixed_split_size,
                         disable_split_kv=args.disable_split_kv,
+                        window_left=args.window_left,
+                        logits_soft_cap=args.logits_soft_cap,
                     )
                 )
                 separate_inputs.append((q, out))

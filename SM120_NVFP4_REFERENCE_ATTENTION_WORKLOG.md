@@ -13551,3 +13551,51 @@ Pytest:
   tests/attention/test_nvfp4_kv_head_dim_512.py::test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x
   3 passed
 ```
+
+## Production Wrapper Benchmark Path
+
+The Gemma grid no longer benchmarks `sm120_fused` through the dense/prepacked
+microbenchmark path. It now calls:
+
+```text
+benchmarks/bench_fmha_nvfp4_sm120.py --mode paged-wrapper
+```
+
+This measures the production wrapper boundary:
+
+```text
+BF16 Q -> csrc Q quantization
+PV-layout NVFP4 paged K/V input
+run_paged_batch paged gather bridge
+fused SM120 attention
+output scatter to [q, heads, d]
+```
+
+The grid also now passes production Gemma semantics explicitly:
+
+```text
+causal=true
+logits_soft_cap=50.0
+Shape A window_left=1024
+Shape B window_left=-1
+```
+
+FMHAv2 on SM120 does not support sliding-window prefill, so
+`flashinfer_nvfp4_fmha_v2` is marked unsupported for Shape A instead of being
+timed under the wrong mask. BF16 Shape A uses FA2 in the baseline grid.
+
+Validation:
+
+```text
+bench_fmha_nvfp4_sm120.py --mode paged-wrapper
+  D256 q=128 kv=1024 group=6 causal sliding_window=1024 softcap=50
+  min_ms=0.068192, output_finite=true
+
+bench_gemma4_attention_grid.py sm120_fused smoke
+  Shape A q=512 kv=1024 D256 group=2
+  min_ms=0.068064, status=ok
+
+bench_gemma4_attention_grid.py Shape A smoke with sm120_fused + BF16 baseline
+  sm120_fused min_ms=0.068352, status=ok
+  flashinfer_bf16 min_ms=0.069024, status=ok
+```

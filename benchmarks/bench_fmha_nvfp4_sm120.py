@@ -6,6 +6,7 @@ import math
 
 import torch
 
+import flashinfer
 from flashinfer.jit import gen_fmha_nvfp4_sm120_module
 
 from bench_sm120_nvfp4_cutlass_fused_attention import (
@@ -51,6 +52,17 @@ def main() -> None:
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--sliding-window", type=int, default=-1)
     parser.add_argument("--logits-soft-cap", type=float, default=0.0)
+    parser.add_argument(
+        "--mode",
+        choices=("dense", "paged-wrapper"),
+        default="dense",
+        help=(
+            "dense benchmarks the low-level prepacked run_dense binding; "
+            "paged-wrapper benchmarks the production Python wrapper, including "
+            "Q quantization, paged gather, fused attention, and output scatter."
+        ),
+    )
+    parser.add_argument("--num-kv-heads", type=int, default=1)
     args = parser.parse_args()
 
     if args.kv_len % 128 != 0:
@@ -69,10 +81,107 @@ def main() -> None:
         raise ValueError("D128 only supports output_group_span=1")
     if args.head_dim % (output_group_span * 128) != 0:
         raise ValueError("head_dim must be divisible by output_group_span * 128")
+    if args.num_kv_heads <= 0:
+        raise ValueError("--num-kv-heads must be positive")
 
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     q_rows = args.q_len * args.group
+    key = bench_key(output_group_span)
+
+    if args.mode == "paged-wrapper":
+        gen = torch.Generator(device=device)
+        gen.manual_seed(1234)
+        num_qo_heads = args.group * args.num_kv_heads
+        q = (
+            torch.randn(
+                (args.q_len, num_qo_heads, args.head_dim),
+                device=device,
+                generator=gen,
+            )
+            / 4
+        ).to(torch.bfloat16)
+        page_size = 16
+        num_pages = math.ceil(args.kv_len / page_size)
+        k_bf16 = (
+            torch.randn(
+                (num_pages, page_size, args.num_kv_heads, args.head_dim),
+                device=device,
+                generator=gen,
+            )
+            / 4
+        ).to(torch.bfloat16)
+        v_bf16 = (
+            torch.randn(
+                (num_pages, page_size, args.num_kv_heads, args.head_dim),
+                device=device,
+                generator=gen,
+            )
+            / 4
+        ).to(torch.bfloat16)
+        (k_pages, v_pages), (k_sf, v_sf), k_scale, v_scale = (
+            flashinfer.nvfp4_quantize_paged_kv_cache(
+                k_bf16,
+                v_bf16,
+                kv_layout="NHD",
+                v_data_layout="pv",
+                v_scale_layout="pv",
+            )
+        )
+        block_tables = torch.arange(num_pages, dtype=torch.int32, device=device).view(
+            1, num_pages
+        )
+        qo_indptr = torch.tensor([0, args.q_len], dtype=torch.int32, device="cpu")
+        kv_lens = torch.tensor([args.kv_len], dtype=torch.int32, device="cpu")
+        out = torch.empty_like(q)
+        workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(
+            workspace
+        )
+        wrapper.plan(
+            qo_indptr,
+            block_tables,
+            kv_lens,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=args.num_kv_heads,
+            head_dim=args.head_dim,
+            causal=bool(args.causal),
+            window_left=args.sliding_window,
+            logits_soft_cap=float(args.logits_soft_cap),
+            split_kv_len=args.split_kv_len,
+            output_group_span=output_group_span,
+        )
+
+        def run() -> None:
+            wrapper.run(
+                q,
+                (k_pages, v_pages),
+                (k_sf, v_sf),
+                k_scale=k_scale,
+                v_scale=v_scale,
+                out=out,
+            )
+
+        run()
+        torch.cuda.synchronize()
+        result = {
+            "fmha_nvfp4_sm120_jit": True,
+            "production_paged_wrapper": True,
+            "q_len": args.q_len,
+            "kv_len": args.kv_len,
+            "head_dim": args.head_dim,
+            "group": args.group,
+            "num_kv_heads": args.num_kv_heads,
+            "output_group_span": output_group_span,
+            "causal": bool(args.causal),
+            "sliding_window": args.sliding_window,
+            "logits_soft_cap": args.logits_soft_cap,
+            "output_finite": bool(torch.isfinite(out.float()).all()),
+            key: event_ms(run, warmup=args.warmup, repeat=args.repeat),
+        }
+        print(json.dumps(result, sort_keys=True))
+        return
+
     q, k, v, k_scales_ref, v_scales_ref = make_shape_inputs(
         device,
         q_len=args.q_len,
@@ -132,9 +241,9 @@ def main() -> None:
 
     run()
     torch.cuda.synchronize()
-    key = bench_key(output_group_span)
     result = {
         "fmha_nvfp4_sm120_jit": True,
+        "production_paged_wrapper": False,
         "q_len": args.q_len,
         "kv_len": args.kv_len,
         "head_dim": args.head_dim,
