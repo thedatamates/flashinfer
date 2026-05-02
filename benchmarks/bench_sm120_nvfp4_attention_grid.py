@@ -46,12 +46,24 @@ def default_output_group_span(head_dim: int) -> int:
     raise ValueError("--head-dim must be one of 128, 256, or 512")
 
 
+def default_split_kv_len(head_dim: int) -> int:
+    if head_dim == 512:
+        return 32768
+    return 6656
+
+
 def fused_output_group_span(args: argparse.Namespace) -> int:
     if args.fused_output_group_span == 0:
         return default_output_group_span(args.head_dim)
     if args.fused_output_group_span not in (1, 2, 4):
         raise ValueError("--fused-output-group-span must be 0, 1, 2, or 4")
     return int(args.fused_output_group_span)
+
+
+def fused_split_kv_len(args: argparse.Namespace) -> int:
+    if args.fused_split_kv_len == 0:
+        return default_split_kv_len(args.head_dim)
+    return int(args.fused_split_kv_len)
 
 
 def build_cells(args: argparse.Namespace) -> list[Cell]:
@@ -110,13 +122,13 @@ def run_json(command: list[str], *, env: dict[str, str], timeout_sec: int) -> di
 
 def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]:
     output_group_span = fused_output_group_span(args)
-    return [
+    command = [
         sys.executable,
         str(root / "benchmarks" / "bench_sm120_nvfp4_attention.py"),
         "--device",
         str(args.device),
         "--mode",
-        "paged-wrapper",
+        "paged-wrapper" if args.fused_api == "paged" else "dense",
         "--q-len",
         str(cell.q_len),
         "--kv-len",
@@ -126,19 +138,21 @@ def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]
         "--group",
         str(cell.group),
         "--split-kv-len",
-        str(args.fused_split_kv_len),
+        str(fused_split_kv_len(args)),
         "--warmup",
         str(args.warmup),
         "--repeat",
         str(args.repeat),
         "--output-group-span",
         str(output_group_span),
-        "--causal",
         "--sliding-window",
         str(args.sliding_window),
         "--logits-soft-cap",
         str(args.logits_soft_cap),
     ]
+    if args.causal:
+        command.append("--causal")
+    return command
 
 
 def flashinfer_command(
@@ -179,6 +193,7 @@ def flashinfer_command(
         "linear",
         "--bf16-backend",
         "fa2",
+        "--causal" if args.causal else "--no-causal",
         "--window-left",
         str(args.sliding_window),
         "--logits-soft-cap",
@@ -206,9 +221,11 @@ def summarize(
             "d": cell.head_dim,
             "group": cell.group,
             "kernel": kernel,
+            "api": data.get("api"),
             "fused_output_group_span": fused_output_group_span,
             "min_ms": bench["min_ms"],
             "mean_ms": bench["mean_ms"],
+            "output_finite": data.get("output_finite"),
             "cosine": data.get("splitkv_full_grid_first_tile_vs_exact_cosine"),
             "splits": data.get("splits"),
             "split_kv_len": data.get("split_kv_len"),
@@ -228,8 +245,10 @@ def summarize(
         "d": cell.head_dim,
         "group": cell.group,
         "kernel": kernel,
+        "api": None,
         "min_ms": bench["min_ms"],
         "mean_ms": bench["mean_ms"],
+        "output_finite": None,
         "cosine": None,
         "splits": None,
         "split_kv_len": None,
@@ -259,9 +278,11 @@ def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
         "d",
         "group",
         "kernel",
+        "api",
         "fused_output_group_span",
         "min_ms",
         "mean_ms",
+        "output_finite",
         "cosine",
         "splits",
         "split_kv_len",
@@ -297,6 +318,7 @@ def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
                 "nvfp4_fa2_ms": nvfp4["min_ms"],
                 "fp8_fa2_ms": data.get("fp8_fa2", {}).get("min_ms"),
                 "bf16_fa2_ms": data.get("bf16_fa2", {}).get("min_ms"),
+                "fused_finite": fused.get("output_finite"),
                 "fused_cosine": fused["cosine"],
                 "fused_vs_nvfp4_fa2_speedup": speedup,
                 "target_ms_for_2x": target_ms,
@@ -315,6 +337,7 @@ def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
         "nvfp4_fa2_ms",
         "fp8_fa2_ms",
         "bf16_fa2_ms",
+        "fused_finite",
         "fused_cosine",
         "fused_vs_nvfp4_fa2_speedup",
         "target_ms_for_2x",
@@ -366,9 +389,11 @@ def row_fieldnames() -> list[str]:
         "d",
         "group",
         "kernel",
+        "api",
         "fused_output_group_span",
         "min_ms",
         "mean_ms",
+        "output_finite",
         "cosine",
         "splits",
         "split_kv_len",
@@ -435,6 +460,7 @@ def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
                 "nvfp4_fa2_ms": nvfp4["min_ms"],
                 "fp8_fa2_ms": data.get("fp8_fa2", {}).get("min_ms"),
                 "bf16_fa2_ms": data.get("bf16_fa2", {}).get("min_ms"),
+                "fused_finite": fused.get("output_finite"),
                 "fused_cosine": fused["cosine"],
                 "fused_vs_nvfp4_fa2_speedup": speedup,
                 "target_ms_for_2x": target_ms,
@@ -453,6 +479,7 @@ def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
         "nvfp4_fa2_ms",
         "fp8_fa2_ms",
         "bf16_fa2_ms",
+        "fused_finite",
         "fused_cosine",
         "fused_vs_nvfp4_fa2_speedup",
         "target_ms_for_2x",
@@ -509,11 +536,13 @@ def error_row(
         "d": cell.head_dim,
         "group": cell.group,
         "kernel": kernel,
+        "api": None,
         "fused_output_group_span": (
             fused_output_group_span if kernel == "sm120_fused" else None
         ),
         "min_ms": None,
         "mean_ms": None,
+        "output_finite": None,
         "cosine": None,
         "splits": None,
         "split_kv_len": None,
@@ -533,7 +562,18 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--timeout-sec", type=int, default=900)
     parser.add_argument("--head-dim", type=int, default=256)
-    parser.add_argument("--fused-split-kv-len", type=int, default=6656)
+    parser.add_argument(
+        "--fused-split-kv-len",
+        type=int,
+        default=0,
+        help="0 selects the default split length for --head-dim: D512=32768, otherwise 6656.",
+    )
+    parser.add_argument(
+        "--fused-api",
+        choices=("paged", "dense"),
+        default="paged",
+        help="Entry point used for the sm120_fused column.",
+    )
     parser.add_argument(
         "--fused-output-group-span",
         type=int,
@@ -542,6 +582,7 @@ def main() -> None:
     )
     parser.add_argument("--sliding-window", type=int, default=-1)
     parser.add_argument("--logits-soft-cap", type=float, default=50.0)
+    parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--q-lens",
         type=str,

@@ -112,6 +112,7 @@ def _make_wrapper(
     plan_tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     fixed_split_size: int | None,
     disable_split_kv: bool,
+    causal: bool,
     window_left: int,
     logits_soft_cap: float,
 ) -> flashinfer.BatchPrefillWithPagedKVCacheWrapper:
@@ -132,7 +133,7 @@ def _make_wrapper(
         num_kv_heads,
         head_dim,
         page_size,
-        causal=True,
+        causal=causal,
         window_left=window_left,
         logits_soft_cap=logits_soft_cap,
         q_data_type=q_data_type,
@@ -234,6 +235,7 @@ def main() -> None:
         action="store_true",
         help="Forward disable_split_kv=True to FlashInfer prefill planning.",
     )
+    parser.add_argument("--causal", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--window-left", type=int, default=None)
     parser.add_argument("--logits-soft-cap", type=float, default=None)
     args = parser.parse_args()
@@ -347,6 +349,8 @@ def main() -> None:
         "fp4_backend": args.fp4_backend,
         "fp4_v_layout": args.fp4_v_layout,
         "fp4_v_sf_layout": args.fp4_v_sf_layout,
+        "causal": args.causal,
+        "logits_soft_cap": args.logits_soft_cap,
         "groups": {},
     }
 
@@ -382,6 +386,7 @@ def main() -> None:
                 plan_tensors=plan_tensors,
                 fixed_split_size=args.fixed_split_size,
                 disable_split_kv=args.disable_split_kv,
+                causal=args.causal,
                 window_left=args.window_left,
                 logits_soft_cap=args.logits_soft_cap,
             )
@@ -405,6 +410,7 @@ def main() -> None:
                 plan_tensors=plan_tensors,
                 fixed_split_size=args.fixed_split_size,
                 disable_split_kv=args.disable_split_kv,
+                causal=args.causal,
                 window_left=args.window_left,
                 logits_soft_cap=args.logits_soft_cap,
             )
@@ -428,6 +434,7 @@ def main() -> None:
                 plan_tensors=plan_tensors,
                 fixed_split_size=args.fixed_split_size,
                 disable_split_kv=args.disable_split_kv,
+                causal=args.causal,
                 window_left=args.window_left,
                 logits_soft_cap=args.logits_soft_cap,
             )
@@ -464,6 +471,7 @@ def main() -> None:
                         plan_tensors=plan_tensors,
                         fixed_split_size=args.fixed_split_size,
                         disable_split_kv=args.disable_split_kv,
+                        causal=args.causal,
                         window_left=args.window_left,
                         logits_soft_cap=args.logits_soft_cap,
                     )

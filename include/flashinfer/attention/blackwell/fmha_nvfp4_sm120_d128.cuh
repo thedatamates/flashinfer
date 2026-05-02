@@ -1682,6 +1682,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
       const float old_scale =
           mma_running_l == 0.0f ? 0.0f : __expf(mma_running_m - next_m);
       const float tile_scale = tile_has_values ? __expf(tile_m - next_m) : 0.0f;
+      const float safe_tile_m = tile_has_values ? tile_m : 0.0f;
       float tile_l_scaled_local = 0.0f;
 #pragma unroll
       for (int scale_group = col_begin / 16;
@@ -1695,8 +1696,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
           const float logit = __bfloat162float(
               smem_logits_stage[logits_smem_index(mma_softmax_row,
                                                   local_col + i)]);
-          const float p_scaled =
-              tile_has_values ? __expf(logit - tile_m) * tile_scale : 0.0f;
+          const float p_scaled = __expf(logit - safe_tile_m) * tile_scale;
           tile_l_scaled_local += p_scaled;
           vec_max = fmaxf(vec_max, p_scaled);
           p_vals[i] = p_scaled;

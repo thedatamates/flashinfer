@@ -15197,6 +15197,421 @@ bench_sm120_nvfp4_attention_grid.py --kernels sm120_fused
 status: parsed sm120_nvfp4_attention and wrote /tmp smoke reports
 ```
 
+## D512 Dense Extraction Regression Fix
+
+Follow-up on the no-causal/no-softcap D512 dense regression:
+
+```text
+old benchmark .cu, q=512 kv=32768 group=8:
+  min_ms = 4.9058
+
+current integrated dense before fix:
+  min_ms = 5.3527
+  regression = +9.1%
+
+current integrated dense after fix:
+  min_ms = 4.8908
+```
+
+Root cause:
+
+The integration added fully-masked tile handling for causal/sliding/tail
+semantics. The first implementation put the guard in the inner probability
+loop:
+
+```text
+p_scaled = tile_has_values ? exp(logit - tile_m) * tile_scale : 0
+```
+
+That introduced a reconvergence region for each unrolled probability element.
+SASS showed:
+
+```text
+old benchmark .cu:
+  total inst = 13944
+  BSSY/BSYNC = 37/37
+
+integrated dense before fix:
+  total inst = 14696
+  BSSY/BSYNC = 133/133
+```
+
+The per-element guard accounted for essentially the whole regression:
+line-mapped SASS attributed 192 BSSY/BSYNC instructions to the guarded
+`p_scaled` line.
+
+Fix:
+
+Hoist the all-masked-tile guard out of the inner loop by using a safe max
+value:
+
+```text
+safe_tile_m = tile_has_values ? tile_m : 0
+p_scaled = exp(logit - safe_tile_m) * tile_scale
+```
+
+For fully masked tiles `tile_scale` is zero and logits are `-inf`, so the P
+tile is still explicitly zeroed without generating per-element branch
+regions. The fix was applied to D128, D256, and D512 in both source-tree and
+JIT-copied headers.
+
+Post-fix SASS for the active D512 dense specialization:
+
+```text
+total inst = 13967
+BSSY/BSYNC = 37/37
+BRA = 608
+OMMA = 640
+```
+
+Validation:
+
+```text
+D512 dense no-causal/no-softcap q=512 kv=32768 group=8:
+  min_ms = 4.8908
+  output_finite = true
+
+D512 dense causal+softcap q=512 kv=8192 group=8:
+  min_ms = 1.9814
+  output_finite = true
+```
+
+## D512 Old Benchmark Code vs Integrated Dense Code
+
+Comparison target:
+
+```text
+cell: D512, q=512, kv=32768, group=8, output_group_span=4
+semantics: no causal, no sliding window, no logits softcap
+old code: commit 44999a2, benchmarks/sm120_nvfp4_cutlass_fused_attention.cu
+new code: include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh
+```
+
+The old benchmark-owned code still reproduces the faster baseline in the
+current environment:
+
+```text
+old 44999a2 benchmark rerun:
+  min_ms 4.9058
+
+current integrated dense path:
+  min_ms 5.3527
+
+spot regression:
+  +9.11%
+```
+
+This confirms the `+7.73%` median overlap delta from the full sweep is a real
+integration/codegen regression, not stale report data.
+
+Quick checks that did not explain the gap:
+
+```text
+CUTLASS source roots:
+  current 3rdparty/cutlass and /home/josh/tdm/cutlass match
+
+old extension flag absent from new JIT:
+  -DCUTLASS_ENABLE_GDC_FOR_SM100=1
+test result:
+  current stayed ~5.35 ms
+
+K128 stage-2 epilogue type:
+  old paired K128 mainloop with K128 epilogue type
+test result:
+  current stayed ~5.34 ms
+
+resource usage, active span4 dense stage:
+  old     REG 168, STACK 1352, CONSTANT[0] 5568
+  current REG 168, STACK 1360, CONSTANT[0] 5824
+```
+
+SASS count comparison for the active span4 stage kernel:
+
+```text
+old total instructions:     13944
+current total instructions: 14696
+delta:                      +752 (+5.4%)
+
+notable increases:
+  BSSY:  37 -> 133
+  BSYNC: 37 -> 133
+  BRA:   611 -> 704
+  LEA:   228 -> 347
+  MOV:   712 -> 782
+```
+
+Interpretation:
+
+```text
+The integrated dense specialization is not register-limited relative to the
+old benchmark code. The regression is mostly extra control-flow/reconvergence
+and address-generation code introduced by the production/generalized stage
+kernel shape.
+
+The likely fix direction is a truly dense-specialized stage kernel body for
+the dense FFI path, not more tuning of the production paged path. Paged
+production may still need its generalized logic; dense benchmark parity should
+not force that overhead into the dense specialization.
+```
+
+## D512 Dense No-Causal / No-Softcap Base Sweep
+
+Purpose:
+
+Capture an old-semantics baseline for the source-tree D512 dense kernel so it
+can be compared against older reports that did not include production causal
+masking or Gemma logit soft-capping.
+
+Benchmark harness changes:
+
+```text
+benchmarks/bench_sm120_nvfp4_attention_grid.py
+  added --causal / --no-causal
+  passes causal selection through fused and FlashInfer baseline commands
+
+benchmarks/bench_nvfp4_fmha_v2_gqa_grouped_attention.py
+  added --causal / --no-causal
+  wrapper.plan(...) now receives the selected causal value
+  emitted metadata now records causal and logits_soft_cap
+```
+
+Validation before sweep:
+
+```text
+py_compile:
+  benchmarks/bench_sm120_nvfp4_attention_grid.py
+  benchmarks/bench_nvfp4_fmha_v2_gqa_grouped_attention.py
+status: passed
+
+smoke:
+  D=512 q=512 kv=32768 group=8
+  --no-causal --logits-soft-cap 0.0
+  sm120_fused: 5.3629 ms
+  nvfp4_fa2:   4.7013 ms
+  fp8_fa2:     5.0349 ms
+status: completed
+```
+
+Full sweep:
+
+```text
+head_dim: 512
+api: dense
+q_lens: all
+kv_lens: all
+groups: all
+kernels: sm120_fused,nvfp4_fa2,fp8_fa2,bf16_fa2
+causal: false
+logits_soft_cap: 0.0
+fused_split_kv_len: 32768
+fused_output_group_span: 4
+warmup: 1
+repeat: 3
+```
+
+Reports:
+
+```text
+reports/d512_sm120_nvfp4_attention_dense_nomask_nosoftcap_grid_20260501.jsonl
+reports/d512_sm120_nvfp4_attention_dense_nomask_nosoftcap_grid_20260501.csv
+reports/d512_sm120_nvfp4_attention_dense_nomask_nosoftcap_grid_20260501.summary.csv
+reports/d512_sm120_nvfp4_attention_dense_nomask_nosoftcap_grid_20260501.md
+```
+
+Completion:
+
+```text
+raw rows: 1440/1440
+cells:    360/360
+status:   1080 ok, 360 error
+```
+
+The 360 errors are the expected BF16 FA2 D512 invalid-configuration failures:
+
+```text
+Invalid configuration : NUM_MMA_Q=1 NUM_MMA_D_QK=32
+NUM_MMA_D_VO=32 NUM_MMA_KV=1 NUM_WARPS_Q=4 NUM_WARPS_KV=1
+```
+
+Headline results:
+
+```text
+all 360 cells:
+  fused wins vs nvfp4_fa2: 223/360
+  fused wins vs fp8_fa2:   223/360
+  passes 2x gate:          143/360
+  median speedup:          1.447x
+  max speedup:             5.674x
+
+q>=512, kv>=8192:
+  cells:                   120
+  fused wins vs nvfp4_fa2: 102/120
+  fused wins vs fp8_fa2:   102/120
+  passes 2x gate:          91/120
+  median speedup:          3.311x
+  max speedup:             5.674x
+
+q>=2048, kv>=8192:
+  cells:                   60
+  fused wins vs nvfp4_fa2: 58/60
+  fused wins vs fp8_fa2:   58/60
+  passes 2x gate:          57/60
+  median speedup:          3.713x
+  max speedup:             5.674x
+```
+
+Per-group rollup for `q>=512, kv>=8192`:
+
+```text
+group 2:  wins 11/20, passes 2x  8/20, median 1.605x, min 0.211x, max 4.599x
+group 4:  wins 15/20, passes 2x 13/20, median 3.096x, min 0.423x, max 4.632x
+group 6:  wins 18/20, passes 2x 15/20, median 3.030x, min 0.645x, max 5.674x
+group 8:  wins 18/20, passes 2x 17/20, median 3.637x, min 0.879x, max 4.646x
+group 12: wins 20/20, passes 2x 18/20, median 3.548x, min 1.448x, max 5.670x
+group 16: wins 20/20, passes 2x 20/20, median 3.721x, min 2.110x, max 4.641x
+```
+
+Comparison against the prior old-semantics D512 report:
+
+```text
+prior report: reports/d512_hillclimb_180cell_20260430.summary.csv
+overlap cells: 180
+median fused_ms delta: +7.73%
+min fused_ms delta:    -2.99%
+max fused_ms delta:    +10.93%
+improved cells:        2
+regressed cells:       178
+```
+
+Interpretation:
+
+This no-causal/no-softcap run is the correct base comparison for the older
+old-semantics reports. It confirms that the production-semantics sweep's larger
+delta was mostly caused by adding causal masking plus Gemma soft-capping. There
+is still a source-tree dense old-semantics regression of roughly 8-11% against
+the 2026-04-30 report over the overlapping cells.
+
+## D512 Dense Expanded Sweep With Production Semantics
+
+Ran the full D512 dense/direct expanded grid through the consolidated
+`bench_sm120_nvfp4_attention_grid.py` harness:
+
+```text
+head_dim: 512
+api: dense
+q_len: 128, 256, 512, 1024, 2048, 4096
+kv_len: 128, 512, 1024, 2048, 4096, 8192, 32768, 65536, 131072, 262144
+group: 2, 4, 6, 8, 12, 16
+sm120_fused split_kv_len: 32768
+sm120_fused output_group_span: 4
+causal: true
+logits_soft_cap: 50.0
+sliding_window: -1
+warmup/repeat: 1 / 3
+```
+
+Report files:
+
+```text
+reports/d512_sm120_nvfp4_attention_dense_grid_20260501.jsonl
+reports/d512_sm120_nvfp4_attention_dense_grid_20260501.csv
+reports/d512_sm120_nvfp4_attention_dense_grid_20260501.summary.csv
+reports/d512_sm120_nvfp4_attention_dense_grid_20260501.md
+```
+
+Completion:
+
+```text
+raw rows: 1440 / 1440
+cells:    360 / 360
+kernels: sm120_fused, nvfp4_fa2, fp8_fa2, bf16_fa2 each 360 rows
+status:  1080 ok, 360 error
+```
+
+All 360 error rows are the existing BF16 FA2 D512 invalid-configuration
+failure:
+
+```text
+Invalid configuration:
+NUM_MMA_Q=1 NUM_MMA_D_QK=32 NUM_MMA_D_VO=32 NUM_MMA_KV=1
+NUM_WARPS_Q=4 NUM_WARPS_KV=1
+```
+
+Headline summary versus NVFP4 FA2:
+
+```text
+all 360 cells:
+  sm120_fused wins:     179 / 360
+  passes 2x gate:        86 / 360
+  median speedup:     0.984x
+  max speedup:        4.422x
+
+q>=512 and kv>=8192:
+  sm120_fused wins:      97 / 120
+  wins vs fp8_fa2:      101 / 120
+  passes 2x gate:        71 / 120
+  median speedup:     2.328x
+  max speedup:        4.422x
+
+q>=1024 and kv>=8192:
+  sm120_fused wins:      81 / 90
+  wins vs fp8_fa2:       83 / 90
+  passes 2x gate:        64 / 90
+  median speedup:     2.621x
+  max speedup:        4.422x
+
+q>=2048 and kv>=8192:
+  sm120_fused wins:      58 / 60
+  wins vs fp8_fa2:       58 / 60
+  passes 2x gate:        47 / 60
+  median speedup:     2.691x
+  max speedup:        4.380x
+```
+
+Per-group rollup for the focus region `q>=512, kv>=8192`:
+
+```text
+group 2:  wins 11/20, passes 2x  6/20, median 1.083x, max 3.523x
+group 4:  wins 15/20, passes 2x 11/20, median 2.199x, max 3.512x
+group 6:  wins 15/20, passes 2x  9/20, median 1.950x, max 4.380x
+group 8:  wins 18/20, passes 2x 14/20, median 2.654x, max 3.508x
+group 12: wins 18/20, passes 2x 14/20, median 2.596x, max 4.422x
+group 16: wins 20/20, passes 2x 17/20, median 2.715x, max 3.526x
+```
+
+Important comparison note:
+
+The prior D512 report at
+`reports/d512_hillclimb_180cell_20260430.*` was not using production
+attention semantics. The old fused command did not pass causal masking or
+Gemma soft-capping. The new sweep does pass `--causal --logits-soft-cap 50.0`.
+Therefore the old report is not an apples-to-apples performance baseline for
+this run.
+
+Spot check at D512/group8/q512/kv32768:
+
+```text
+old report, no causal, no softcap:
+  4.889 ms
+
+new source-tree dense, no causal, no softcap:
+  5.329 ms
+
+new source-tree dense, causal only:
+  7.736 ms
+
+new source-tree dense, softcap only:
+  6.464 ms
+
+new source-tree dense, causal + softcap:
+  8.121 ms
+```
+
+So the overlap delta against the old report is mostly a semantic change, not
+a pure source-tree extraction regression. The remaining old-semantics delta at
+this spot is about +9.0% and still needs separate investigation if dense
+benchmark parity with the old benchmark `.cu` remains a goal.
+
 ## Benchmark API Field
 
 The benchmark output now uses a single `api` field to label the entry shape:
