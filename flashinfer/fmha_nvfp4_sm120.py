@@ -24,6 +24,7 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit import gen_fmha_nvfp4_sm120_module
+from .quantization.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from .utils import check_shape_dtype_device
 
 
@@ -71,14 +72,13 @@ def _get_sm120_nvfp4_fmha_module(
     causal: bool,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
-    v_cache_uses_pv_layout: bool,
 ):
     return gen_fmha_nvfp4_sm120_module(
         head_dim,
         causal=causal,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
-        v_cache_uses_pv_layout=v_cache_uses_pv_layout,
+        v_cache_uses_pv_layout=True,
     ).build_and_load()
 
 
@@ -96,19 +96,17 @@ def _as_uint8_scale(scale: torch.Tensor) -> torch.Tensor:
 class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
     r"""SM120 NVFP4 paged prefill wrapper for BF16 Q/O and NVFP4 KV.
 
-    This wrapper is intentionally narrow: it exposes the productionized SM120
-    fused FMHA kernels for D128/D256/D512. It can consume the PV-reblocked V
-    layout produced by :func:`flashinfer.nvfp4_quantize_paged_kv_cache` with
-    ``v_data_layout="pv"`` and ``v_scale_layout="pv"``, or the historical
-    normal V layout by reblocking V into the PV MMA operand in the stage
-    producer.
+    This wrapper exposes the productionized SM120 fused FMHA kernels for
+    D128/D256/D512. Standard vLLM paged NVFP4 KV uses linear V layout at the
+    public API boundary; the wrapper converts that V cache to the PV physical
+    layout required by the SM120 block-scaled PV MMA before launching attention.
 
-    The current implementation uses the source-tree csrc/JIT ``paged_run``
-    path. D128/D256/D512 stage K and V directly from the paged block table.
-    PV-layout V is consumed directly, while normal-layout V is converted into
-    the PV MMA operand inside the stage producer. The API boundary is the
-    production boundary; callers do not need a different vLLM-side call site for
-    the native block-table load path.
+    Callers that already store PV-layout V from
+    :func:`flashinfer.nvfp4_quantize_paged_kv_cache` with
+    ``v_data_layout="pv"`` and ``v_scale_layout="pv"`` can pass
+    ``v_cache_uses_pv_layout=True`` to skip that conversion. In both cases the
+    attention kernel itself stages K and PV-layout V directly from the paged
+    block table.
     """
 
     def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD") -> None:
@@ -213,7 +211,6 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             self._causal,
             self._window_left > 0,
             self._logits_soft_cap > 0.0,
-            self._v_cache_uses_pv_layout,
         )
 
         tile_m = _tile_m_for_head_dim(head_dim)
@@ -282,12 +279,18 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 f"got {tuple(q.shape)}."
             )
 
-        k_pages, v_pages_pv = paged_kv_cache
-        k_sf_pages, v_sf_pages_pv = kv_cache_sf
+        k_pages, v_pages_input = paged_kv_cache
+        k_sf_pages, v_sf_pages_input = kv_cache_sf
         k_sf_pages_u8 = _as_uint8_scale(k_sf_pages)
-        v_sf_pages_pv_u8 = _as_uint8_scale(v_sf_pages_pv)
-        if v_cache_sf_layout not in ("trtllm_interleaved", "linear"):
-            raise ValueError("v_cache_sf_layout must be 'trtllm_interleaved' or 'linear'.")
+        v_sf_pages_input_u8 = _as_uint8_scale(v_sf_pages_input)
+        if v_cache_sf_layout not in ("trtllm_interleaved", "linear", "pv"):
+            raise ValueError(
+                "v_cache_sf_layout must be 'trtllm_interleaved', 'linear', or 'pv'."
+            )
+        if v_cache_sf_layout == "pv" and not self._v_cache_uses_pv_layout:
+            raise ValueError(
+                "v_cache_sf_layout='pv' requires v_cache_uses_pv_layout=True."
+            )
         if bool(v_cache_uses_pv_layout) != self._v_cache_uses_pv_layout:
             raise ValueError(
                 "v_cache_uses_pv_layout must match the value passed to plan()."
@@ -300,15 +303,15 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             if self._kv_layout == "HND"
             else (None, self._page_size, self._num_kv_heads, self._head_dim // 2)
         )
-        if k_pages.dtype != torch.uint8 or v_pages_pv.dtype != torch.uint8:
+        if k_pages.dtype != torch.uint8 or v_pages_input.dtype != torch.uint8:
             raise ValueError("paged_kv_cache tensors must have dtype torch.uint8.")
         if k_pages.shape[1:] != expected_page_shape[1:]:
             raise ValueError(
                 "k_pages must have shape "
                 f"{expected_page_shape}, got {tuple(k_pages.shape)}."
             )
-        if v_pages_pv.shape != k_pages.shape:
-            raise ValueError("v_pages_pv must have the same shape as k_pages.")
+        if v_pages_input.shape != k_pages.shape:
+            raise ValueError("V pages must have the same shape as K pages.")
         expected_sf_shape = (
             (k_pages.shape[0], self._num_kv_heads, self._page_size, self._head_dim // 16)
             if self._kv_layout == "HND"
@@ -319,14 +322,56 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 f"k scale pages must have shape {expected_sf_shape}, "
                 f"got {tuple(k_sf_pages_u8.shape)}."
             )
-        if v_sf_pages_pv_u8.shape != expected_sf_shape:
+        if v_sf_pages_input_u8.shape != expected_sf_shape:
             raise ValueError(
-                f"PV V scale pages must have shape {expected_sf_shape}, "
-                f"got {tuple(v_sf_pages_pv_u8.shape)}."
+                f"V scale pages must have shape {expected_sf_shape}, "
+                f"got {tuple(v_sf_pages_input_u8.shape)}."
             )
 
+        stream = torch.cuda.current_stream(q.device).cuda_stream
+
+        if self._v_cache_uses_pv_layout:
+            run_k_pages = k_pages
+            run_k_sf_pages_u8 = k_sf_pages_u8
+            run_v_pages_pv = v_pages_input
+            run_v_sf_pages_pv_u8 = v_sf_pages_input_u8
+            run_kv_layout_hnd = False
+            run_k_scale = float(k_scale)
+            run_v_scale = float(v_scale)
+        else:
+            if self._kv_layout == "HND":
+                k_pages_nhd = k_pages.permute(0, 2, 1, 3).contiguous()
+                k_sf_pages_nhd = k_sf_pages_u8.permute(0, 2, 1, 3).contiguous()
+                v_pages_nhd = v_pages_input.permute(0, 2, 1, 3).contiguous()
+                v_sf_pages_nhd = v_sf_pages_input_u8.permute(0, 2, 1, 3).contiguous()
+            else:
+                k_pages_nhd = k_pages
+                k_sf_pages_nhd = k_sf_pages_u8
+                v_pages_nhd = v_pages_input
+                v_sf_pages_nhd = v_sf_pages_input_u8
+
+            (
+                (run_k_pages, run_v_pages_pv),
+                (run_k_sf_pages, run_v_sf_pages_pv),
+                run_k_scale,
+                run_v_scale,
+            ) = nvfp4_quantize_paged_kv_cache(
+                k_pages_nhd,
+                v_pages_nhd,
+                "NHD",
+                v_scale_layout="pv",
+                v_data_layout="pv",
+                kv_cache_sf=(k_sf_pages_nhd, v_sf_pages_nhd),
+                k_global_scale=float(k_scale),
+                v_global_scale=float(v_scale),
+                stream_handle=stream,
+            )
+            run_k_sf_pages_u8 = _as_uint8_scale(run_k_sf_pages)
+            run_v_sf_pages_pv_u8 = _as_uint8_scale(run_v_sf_pages_pv)
+            run_kv_layout_hnd = False
+
         if out is None:
-            out = torch.empty_like(q)
+            out = torch.zeros_like(q)
         else:
             check_shape_dtype_device(out, q.shape, torch.bfloat16, q.device, "out")
 
@@ -334,14 +379,18 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             qo_start = kv_head * self._group_size
             qo_stop = qo_start + self._group_size
             self._q_group.copy_(q[:, qo_start:qo_stop, :])
-            self._module.quantize_q(self._q_group, self._q_packed, self._q_scales)
+            self._module.quantize_q(
+                self._q_group, self._q_packed, self._q_scales, stream
+            )
+            self._out_scratch.zero_()
+            self._out_group.zero_()
             self._module.paged_run(
                 self._q_packed,
                 self._q_scales,
-                k_pages,
-                k_sf_pages_u8,
-                v_pages_pv,
-                v_sf_pages_pv_u8,
+                run_k_pages,
+                run_k_sf_pages_u8,
+                run_v_pages_pv,
+                run_v_sf_pages_pv_u8,
                 self._block_tables,
                 self._qo_indptr_device,
                 self._kv_lens_device,
@@ -354,8 +403,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 self._out_group,
                 self._workspace_buffer,
                 self._physical_kv_len,
-                float(k_scale),
-                float(v_scale),
+                float(run_k_scale),
+                float(run_v_scale),
                 kv_head,
                 self._split_kv_tiles,
                 self._group_size,
@@ -363,9 +412,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 self._window_left,
                 self._logits_soft_cap,
                 self._output_group_span,
-                self._v_cache_uses_pv_layout,
-                v_cache_sf_layout == "trtllm_interleaved",
-                self._kv_layout == "HND",
+                run_kv_layout_hnd,
+                stream,
             )
             out[:, qo_start:qo_stop, :].copy_(
                 self._out_group.view(

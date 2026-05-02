@@ -48,7 +48,6 @@ struct PagedKernelConfig {
   bool causal;
   bool use_sliding_window;
   bool use_logits_soft_cap;
-  bool v_cache_uses_pv_layout;
   RawPagedRunFn run;
 };
 

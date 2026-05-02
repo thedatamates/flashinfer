@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 from types import SimpleNamespace
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 
@@ -243,6 +243,7 @@ def get_fp4_quantization_module(backend: str = "100"):
         is_sf_swizzled_layout: bool = True,
         is_sf_8x4_layout: bool = False,
         enable_pdl: Optional[bool] = None,
+        stream_handle: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Quantize input tensor to FP4 format.
 
@@ -291,6 +292,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             is_sf_swizzled_layout,
             is_sf_8x4_layout,
             enable_pdl,
+            stream_handle,
         )
         return out_val, out_sf[:out_sf_size]
 
@@ -301,6 +303,9 @@ def get_fp4_quantization_module(backend: str = "100"):
         sf_vec_size: int = 16,
         sf_use_ue8m0: bool = False,
         is_sf_swizzled_layout: bool = True,
+        is_sf_8x4_layout: bool = False,
+        enable_pdl: Optional[bool] = None,
+        stream_handle: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         m, k = input.shape
         return (
@@ -720,6 +725,7 @@ def fp4_quantize(
     is_sf_8x4_layout: bool = False,
     enable_pdl: Optional[bool] = None,
     backend: str = "cuda",
+    stream_handle: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize input tensor to FP4 format.
 
@@ -792,6 +798,7 @@ def fp4_quantize(
         is_sf_swizzled_layout,
         is_sf_8x4_layout,
         enable_pdl,
+        stream_handle,
     )
     # Swizzled sf includes row/column padding from block_scale_interleave
     # (rows to multiple of 128, cols to multiple of 4), so we use the padded
@@ -1232,7 +1239,11 @@ def nvfp4_quantize_paged_kv_cache(
     k_global_sf: Optional[torch.Tensor] = None,
     v_global_sf: Optional[torch.Tensor] = None,
     v_scale_layout: str = "trtllm_interleaved",
-    v_data_layout: str = "normal",
+    v_data_layout: str = "linear",
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    k_global_scale: Optional[Union[float, torch.Tensor]] = None,
+    v_global_scale: Optional[Union[float, torch.Tensor]] = None,
+    stream_handle: int = 0,
 ) -> Tuple[
     Tuple[torch.Tensor, torch.Tensor],
     Tuple[torch.Tensor, torch.Tensor],
@@ -1260,10 +1271,16 @@ def nvfp4_quantize_paged_kv_cache(
             historical default; ``"linear"`` leaves V scales in row-major layout.
             ``"pv"`` emits the PV-reblocked scale layout used by the SM120
             NVFP4 FMHA path and requires ``v_data_layout="pv"``.
-        v_data_layout: Physical V data layout. ``"normal"`` returns V in the same
+        v_data_layout: Physical V data layout. ``"linear"`` returns V in the same
             packed page layout as K. ``"pv"`` emits the PV-reblocked layout used by
             SM120 NVFP4 FMHA. PV layout currently requires ``kv_layout="NHD"`` and
             ``page_size=16``.
+        kv_cache_sf: Optional existing per-block FP8 scale tensors for already
+            packed NVFP4 K/V input. When provided with uint8 K/V input and
+            ``v_data_layout="pv"``, K is returned unchanged and V is dequantized
+            from the linear layout then re-quantized into the PV layout.
+        k_global_scale: Global dequantization scale for already packed K input.
+        v_global_scale: Global dequantization scale for already packed V input.
 
     Returns:
         kv_cache_fp4: Tuple of (k_fp4, v_fp4) in the same layout as input,
@@ -1277,12 +1294,97 @@ def nvfp4_quantize_paged_kv_cache(
     _FLOAT8_E4M3_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
     # Extract dimensions based on layout
     if kv_layout == "NHD":
-        num_pages, page_size, num_kv_heads, head_dim = k_cache.shape
+        num_pages, page_size, num_kv_heads, last_dim = k_cache.shape
     else:
-        num_pages, num_kv_heads, page_size, head_dim = k_cache.shape
+        num_pages, num_kv_heads, page_size, last_dim = k_cache.shape
 
     device = k_cache.device
+    packed_input = k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
+    if packed_input:
+        if k_cache.dtype != torch.uint8 or v_cache.dtype != torch.uint8:
+            raise TypeError("packed NVFP4 K/V conversion requires both K and V dtype uint8.")
+        head_dim = last_dim * 2
+    else:
+        head_dim = last_dim
     scale_dim = head_dim // 16
+
+    if v_data_layout not in ("linear", "pv"):
+        raise ValueError("v_data_layout must be 'linear' or 'pv'.")
+    if v_data_layout == "pv":
+        if kv_layout != "NHD":
+            raise ValueError("v_data_layout='pv' currently requires kv_layout='NHD'.")
+        if page_size != 16:
+            raise ValueError("v_data_layout='pv' currently requires page_size=16.")
+        if v_scale_layout != "pv":
+            raise ValueError("v_data_layout='pv' requires v_scale_layout='pv'.")
+    elif v_scale_layout == "pv":
+        raise ValueError("v_scale_layout='pv' requires v_data_layout='pv'.")
+
+    if packed_input:
+        if kv_cache_sf is None:
+            raise ValueError("packed NVFP4 K/V conversion requires kv_cache_sf.")
+        if k_global_scale is None or v_global_scale is None:
+            raise ValueError(
+                "packed NVFP4 K/V conversion requires k_global_scale and v_global_scale."
+            )
+        if v_data_layout != "pv":
+            k_sf_in, v_sf_in = kv_cache_sf
+            return (
+                (k_cache, v_cache),
+                (k_sf_in, v_sf_in),
+                float(_as_fp32_scalar_tensor(k_global_scale, name="k_global_scale", device=device).item()),
+                float(_as_fp32_scalar_tensor(v_global_scale, name="v_global_scale", device=device).item()),
+            )
+
+        k_sf_in, v_sf_in = kv_cache_sf
+        k_sf_in_u8 = _as_uint8_fp8_scale(k_sf_in, name="k_cache_sf[0]")
+        v_sf_in_u8 = _as_uint8_fp8_scale(v_sf_in, name="kv_cache_sf[1]")
+        expected_sf_shape = (num_pages, page_size, num_kv_heads, scale_dim)
+        if k_sf_in_u8.shape != expected_sf_shape:
+            raise ValueError(
+                f"packed K scales must have shape {expected_sf_shape}, "
+                f"got {tuple(k_sf_in_u8.shape)}."
+            )
+        if v_sf_in_u8.shape != expected_sf_shape:
+            raise ValueError(
+                f"packed V scales must have shape {expected_sf_shape}, "
+                f"got {tuple(v_sf_in_u8.shape)}."
+            )
+        v_scale_tensor = _as_fp32_scalar_tensor(
+            v_global_scale, name="v_global_scale", device=device
+        )
+        v_global_sf = 1.0 / v_scale_tensor
+        v_2d = v_cache.reshape(-1, head_dim // 2)
+        v_sf_2d = v_sf_in_u8.reshape(-1, scale_dim)
+        v_dequant_2d = nvfp4_kv_dequantize(
+            v_2d,
+            v_sf_2d,
+            v_scale_tensor,
+            output_dtype=torch.float16,
+            stream_handle=stream_handle,
+        )
+        v_dequant = v_dequant_2d.reshape(
+            num_pages, page_size, num_kv_heads, head_dim
+        )
+        v_cache_pv, v_sf_pv = _quantize_v_cache_pv_nhd(
+            v_dequant,
+            v_global_sf,
+            num_pages=num_pages,
+            page_size=page_size,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            stream_handle=stream_handle,
+        )
+        return (
+            (k_cache, v_cache_pv),
+            (k_sf_in, v_sf_pv),
+            float(
+                _as_fp32_scalar_tensor(
+                    k_global_scale, name="k_global_scale", device=device
+                ).item()
+            ),
+            float(v_scale_tensor.item()),
+        )
 
     # Compute global scale factors if not provided.
     # global_sf = FLOAT8_E4M3_MAX / tensor_amax (no *E2M1_MAX factor).
@@ -1305,21 +1407,13 @@ def nvfp4_quantize_paged_kv_cache(
     # Flatten to 2D [total_tokens, head_dim] for fp4_quantize
     # Both layouts flatten identically since total elements are the same
     k_2d = k_cache.reshape(-1, head_dim)
-    if v_data_layout not in ("normal", "pv"):
-        raise ValueError("v_data_layout must be 'normal' or 'pv'.")
-    if v_data_layout == "pv":
-        if kv_layout != "NHD":
-            raise ValueError("v_data_layout='pv' currently requires kv_layout='NHD'.")
-        if page_size != 16:
-            raise ValueError("v_data_layout='pv' currently requires page_size=16.")
-        if v_scale_layout != "pv":
-            raise ValueError("v_data_layout='pv' requires v_scale_layout='pv'.")
-    elif v_scale_layout == "pv":
-        raise ValueError("v_scale_layout='pv' requires v_data_layout='pv'.")
-
     # Quantize using FlashInfer's GPU kernel with linear scale layout
     k_packed, k_sf = fp4_quantize(
-        k_2d, k_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
+        k_2d,
+        k_global_sf,
+        sf_vec_size=16,
+        is_sf_swizzled_layout=False,
+        stream_handle=stream_handle,
     )
     # fp4_quantize returns uint8 packed FP4 and uint8 scale factors (FP8 E4M3 encoded)
     # Reshape packed data and scale factors back to the original layout
@@ -1333,49 +1427,27 @@ def nvfp4_quantize_paged_kv_cache(
     # Reshape scale factors (FP8 E4M3 encoded as uint8)
     k_sf_fp8 = k_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
 
-    if v_data_layout == "normal":
+    if v_data_layout == "linear":
         v_2d = v_cache.reshape(-1, head_dim)
         v_packed, v_sf = fp4_quantize(
-            v_2d, v_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
+            v_2d,
+            v_global_sf,
+            sf_vec_size=16,
+            is_sf_swizzled_layout=False,
+            stream_handle=stream_handle,
         )
         v_cache_fp4 = v_packed.view(torch.uint8).reshape(out_shape_fp4)
         v_sf_fp8 = v_sf.view(torch.float8_e4m3fn).reshape(out_shape_sf)
     else:
-        # PV-reblocked V layout for the SM120 NVFP4 fused attention kernel.
-        # Data remains shaped like NHD pages, but each byte packs two tokens for
-        # a fixed output column. Scales are stored as [page, token_slot, head,
-        # scale_col] where token_slot selects the output-column group consumed by
-        # the PV MMA staging path.
-        v_by_col = (
-            v_cache.permute(0, 2, 3, 1)
-            .contiguous()
-            .reshape(num_pages * num_kv_heads * head_dim, page_size)
+        v_cache_fp4, v_sf_fp8 = _quantize_v_cache_pv_nhd(
+            v_cache,
+            v_global_sf,
+            num_pages=num_pages,
+            page_size=page_size,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            stream_handle=stream_handle,
         )
-        packed_col_token, sf_col = fp4_quantize(
-            v_by_col, v_global_sf, sf_vec_size=16, is_sf_swizzled_layout=False
-        )
-        packed_col_token = packed_col_token.view(torch.uint8).reshape(
-            num_pages, num_kv_heads, head_dim, page_size // 2
-        )
-        nibbles = torch.empty(
-            (num_pages, num_kv_heads, head_dim, page_size),
-            device=device,
-            dtype=torch.uint8,
-        )
-        nibbles[..., 0::2] = packed_col_token & 0x0F
-        nibbles[..., 1::2] = (packed_col_token >> 4) & 0x0F
-        nibbles_by_row = nibbles.permute(0, 3, 1, 2).contiguous()
-        v_cache_fp4 = (
-            nibbles_by_row[..., 0::2] | (nibbles_by_row[..., 1::2] << 4)
-        ).contiguous()
-
-        v_sf_u8 = (
-            sf_col.view(torch.uint8)
-            .reshape(num_pages, num_kv_heads, page_size, scale_dim)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
-        v_sf_fp8 = v_sf_u8.view(torch.float8_e4m3fn)
 
     kv_cache_fp4 = (
         k_packed.view(torch.uint8).reshape(out_shape_fp4),
@@ -1484,8 +1556,11 @@ def get_fp4_kv_dequantization_module():
         block_scales: torch.Tensor,
         global_scale: torch.Tensor,
         output: torch.Tensor,
+        stream_handle: int = 0,
     ) -> None:
-        module.nvfp4_kv_dequant(fp4_data, block_scales, global_scale, output)
+        module.nvfp4_kv_dequant(
+            fp4_data, block_scales, global_scale, output, stream_handle
+        )
 
     @register_fake_op("flashinfer::nvfp4_kv_dequant")
     def _fake_nvfp4_kv_dequant(
@@ -1493,6 +1568,7 @@ def get_fp4_kv_dequantization_module():
         block_scales: torch.Tensor,
         global_scale: torch.Tensor,
         output: torch.Tensor,
+        stream_handle: int = 0,
     ) -> None:
         pass
 
@@ -1514,8 +1590,11 @@ def get_fp4_kv_quantization_module():
         global_scale: torch.Tensor,
         fp4_output: torch.Tensor,
         block_scales: torch.Tensor,
+        stream_handle: int = 0,
     ) -> None:
-        module.nvfp4_kv_quant(input, global_scale, fp4_output, block_scales)
+        module.nvfp4_kv_quant(
+            input, global_scale, fp4_output, block_scales, stream_handle
+        )
 
     @register_fake_op("flashinfer::nvfp4_kv_quant")
     def _fake_nvfp4_kv_quant(
@@ -1523,6 +1602,7 @@ def get_fp4_kv_quantization_module():
         global_scale: torch.Tensor,
         fp4_output: torch.Tensor,
         block_scales: torch.Tensor,
+        stream_handle: int = 0,
     ) -> None:
         pass
 
@@ -1566,6 +1646,81 @@ def get_fp4_softmax_quantization_module():
 _NVFP4_BLOCK_SIZE = 16
 
 
+def _as_fp32_scalar_tensor(
+    value: Union[float, torch.Tensor],
+    *,
+    name: str,
+    device: torch.device,
+) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(f"{name} must be a scalar tensor.")
+        return value.to(device=device, dtype=torch.float32).reshape(1)
+    return torch.tensor([float(value)], dtype=torch.float32, device=device)
+
+
+def _as_uint8_fp8_scale(scale: torch.Tensor, *, name: str) -> torch.Tensor:
+    if scale.dtype == torch.uint8:
+        return scale
+    if scale.dtype == torch.float8_e4m3fn:
+        return scale.view(torch.uint8)
+    raise TypeError(f"{name} must have dtype torch.uint8 or torch.float8_e4m3fn.")
+
+
+def _quantize_v_cache_pv_nhd(
+    v_cache: torch.Tensor,
+    v_global_sf: torch.Tensor,
+    *,
+    num_pages: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    stream_handle: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    device = v_cache.device
+    scale_dim = head_dim // 16
+
+    # PV-reblocked V layout for the SM120 NVFP4 fused attention kernel.
+    # Data remains shaped like NHD pages, but each byte packs two tokens for
+    # a fixed output column. Scales are stored as [page, token_slot, head,
+    # scale_col] where token_slot selects the output-column group consumed by
+    # the PV MMA staging path.
+    v_by_col = (
+        v_cache.permute(0, 2, 3, 1)
+        .contiguous()
+        .reshape(num_pages * num_kv_heads * head_dim, page_size)
+    )
+    packed_col_token, sf_col = fp4_quantize(
+        v_by_col,
+        v_global_sf,
+        sf_vec_size=16,
+        is_sf_swizzled_layout=False,
+        stream_handle=stream_handle,
+    )
+    packed_col_token = packed_col_token.view(torch.uint8).reshape(
+        num_pages, num_kv_heads, head_dim, page_size // 2
+    )
+    nibbles = torch.empty(
+        (num_pages, num_kv_heads, head_dim, page_size),
+        device=device,
+        dtype=torch.uint8,
+    )
+    nibbles[..., 0::2] = packed_col_token & 0x0F
+    nibbles[..., 1::2] = (packed_col_token >> 4) & 0x0F
+    nibbles_by_row = nibbles.permute(0, 3, 1, 2).contiguous()
+    v_cache_fp4 = (
+        nibbles_by_row[..., 0::2] | (nibbles_by_row[..., 1::2] << 4)
+    ).contiguous()
+
+    v_sf_u8 = (
+        sf_col.view(torch.uint8)
+        .reshape(num_pages, num_kv_heads, page_size, scale_dim)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+    )
+    return v_cache_fp4, v_sf_u8.view(torch.float8_e4m3fn)
+
+
 def _select_nvfp4_softmax_quant_threads(m: int, n: int) -> int:
     """Select a row-block size for fused softmax + NVFP4 quantization.
 
@@ -1585,7 +1740,9 @@ def _select_nvfp4_softmax_quant_threads(m: int, n: int) -> int:
 
 
 @supported_compute_capability([80, 86, 89, 90, 100, 103, 110, 120, 121])
-def _nvfp4_kv_dequant_check(fp4_data, block_scales, global_scale, output_dtype=None):
+def _nvfp4_kv_dequant_check(
+    fp4_data, block_scales, global_scale, output_dtype=None, stream_handle=0
+):
     return True
 
 
@@ -1596,6 +1753,7 @@ def nvfp4_kv_dequantize(
     block_scales: torch.Tensor,
     global_scale: torch.Tensor,
     output_dtype: torch.dtype = torch.bfloat16,
+    stream_handle: int = 0,
 ) -> torch.Tensor:
     """GPU dequantization of NVFP4 KV cache data with linear block scale layout.
 
@@ -1618,13 +1776,13 @@ def nvfp4_kv_dequantize(
         raise ValueError(f"K dimension ({K}) must be divisible by {_NVFP4_BLOCK_SIZE}")
     output = torch.empty((M, K), dtype=output_dtype, device=fp4_data.device)
     get_fp4_kv_dequantization_module().nvfp4_kv_dequant(
-        fp4_data, block_scales, global_scale, output
+        fp4_data, block_scales, global_scale, output, stream_handle
     )
     return output
 
 
 @supported_compute_capability([100, 103, 110, 120, 121])
-def _nvfp4_kv_quant_check(input, global_scale):
+def _nvfp4_kv_quant_check(input, global_scale, stream_handle=0):
     return True
 
 
@@ -1633,6 +1791,7 @@ def _nvfp4_kv_quant_check(input, global_scale):
 def nvfp4_kv_quantize(
     input: torch.Tensor,
     global_scale: torch.Tensor,
+    stream_handle: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """GPU quantization to NVFP4 KV cache format with linear block scale layout.
 
@@ -1657,7 +1816,7 @@ def nvfp4_kv_quantize(
         (M, K // _NVFP4_BLOCK_SIZE), dtype=torch.uint8, device=input.device
     )
     get_fp4_kv_quantization_module().nvfp4_kv_quant(
-        input, global_scale, fp4_output, block_scales
+        input, global_scale, fp4_output, block_scales, stream_handle
     )
     return fp4_output, block_scales
 

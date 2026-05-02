@@ -10,8 +10,9 @@ namespace flashinfer {
 namespace {
 
 void SM120Nvfp4QuantizeQ(TensorView q, TensorView q_packed,
-                         TensorView q_scales) {
-  sm120_nvfp4_quantize::QuantizeQImpl(128, q, q_packed, q_scales);
+                         TensorView q_scales, int64_t stream_handle) {
+  sm120_nvfp4_quantize::QuantizeQImpl(128, q, q_packed, q_scales,
+                                      stream_handle);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(quantize_q, SM120Nvfp4QuantizeQ);

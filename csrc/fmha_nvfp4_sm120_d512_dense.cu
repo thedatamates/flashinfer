@@ -25,7 +25,7 @@ cudaError_t Sm120Nvfp4D512RunDenseRaw(
     float logits_soft_cap, int q_rows, int kv_len, cudaStream_t stream) {
   return d512::sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw<
       4, false, SM120_NVFP4_CAUSAL, SM120_NVFP4_USE_SLIDING_WINDOW,
-      SM120_NVFP4_USE_LOGITS_SOFT_CAP, false>(
+      SM120_NVFP4_USE_LOGITS_SOFT_CAP>(
       q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
       partial, split_m, split_l, out, workspace, workspace_bytes, qk_alpha,
       pv_alpha, split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
@@ -50,13 +50,14 @@ void SM120Nvfp4FmhaRunDense(
     TensorView out, TensorView workspace, double qk_alpha, double pv_alpha,
     int64_t split_kv_tiles, int64_t q_len, int64_t group_size,
     int64_t kv_len_tokens, bool causal, int64_t sliding_window,
-    double logits_soft_cap, int64_t output_group_span) {
+    double logits_soft_cap, int64_t output_group_span,
+    int64_t stream_handle) {
   const auto kernel = Sm120Nvfp4D512DenseKernelConfig();
   sm120_nvfp4_paged::RunDenseImpl(
       kernel, q_packed, q_scales, k_packed, k_scales, v_pv_packed,
       v_pv_scales, partial, split_m, split_l, out, workspace, qk_alpha,
       pv_alpha, split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
-      sliding_window, logits_soft_cap, output_group_span);
+      sliding_window, logits_soft_cap, output_group_span, stream_handle);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(dense_run, SM120Nvfp4FmhaRunDense);

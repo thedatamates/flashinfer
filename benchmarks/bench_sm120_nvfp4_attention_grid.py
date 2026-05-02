@@ -150,6 +150,8 @@ def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]
         "--logits-soft-cap",
         str(args.logits_soft_cap),
     ]
+    if args.fused_api == "paged":
+        command.extend(["--v-layout", args.fused_v_layout])
     if args.causal:
         command.append("--causal")
     return command
@@ -222,6 +224,7 @@ def summarize(
             "group": cell.group,
             "kernel": kernel,
             "api": data.get("api"),
+            "v_layout": data.get("v_layout"),
             "fused_output_group_span": fused_output_group_span,
             "min_ms": bench["min_ms"],
             "mean_ms": bench["mean_ms"],
@@ -246,6 +249,7 @@ def summarize(
         "group": cell.group,
         "kernel": kernel,
         "api": None,
+        "v_layout": None,
         "min_ms": bench["min_ms"],
         "mean_ms": bench["mean_ms"],
         "output_finite": None,
@@ -279,6 +283,7 @@ def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
         "group",
         "kernel",
         "api",
+        "v_layout",
         "fused_output_group_span",
         "min_ms",
         "mean_ms",
@@ -390,6 +395,7 @@ def row_fieldnames() -> list[str]:
         "group",
         "kernel",
         "api",
+        "v_layout",
         "fused_output_group_span",
         "min_ms",
         "mean_ms",
@@ -436,18 +442,30 @@ def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
     _, _, summary_path, md_path = report_paths(prefix)
     ok_rows = [row for row in rows if row.get("status", "ok") == "ok"]
 
-    by_cell: dict[tuple[int, int, int], dict[str, dict[str, Any]]] = {}
+    baselines_by_cell: dict[tuple[int, int, int], dict[str, dict[str, Any]]] = {}
+    fused_rows: list[dict[str, Any]] = []
     for row in ok_rows:
-        by_cell.setdefault((row["group"], row["q"], row["kv"]), {})[
-            row["kernel"]
-        ] = row
+        cell_key = (row["group"], row["q"], row["kv"])
+        if row["kernel"] == "sm120_fused":
+            fused_rows.append(row)
+        else:
+            baselines_by_cell.setdefault(cell_key, {})[row["kernel"]] = row
 
     summary_rows: list[dict[str, Any]] = []
-    for cell_key in sorted(by_cell):
-        data = by_cell[cell_key]
-        fused = data.get("sm120_fused")
+    for fused in sorted(
+        fused_rows,
+        key=lambda row: (
+            row["group"],
+            row["q"],
+            row["kv"],
+            str(row.get("api")),
+            str(row.get("v_layout")),
+        ),
+    ):
+        cell_key = (fused["group"], fused["q"], fused["kv"])
+        data = baselines_by_cell.get(cell_key, {})
         nvfp4 = data.get("nvfp4_fa2")
-        if not fused or not nvfp4:
+        if not nvfp4:
             continue
         speedup = nvfp4["min_ms"] / fused["min_ms"]
         target_ms = nvfp4["min_ms"] / 2.0
@@ -456,6 +474,8 @@ def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
                 "group": cell_key[0],
                 "q": cell_key[1],
                 "kv": cell_key[2],
+                "api": fused.get("api"),
+                "v_layout": fused.get("v_layout"),
                 "fused_ms": fused["min_ms"],
                 "nvfp4_fa2_ms": nvfp4["min_ms"],
                 "fp8_fa2_ms": data.get("fp8_fa2", {}).get("min_ms"),
@@ -475,6 +495,8 @@ def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
         "group",
         "q",
         "kv",
+        "api",
+        "v_layout",
         "fused_ms",
         "nvfp4_fa2_ms",
         "fp8_fa2_ms",
@@ -494,13 +516,14 @@ def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
         writer.writerows(summary_rows)
 
     with md_path.open("w") as f:
-        f.write("| group | q | kv | fused | nvfp4_fa2 | fp8_fa2 | bf16_fa2 | speedup vs nvfp4 | cosine | pass |\n")
-        f.write("|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|\n")
+        f.write("| group | q | kv | api | v_layout | fused | nvfp4_fa2 | fp8_fa2 | bf16_fa2 | speedup vs nvfp4 | cosine | pass |\n")
+        f.write("|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|:---:|\n")
         for row in summary_rows:
             fp8_ms = row["fp8_fa2_ms"]
             bf16_ms = row["bf16_fa2_ms"]
             f.write(
-                f"| {row['group']} | {row['q']} | {row['kv']} | {row['fused_ms']:.6f} | "
+                f"| {row['group']} | {row['q']} | {row['kv']} | "
+                f"{row['api']} | {row['v_layout']} | {row['fused_ms']:.6f} | "
                 f"{row['nvfp4_fa2_ms']:.6f} | "
                 f"{'-' if fp8_ms is None else f'{fp8_ms:.6f}'} | "
                 f"{'-' if bf16_ms is None else f'{bf16_ms:.6f}'} | "
@@ -537,6 +560,7 @@ def error_row(
         "group": cell.group,
         "kernel": kernel,
         "api": None,
+        "v_layout": None,
         "fused_output_group_span": (
             fused_output_group_span if kernel == "sm120_fused" else None
         ),
@@ -573,6 +597,17 @@ def main() -> None:
         choices=("paged", "dense"),
         default="paged",
         help="Entry point used for the sm120_fused column.",
+    )
+    parser.add_argument(
+        "--fused-v-layout",
+        choices=("linear", "pv"),
+        default="linear",
+        help=(
+            "V cache layout for --fused-api=paged. 'linear' matches "
+            "nvfp4_quantize_paged_kv_cache(v_data_layout='linear') and "
+            "measures the standard vLLM paged-KV input layout; 'pv' measures "
+            "preconverted PV-layout cache."
+        ),
     )
     parser.add_argument(
         "--fused-output-group-span",
@@ -627,12 +662,32 @@ def main() -> None:
     )
     rows: list[dict[str, Any]] = load_jsonl_rows(prefix)
     existing = {
-        (row.get("group"), row.get("q"), row.get("kv"), row.get("d"), row.get("kernel"))
+        (
+            row.get("group"),
+            row.get("q"),
+            row.get("kv"),
+            row.get("d"),
+            row.get("kernel"),
+            row.get("api"),
+            row.get("v_layout"),
+        )
         for row in rows
     }
     for cell in cells:
         for kernel in kernels:
-            row_key = (cell.group, cell.q_len, cell.kv_len, cell.head_dim, kernel)
+            row_key = (
+                cell.group,
+                cell.q_len,
+                cell.kv_len,
+                cell.head_dim,
+                kernel,
+                args.fused_api if kernel == "sm120_fused" else None,
+                (
+                    args.fused_v_layout
+                    if kernel == "sm120_fused" and args.fused_api == "paged"
+                    else ("pv" if kernel == "sm120_fused" else None)
+                ),
+            )
             if row_key in existing:
                 print(
                     json.dumps(

@@ -127,7 +127,7 @@ __global__ void nvfp4_dequant_vectorized_kernel(const uint8_t* __restrict__ fp4_
 }
 
 void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView global_scale,
-                      TensorView output) {
+                      TensorView output, int64_t stream_handle) {
   CHECK_INPUT(fp4_data);
   CHECK_INPUT(block_scales);
   CHECK_CUDA(global_scale);
@@ -154,7 +154,8 @@ void nvfp4_kv_dequant(TensorView fp4_data, TensorView block_scales, TensorView g
       << "output must be on the same device as fp4_data";
 
   ffi::CUDADeviceGuard device_guard(fp4_data.device().device_id);
-  cudaStream_t stream = get_stream(fp4_data.device());
+  cudaStream_t stream =
+      stream_handle != 0 ? stream_from_handle(stream_handle) : get_stream(fp4_data.device());
 
   const float* scale_ptr = static_cast<const float*>(global_scale.data_ptr());
 

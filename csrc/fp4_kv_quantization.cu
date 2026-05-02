@@ -231,7 +231,7 @@ __global__ void nvfp4_quant_kernel(const InType* __restrict__ input,
 }
 
 void nvfp4_kv_quant(TensorView input, TensorView global_scale, TensorView fp4_output,
-                    TensorView block_scales) {
+                    TensorView block_scales, int64_t stream_handle) {
   CHECK_INPUT(input);
   CHECK_CUDA(global_scale);
   CHECK_INPUT(fp4_output);
@@ -258,7 +258,8 @@ void nvfp4_kv_quant(TensorView input, TensorView global_scale, TensorView fp4_ou
       << "block_scales must be on the same device as input";
 
   ffi::CUDADeviceGuard device_guard(input.device().device_id);
-  cudaStream_t stream = get_stream(input.device());
+  cudaStream_t stream =
+      stream_handle != 0 ? stream_from_handle(stream_handle) : get_stream(input.device());
 
   const float* scale_ptr = static_cast<const float*>(global_scale.data_ptr());
 

@@ -29,7 +29,7 @@ cudaError_t Sm120Nvfp4D128RunPagedRaw(
     bool skip_internal_combine) {
   return d128::sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw<
       1, true, SM120_NVFP4_CAUSAL, SM120_NVFP4_USE_SLIDING_WINDOW,
-      SM120_NVFP4_USE_LOGITS_SOFT_CAP, SM120_NVFP4_USE_PV_LAYOUT_V>(
+      SM120_NVFP4_USE_LOGITS_SOFT_CAP>(
       q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
       partial, split_m, split_l, out, workspace, workspace_bytes, qk_alpha,
       pv_alpha, split_kv_tiles, q_len, group_size, kv_len_tokens, causal,
@@ -45,7 +45,6 @@ PagedKernelConfig Sm120Nvfp4D128PagedKernelConfig() {
           SM120_NVFP4_CAUSAL,
           SM120_NVFP4_USE_SLIDING_WINDOW,
           SM120_NVFP4_USE_LOGITS_SOFT_CAP,
-          SM120_NVFP4_USE_PV_LAYOUT_V,
           Sm120Nvfp4D128RunPagedRaw};
 }
 
@@ -59,8 +58,7 @@ void SM120Nvfp4FmhaRunPagedBatch(
     int64_t max_physical_kv_len, double qk_alpha, double pv_alpha,
     int64_t kv_head, int64_t split_kv_tiles, int64_t group_size, bool causal,
     int64_t sliding_window, double logits_soft_cap,
-    int64_t output_group_span, bool v_cache_uses_pv_layout,
-    bool normal_v_scales_are_trtllm_interleaved, bool kv_layout_hnd) {
+    int64_t output_group_span, bool kv_layout_hnd, int64_t stream_handle) {
   const auto kernel = Sm120Nvfp4D128PagedKernelConfig();
   sm120_nvfp4_paged::RunPagedBatchImpl(
       kernel, q_packed, q_scales, k_pages, k_sf_pages, v_pages_pv,
@@ -68,8 +66,7 @@ void SM120Nvfp4FmhaRunPagedBatch(
       q_scales_scratch, partial, split_m, split_l, out_scratch, out,
       workspace, max_physical_kv_len, qk_alpha, pv_alpha, kv_head,
       split_kv_tiles, group_size, causal, sliding_window, logits_soft_cap,
-      output_group_span, v_cache_uses_pv_layout,
-      normal_v_scales_are_trtllm_interleaved, kv_layout_hnd);
+      output_group_span, kv_layout_hnd, stream_handle);
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(paged_run, SM120Nvfp4FmhaRunPagedBatch);

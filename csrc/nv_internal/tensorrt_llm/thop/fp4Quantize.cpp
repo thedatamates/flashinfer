@@ -34,7 +34,8 @@
 // ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, TensorView valueE2M1,
                   TensorView scaleFP8SF, int64_t sfVecSize, bool sfUseUE8M0,
-                  bool isSfSwizzledLayout, bool isSf8x4Layout, bool enable_pdl) {
+                  bool isSfSwizzledLayout, bool isSf8x4Layout, bool enable_pdl,
+                  int64_t stream_handle) {
   CHECK_CUDA(self);
   CHECK_CONTIGUOUS(self);
   if (sfUseUE8M0) {
@@ -62,6 +63,8 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
   TVM_FFI_ICHECK_EQ(k % sfVecSize, 0);
 
   const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+  const cudaStream_t stream =
+      stream_handle != 0 ? stream_from_handle(stream_handle) : get_stream(self.device());
 
   auto layout = tensorrt_llm::QuantizationSFLayout::LINEAR;
   layout = isSfSwizzledLayout ? (isSf8x4Layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED_8x4
@@ -73,7 +76,7 @@ void fp4_quantize(TensorView self, Optional<TensorView> const& globalScale, Tens
       1, m, k, reinterpret_cast<T*>(self.data_ptr()), globalScalePtr,                              \
       reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                            \
       reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount, \
-      enable_pdl, get_stream(self.device()));
+      enable_pdl, stream);
 
   if (sfUseUE8M0) {
     if (self.dtype() == dl_float16) {

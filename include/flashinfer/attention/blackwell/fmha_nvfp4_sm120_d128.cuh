@@ -22,6 +22,7 @@
 #include <cutlass/util/packed_stride.hpp>
 
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh>
+#include <flashinfer/cp_async.cuh>
 #include <flashinfer/mma.cuh>
 
 namespace flashinfer::attention::blackwell::sm120_nvfp4::d128 {
@@ -797,8 +798,7 @@ __device__ __forceinline__ void sm120_epilogue_store_bf16_tile(
 }
 
 template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
-          bool kUseSlidingWindow, bool kUseLogitsSoftCap,
-          bool kUsePvLayoutV>
+          bool kUseSlidingWindow, bool kUseLogitsSoftCap>
 	__global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount,
 	                             kMinBlocksPerSm)
 	void sm120_nvfp4_qkv_online_register_q_stage_kernel(
@@ -901,6 +901,14 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
           ? thread_idx - kSm120Nvfp4FmhaWarpEpilogue * cutlass::NumThreadsPerWarp
           : 0;
   const int output_thread_idx = is_epilogue ? epilogue_thread_idx : lane_idx;
+
+  for (int row = thread_idx; row < kCutlassTileM; row += blockDim.x) {
+    storage.global_m[row] = -INFINITY;
+    storage.global_l[row] = 0.0f;
+    storage.old_scale_stage[0][row] = 0.0f;
+    storage.old_scale_stage[1][row] = 0.0f;
+  }
+  __syncthreads();
 
   typename Sm120Nvfp4PipelineE::Params pipeline_corr_epi_params{};
   if (is_mma) {
@@ -1068,6 +1076,10 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
 
   auto stage_paged_k_tile = [&](int kv_tile, int k_outer, int write_stage) {
     if constexpr (kUsePagedKv) {
+      using QkSmemLayoutB = typename CutlassCollectiveMainloop::SmemLayoutB;
+      static_assert(decltype(cute::size<1>(QkSmemLayoutB{}))::value >= 8,
+                    "Paged K producer requires an inner-K layout extent large "
+                    "enough for byte-packed FP4 writes.");
       auto smem_tiled_copy_B = cute::make_tiled_copy_B(
           typename CutlassCollectiveMainloop::SmemCopyAtomB{}, qk_tiled_mma);
       auto cB = cute::make_identity_tensor(
@@ -1086,20 +1098,46 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                        [&](auto k_block) {
           auto dst = tBsB_prod(_, _, k_block, write_stage);
           auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
-          for (int i = 0; i < int(cute::size(dst)); ++i) {
-            auto coord = coord_tensor(i);
-            const int row = int(cute::get<0>(coord));
-            const int k = int(cute::get<1>(coord));
-            const int token = kv_tile * kCutlassTileN + row;
-            const int dim = k_outer * kCutlassTileK + k;
-            const uint8_t code =
-                token < kv_len_tokens
-                    ? sm120_nvfp4_paged_k_code(paged_kv_params, token, dim)
-                    : 0;
-            dst(i) = cute::uint4_t(code);
+          if (int(cute::size(dst)) % 8 != 0) {
+            asm volatile("trap;\n");
+          }
+          for (int i = 0; i < int(cute::size(dst)); i += 8) {
+            auto coord0 = coord_tensor(i);
+            const int row0 = int(cute::get<0>(coord0));
+            const int k0 = int(cute::get<1>(coord0));
+            auto ref0 = dst(i);
+            uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+            if (((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) ||
+                ((k0 & 7) != 0) || paged_kv_params.k_stride_dim3 != 1) {
+              asm volatile("trap;\n");
+            }
+            const int token = kv_tile * kCutlassTileN + row0;
+            const int dim0 = k_outer * kCutlassTileK + k0;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              auto coord = coord_tensor(i + j);
+              auto ref = dst(i + j);
+              uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
+              const int row = int(cute::get<0>(coord));
+              const int k = int(cute::get<1>(coord));
+              if (row != row0 || k != k0 + j ||
+                  dst_byte != dst0 + (j >> 1)) {
+                asm volatile("trap;\n");
+              }
+            }
+            const bool in_bounds = token < kv_len_tokens;
+            const uint32_t* src =
+                in_bounds
+                    ? sm120_nvfp4_paged_k_word_ptr(paged_kv_params, token,
+                                                   dim0)
+                    : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
+            cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
+                reinterpret_cast<uint32_t*>(dst0), src, in_bounds);
           }
         });
       }
+
+      cp_async::commit_group();
 
       for (int idx = lane_idx; idx < kCutlassTileN * kCutlassTileK / 2;
            idx += cutlass::NumThreadsPerWarp) {
@@ -1114,6 +1152,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                 : 0x38;
         qk_sSFB(row, k0, write_stage) = make_ue4m3_raw(scale);
       }
+      cp_async::wait_group<0>();
     }
   };
 
@@ -1129,22 +1168,15 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
 
       auto pv_scale_for = [&](int token, int dim) {
         const int logical_page = token / paged_kv_params.page_size;
-        if constexpr (kUsePvLayoutV) {
-          return sm120_nvfp4_paged_v_pv_scale(paged_kv_params, logical_page,
-                                              dim);
-        }
-        return sm120_nvfp4_paged_v_standard_pv_scale(
-            paged_kv_params, logical_page, dim, kv_len_tokens);
+        return sm120_nvfp4_paged_v_pv_scale(paged_kv_params, logical_page,
+                                            dim);
       };
 
       auto pv_code_for = [&](int token, int dim, uint8_t scale) {
-        if constexpr (kUsePvLayoutV) {
-          return token < kv_len_tokens
-                     ? sm120_nvfp4_paged_v_code(paged_kv_params, token, dim)
-                     : uint8_t{0};
-        }
-        return sm120_nvfp4_paged_v_standard_pv_code(
-            paged_kv_params, token, dim, scale, kv_len_tokens);
+        (void)scale;
+        return token < kv_len_tokens
+                   ? sm120_nvfp4_paged_v_code(paged_kv_params, token, dim)
+                   : uint8_t{0};
       };
 
       for (int copy_thread = lane_idx;
@@ -1897,8 +1929,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
 }
 
 template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
-          bool kUseSlidingWindow, bool kUseLogitsSoftCap,
-          bool kUsePvLayoutV>
+          bool kUseSlidingWindow, bool kUseLogitsSoftCap>
 cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
     uint8_t* q_packed,
     uint8_t* q_scales,
@@ -1943,16 +1974,13 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
       kv_len, head_dim, 1);
   const size_t qk_workspace_size =
       CutlassGemmKernel::get_workspace_size(qk_args);
-  if (workspace_bytes < qk_workspace_size) {
-    return cudaErrorInvalidValue;
-  }
-  auto qk_status = CutlassGemmKernel::initialize_workspace(
-      qk_args, reinterpret_cast<char*>(workspace), stream);
-  if (qk_status != cutlass::Status::kSuccess) {
-    return cudaErrorUnknown;
-  }
-  auto qk_params = CutlassGemmKernel::to_underlying_arguments(
-      qk_args, reinterpret_cast<char*>(workspace));
+  constexpr size_t kWorkspaceAlignment = 256;
+  auto align_workspace = [](size_t bytes) {
+    return (bytes + kWorkspaceAlignment - 1) & ~(kWorkspaceAlignment - 1);
+  };
+  const size_t qk_workspace_alloc = align_workspace(qk_workspace_size);
+  char* workspace_base = reinterpret_cast<char*>(workspace);
+  char* qk_workspace = workspace_base;
 
   auto pv_args = prepare_sm120_nvfp4_gemm_args<
       CutlassGemmKernelK128Stage2>(
@@ -1960,23 +1988,47 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
       kCutlassTileM, head_dim, kv_len, 1);
   const size_t pv_workspace_size =
       CutlassGemmKernelK128Stage2::get_workspace_size(pv_args);
-  if (workspace_bytes < pv_workspace_size) {
+  if (workspace_bytes < qk_workspace_alloc + pv_workspace_size) {
     return cudaErrorInvalidValue;
   }
+  char* pv_workspace = workspace_base + qk_workspace_alloc;
+  const size_t required_workspace_bytes = qk_workspace_alloc + pv_workspace_size;
+  constexpr size_t kWorkspaceClearBytes = 32 * 1024 * 1024;
+  const size_t workspace_clear_bytes =
+      workspace_bytes < kWorkspaceClearBytes ? workspace_bytes
+                                             : kWorkspaceClearBytes;
+  const size_t workspace_zero_bytes =
+      workspace_clear_bytes > required_workspace_bytes
+          ? workspace_clear_bytes
+          : required_workspace_bytes;
+  // CUTLASS persistent scheduler state is sensitive to allocator residue.
+  // Clear a bounded prefix before building the QK/PV argument objects.
+  auto workspace_zero_status =
+      cudaMemsetAsync(workspace_base, 0, workspace_zero_bytes, stream);
+  if (workspace_zero_status != cudaSuccess) {
+    return workspace_zero_status;
+  }
+  auto qk_status = CutlassGemmKernel::initialize_workspace(
+      qk_args, qk_workspace, stream);
+  if (qk_status != cutlass::Status::kSuccess) {
+    return cudaErrorUnknown;
+  }
+  auto qk_params = CutlassGemmKernel::to_underlying_arguments(
+      qk_args, qk_workspace);
   auto pv_status = CutlassGemmKernelK128Stage2::initialize_workspace(
-      pv_args, reinterpret_cast<char*>(workspace), stream);
+      pv_args, pv_workspace, stream);
   if (pv_status != cutlass::Status::kSuccess) {
     return cudaErrorUnknown;
   }
   auto pv_params = CutlassGemmKernelK128Stage2::to_underlying_arguments(
-      pv_args, reinterpret_cast<char*>(workspace));
+      pv_args, pv_workspace);
 
   constexpr int kSmemBytes =
       static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
   auto stage_kernel =
       sm120_nvfp4_qkv_online_register_q_stage_kernel<
           kOutputGroupSpan, kUsePagedKv, kCausal, kUseSlidingWindow,
-          kUseLogitsSoftCap, kUsePvLayoutV>;
+          kUseLogitsSoftCap>;
   cudaError_t status = cudaFuncSetAttribute(
       stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
   if (status != cudaSuccess) {

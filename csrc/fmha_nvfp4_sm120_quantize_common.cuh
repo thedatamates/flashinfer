@@ -16,7 +16,8 @@ namespace sm120_nvfp4_quantize {
 namespace sm120 = attention::blackwell::sm120_nvfp4;
 
 static void QuantizeQImpl(int head_dim_expected, TensorView q,
-                          TensorView q_packed, TensorView q_scales) {
+                          TensorView q_packed, TensorView q_scales,
+                          int64_t stream_handle) {
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(q_packed, dl_uint8);
   CHECK_INPUT_AND_TYPE(q_scales, dl_uint8);
@@ -34,7 +35,7 @@ static void QuantizeQImpl(int head_dim_expected, TensorView q,
   TVM_FFI_ICHECK_EQ(q_scales.size(1), head_dim / 16);
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
-  const cudaStream_t stream = get_stream(q.device());
+  const cudaStream_t stream = stream_from_handle(stream_handle);
   cudaError_t status = sm120::quantize_q_rowmajor_raw(
       static_cast<const __nv_bfloat16*>(q.data_ptr()),
       static_cast<uint8_t*>(q_packed.data_ptr()),

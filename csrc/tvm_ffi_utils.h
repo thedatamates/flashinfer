@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 #pragma once
+#include <cstdint>
+
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
@@ -331,6 +333,10 @@ inline cudaStream_t get_current_stream() {
 
 inline cudaStream_t get_stream(DLDevice device) {
   return static_cast<cudaStream_t>(TVMFFIEnvGetStream(device.device_type, device.device_id));
+}
+
+inline cudaStream_t stream_from_handle(int64_t stream_handle) {
+  return reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(stream_handle));
 }
 
 inline int64_t get_element_size(ffi::Tensor x) { return (x.dtype().bits * x.dtype().lanes) / 8; }

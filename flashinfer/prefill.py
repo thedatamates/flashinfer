@@ -1960,10 +1960,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         block_tables: Optional[torch.Tensor]
             A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
         nvfp4_v_cache_uses_pv_layout : bool
-            Whether NVFP4 V pages are already stored in the SM120 PV operand
-            layout. For ``backend="sm120-nvfp4"``, this is a plan-time
-            specialization axis and must match the value passed to
-            :meth:`run`.
+            Whether NVFP4 V pages are already stored in the SM120 PV physical
+            layout. ``False`` is the standard vLLM linear paged-KV input layout;
+            ``backend="sm120-nvfp4"`` converts V to PV layout before attention.
+            The value is part of the wrapper plan and must match :meth:`run`.
         max_token_per_sequence: Optional[int],
             Required for cudnn backend. This is the scalar max token length of each sequence.
         max_sequence_kv: Optional[int],
@@ -2414,7 +2414,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         nvfp4_v_cache_uses_pv_layout: bool = False,
-        nvfp4_v_cache_sf_layout: Literal["trtllm_interleaved", "linear"] = "trtllm_interleaved",
+        nvfp4_v_cache_sf_layout: Literal["trtllm_interleaved", "linear", "pv"] = "trtllm_interleaved",
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> torch.Tensor: ...
 
@@ -2436,7 +2436,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         nvfp4_v_cache_uses_pv_layout: bool = False,
-        nvfp4_v_cache_sf_layout: Literal["trtllm_interleaved", "linear"] = "trtllm_interleaved",
+        nvfp4_v_cache_sf_layout: Literal["trtllm_interleaved", "linear", "pv"] = "trtllm_interleaved",
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
@@ -2459,7 +2459,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         nvfp4_v_cache_uses_pv_layout: bool = False,
-        nvfp4_v_cache_sf_layout: Literal["trtllm_interleaved", "linear"] = "trtllm_interleaved",
+        nvfp4_v_cache_sf_layout: Literal["trtllm_interleaved", "linear", "pv"] = "trtllm_interleaved",
         skip_softmax_threshold_scale_factor: Optional[float] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
@@ -2523,17 +2523,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Currently, NVFP4 KV supports `fa2`, `fmha_v2`, `trtllm-gen`, and
             `sm120-nvfp4` backend.
         nvfp4_v_cache_uses_pv_layout : bool
-            Whether the NVFP4 V cache is already stored in the K-major physical
-            layout consumed by the PV MMA path. Valid with ``backend="fmha_v2"``
-            or ``backend="sm120-nvfp4"`` and NVFP4 KV cache. When this is
-            ``False``, ``backend="sm120-nvfp4"`` reblocks normal V pages into
-            PV scratch internally.
-        nvfp4_v_cache_sf_layout : Literal["trtllm_interleaved", "linear"]
+            Whether the NVFP4 V cache is already stored in the PV physical
+            layout consumed by the SM120 PV MMA path. ``False`` is the standard
+            vLLM linear paged-KV input layout. With ``backend="sm120-nvfp4"``, the
+            wrapper converts linear V pages into PV layout before launching
+            attention. ``True`` means the caller already provided PV-layout V
+            and the conversion is skipped.
+        nvfp4_v_cache_sf_layout : Literal["trtllm_interleaved", "linear", "pv"]
             Physical layout of the NVFP4 V scale tensor. ``"trtllm_interleaved"``
             is the default layout returned by
             :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache`.
             ``"linear"`` is only valid for backend ``"fa2"`` and stores V scales
-            in the same row-major scale layout as K.
+            in the same row-major scale layout as K. ``"pv"`` identifies the
+            PV scale layout used when ``nvfp4_v_cache_uses_pv_layout=True`` for
+            backend ``"sm120-nvfp4"``.
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2579,9 +2582,19 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 raise ValueError(
                     "nvfp4_v_cache_uses_pv_layout requires NVFP4 KV scale tensors."
                 )
-        if nvfp4_v_cache_sf_layout not in ("trtllm_interleaved", "linear"):
+        if nvfp4_v_cache_sf_layout not in ("trtllm_interleaved", "linear", "pv"):
             raise ValueError(
-                "nvfp4_v_cache_sf_layout must be 'trtllm_interleaved' or 'linear'."
+                "nvfp4_v_cache_sf_layout must be 'trtllm_interleaved', 'linear', or 'pv'."
+            )
+        if nvfp4_v_cache_sf_layout == "pv" and not nvfp4_v_cache_uses_pv_layout:
+            raise ValueError(
+                "nvfp4_v_cache_sf_layout='pv' requires "
+                "nvfp4_v_cache_uses_pv_layout=True."
+            )
+        if nvfp4_v_cache_sf_layout == "pv" and self._backend != "sm120-nvfp4":
+            raise ValueError(
+                "nvfp4_v_cache_sf_layout='pv' is currently supported by "
+                "backend='sm120-nvfp4'."
             )
         if nvfp4_v_cache_sf_layout == "linear" and self._backend not in (
             "fa2",
@@ -5273,7 +5286,7 @@ def trtllm_fmha_v2_prefill(
         scale_bmm2_d,  # Pre-populated scale_bmm2 on device (avoids cudaMemcpy)
         key_block_scales,  # Optional NVFP4 K scales
         value_block_scales,  # Optional NVFP4 V scales
-        nvfp4_v_cache_uses_pv_layout,  # Optional pre-reblocked V cache layout
+        nvfp4_v_cache_uses_pv_layout,  # Optional already-PV V cache layout
         kv_split_size,  # Optional split-KV partition size
         num_kv_splits,  # Optional split-KV partition count
         lse,  # Optional LSE tensor (None if not saving softmax stats)

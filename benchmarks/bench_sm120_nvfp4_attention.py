@@ -109,6 +109,18 @@ def main() -> None:
             "Q quantization, native paged KV loads, fused attention, and output scatter."
         ),
     )
+    parser.add_argument(
+        "--v-layout",
+        choices=("linear", "pv"),
+        default="linear",
+        help=(
+            "V cache layout for --mode=paged-wrapper. 'linear' matches "
+            "nvfp4_quantize_paged_kv_cache(v_data_layout='linear') and measures "
+            "the standard vLLM paged-KV input layout plus wrapper conversion "
+            "to PV. 'pv' matches v_data_layout='pv' and skips conversion. "
+            "Dense mode always uses v_layout='pv'."
+        ),
+    )
     parser.add_argument("--num-kv-heads", type=int, default=1)
     args = parser.parse_args()
 
@@ -165,15 +177,30 @@ def main() -> None:
             )
             / 4
         ).to(torch.bfloat16)
-        (k_pages, v_pages), (k_sf, v_sf), k_scale, v_scale = (
-            flashinfer.nvfp4_quantize_paged_kv_cache(
-                k_bf16,
-                v_bf16,
-                kv_layout="NHD",
-                v_data_layout="pv",
-                v_scale_layout="pv",
+        if args.v_layout == "pv":
+            (k_pages, v_pages), (k_sf, v_sf), k_scale, v_scale = (
+                flashinfer.nvfp4_quantize_paged_kv_cache(
+                    k_bf16,
+                    v_bf16,
+                    kv_layout="NHD",
+                    v_data_layout="pv",
+                    v_scale_layout="pv",
+                )
             )
-        )
+            v_cache_uses_pv_layout = True
+            v_cache_sf_layout = "pv"
+        else:
+            (k_pages, v_pages), (k_sf, v_sf), k_scale, v_scale = (
+                flashinfer.nvfp4_quantize_paged_kv_cache(
+                    k_bf16,
+                    v_bf16,
+                    kv_layout="NHD",
+                    v_data_layout="linear",
+                    v_scale_layout="trtllm_interleaved",
+                )
+            )
+            v_cache_uses_pv_layout = False
+            v_cache_sf_layout = "trtllm_interleaved"
         block_tables = torch.arange(num_pages, dtype=torch.int32, device=device).view(
             1, num_pages
         )
@@ -194,6 +221,7 @@ def main() -> None:
             logits_soft_cap=float(args.logits_soft_cap),
             split_kv_len=args.split_kv_len,
             output_group_span=output_group_span,
+            v_cache_uses_pv_layout=v_cache_uses_pv_layout,
         )
 
         def run() -> None:
@@ -203,6 +231,8 @@ def main() -> None:
                 (k_sf, v_sf),
                 k_scale=k_scale,
                 v_scale=v_scale,
+                v_cache_uses_pv_layout=v_cache_uses_pv_layout,
+                v_cache_sf_layout=v_cache_sf_layout,
                 out=out,
             )
 
@@ -211,6 +241,7 @@ def main() -> None:
         result = {
             "fmha_nvfp4_sm120_jit": True,
             "api": "paged",
+            "v_layout": args.v_layout,
             "q_len": args.q_len,
             "kv_len": args.kv_len,
             "head_dim": args.head_dim,
@@ -286,6 +317,7 @@ def main() -> None:
             args.sliding_window,
             float(args.logits_soft_cap),
             output_group_span,
+            torch.cuda.current_stream(device).cuda_stream,
         )
 
     run()
@@ -293,6 +325,7 @@ def main() -> None:
     result = {
         "fmha_nvfp4_sm120_jit": True,
         "api": "dense",
+        "v_layout": "pv",
         "q_len": args.q_len,
         "kv_len": args.kv_len,
         "head_dim": args.head_dim,

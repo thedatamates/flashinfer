@@ -300,14 +300,14 @@ static void RunDenseImpl(
     double pv_alpha, int64_t split_kv_tiles, int64_t q_len,
     int64_t group_size, int64_t kv_len_tokens, bool causal,
     int64_t sliding_window, double logits_soft_cap,
-    int64_t output_group_span) {
+    int64_t output_group_span, int64_t stream_handle) {
   CheckDenseRunTensors(kernel, q_packed, q_scales, k_packed, k_scales,
                        v_pv_packed, v_pv_scales, partial, split_m, split_l,
                        out, workspace, split_kv_tiles, q_len, group_size,
                        kv_len_tokens, output_group_span, causal,
                        sliding_window, logits_soft_cap);
   ffi::CUDADeviceGuard device_guard(q_packed.device().device_id);
-  const cudaStream_t stream = get_stream(q_packed.device());
+  const cudaStream_t stream = stream_from_handle(stream_handle);
   const int q_rows = static_cast<int>(q_packed.size(0));
   const int kv_len = static_cast<int>(k_packed.size(0));
   const int head_dim = kernel.head_dim;
@@ -363,8 +363,7 @@ static void RunPagedBatchImpl(
     int64_t max_physical_kv_len, double qk_alpha, double pv_alpha,
     int64_t kv_head, int64_t split_kv_tiles, int64_t group_size, bool causal,
     int64_t sliding_window, double logits_soft_cap,
-    int64_t output_group_span, bool v_cache_uses_pv_layout,
-    bool normal_v_scales_are_trtllm_interleaved, bool kv_layout_hnd) {
+    int64_t output_group_span, bool kv_layout_hnd, int64_t stream_handle) {
   CHECK_INPUT_AND_TYPE(q_packed, dl_uint8);
   CHECK_INPUT_AND_TYPE(q_scales, dl_uint8);
   CheckCudaTypeLastDimContiguous(k_pages, dl_uint8, "k_pages");
@@ -403,7 +402,7 @@ static void RunPagedBatchImpl(
   CHECK_DIM(1, kv_lens);
 
   ffi::CUDADeviceGuard device_guard(q_packed.device().device_id);
-  const cudaStream_t stream = get_stream(q_packed.device());
+  const cudaStream_t stream = stream_from_handle(stream_handle);
 
   const int64_t batch = block_tables.size(0);
   TVM_FFI_ICHECK_EQ(qo_indptr.size(0), batch + 1);
@@ -423,10 +422,10 @@ static void RunPagedBatchImpl(
       << "SM120 NVFP4 module sliding-window mode mismatch";
   TVM_FFI_ICHECK_EQ(logits_soft_cap > 0.0, kernel.use_logits_soft_cap)
       << "SM120 NVFP4 module logits-soft-cap mode mismatch";
-  TVM_FFI_ICHECK_EQ(v_cache_uses_pv_layout, kernel.v_cache_uses_pv_layout)
-      << "SM120 NVFP4 module V-cache layout mode mismatch";
-  TVM_FFI_ICHECK(!v_cache_uses_pv_layout || !kv_layout_hnd)
-      << "PV-layout V pages are currently supported only with NHD layout";
+  TVM_FFI_ICHECK(!kv_layout_hnd)
+      << "SM120 NVFP4 paged attention consumes NHD K pages and PV-layout V "
+         "pages. Convert standard HND vLLM KV pages to NHD/PV in the wrapper "
+         "before launching attention.";
   TVM_FFI_ICHECK_EQ(page_size, 16)
       << "SM120 NVFP4 paged run currently supports page_size=16";
   TVM_FFI_ICHECK_EQ(k_sf_pages.size(kv_layout_hnd ? 2 : 1), page_size);
@@ -531,10 +530,6 @@ static void RunPagedBatchImpl(
   paged_params.packed_dim = static_cast<int>(packed_dim);
   paged_params.scale_dim = static_cast<int>(scale_dim);
   paged_params.kv_layout_hnd = kv_layout_hnd ? 1 : 0;
-  paged_params.v_cache_uses_pv_layout = v_cache_uses_pv_layout ? 1 : 0;
-  paged_params.v_scales_trtllm_interleaved =
-      normal_v_scales_are_trtllm_interleaved ? 1 : 0;
-  paged_params.v_global_scale = static_cast<float>(pv_alpha);
 
   status = kernel.run(
       q_scratch_ptr, q_sf_scratch_ptr,
