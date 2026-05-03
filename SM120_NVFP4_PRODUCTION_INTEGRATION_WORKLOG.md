@@ -2006,3 +2006,44 @@ new aliasing scheme that serializes V staging against QK/logits/P/O use. Because
 D512 is the reference production cell and the task requires all head dims with
 no public layout change, implementing D128/D256-only staging would introduce a
 head-dim fallback split and leave the production blocker unresolved.
+
+## 2026-05-03 18:17 CDT - Path A Measured Result And Decision
+
+Path A status:
+
+- Implemented and committed in `581e6f4`.
+- Pushed to `flashinfer-nvfp4-kv-prbranches` with the reference audit and smem
+  budget notes.
+- Public tensor shapes, layout names, tests, and spec axes were unchanged.
+
+Reference cell:
+
+`D=512, group=8, q=512, kv=65536, softcap=30, split_kv_len=32768,
+output_group_span=4, device=2`
+
+| path | min ms | mean ms |
+| --- | ---: | ---: |
+| dense | 7.688 | 7.693 |
+| paged-PV | 899.385 | 900.857 |
+| paged-linear | 1883.437 | 1883.982 |
+
+D256/D128 same-shape benches:
+
+- Not run for Path A. The decision gate is the D512 production reference cell,
+  and it missed target.
+
+Test status:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py -q`: 36 passed.
+- `tests/attention/test_nvfp4_kv_head_dim_512.py tests/utils/test_fp4_kv_quantization.py -q`:
+  62 passed.
+- No tolerance changes.
+
+Decision:
+
+- Path A target was `paged-linear <= 1241 ms` at the D512 reference cell.
+- Measured Path A paged-linear is `1883.437 ms`, which is `642.437 ms` slower
+  than the target and `2.09x` slower than paged-PV.
+- Per directive, stop here. Do not implement full-tile Path B and do not start
+  scale-loop optimization. The next structural option is a separate per-warp
+  scratch design pass with explicit sign-off.
