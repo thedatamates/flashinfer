@@ -2047,3 +2047,104 @@ Decision:
 - Per directive, stop here. Do not implement full-tile Path B and do not start
   scale-loop optimization. The next structural option is a separate per-warp
   scratch design pass with explicit sign-off.
+
+## 2026-05-03 18:32 CDT - P1 V Producer Register-Transpose Plan
+
+What I am about to do:
+
+- Replace the scalar per-output-word V data load in
+  `fmha_nvfp4_sm120_d{128,256,512}.cuh::stage_paged_v_tile` with an 8-lane
+  cooperative register transpose.
+- Each 8-lane group loads one `uint32_t` per token row: 4 dim-contiguous bytes
+  = 8 FP4 codepoints from the public linear/PV V layout. `__shfl_sync` then
+  transposes the 8 row words so each lane owns one output dim across 8 tokens,
+  matching the CUTLASS B operand word currently written by the scalar path.
+- PV-layout V directly packs the transposed codes. Linear-layout V keeps the
+  required fp32 dequant/requant but gathers original row scales by shuffle
+  instead of rewalking the page table per codepoint.
+- Done criteria: D512 and full NVFP4 tests pass without tolerance changes, and
+  the D512 reference cell improves from the Path A numbers
+  (`paged-PV=899.385 ms`, `paged-linear=1883.437 ms`). If the CUTLASS B smem
+  direct-coordinate write invariant fails, document the exact invariant and
+  revert this variant.
+
+Reference audit:
+
+`include/flashinfer/mma.cuh` shows the local idiom for register exchange with
+`__shfl_sync` after each lane holds a register word:
+
+```cpp
+// include/flashinfer/mma.cuh:270
+word.x = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4);
+word.y = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4 + 1);
+word.z = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4 + 2);
+word.w = __shfl_sync(0xffffffff, R[reg_id], (tx % 8) * 4 + 3);
+```
+
+`csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h` shows the production precedent for
+linear-V reblock: regular `ldg` into registers, not direct cp.async into the
+MMA operand, followed by fp32 dequant/requant and packed output:
+
+```cpp
+// csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1753
+fmha::ldg(original_pair, kv_row_ptr + col0 / 2);
+uint8_t const nibble0 = original_pair & 0x0fu;
+uint8_t const nibble1 = (original_pair >> 4) & 0x0fu;
+...
+packed[reg] = fmha::float8_to_e2m1x8(vals[0], vals[1], vals[2], vals[3],
+                                     vals[4], vals[5], vals[6], vals[7]);
+```
+
+The current SM120 producer already verifies that each CUTLASS B operand word is
+8 logical token nibbles colocated into 4 physical bytes before the scalar write:
+
+```cpp
+// include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:971
+if (col != col0 || k != k0 + j ||
+    dst_byte < dst0 || dst_byte >= dst0 + 4 ||
+    pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
+  asm volatile("trap;\n");
+}
+```
+
+Decision:
+
+- Literal `cp.async` into registers is not a CUDA primitive; the zero-smem
+  version must use register `ldg` plus warp shuffle.
+- The public V layouts are dim-contiguous in gmem and the CUTLASS operand is
+  token-contiguous in smem. An 8x8 register transpose is the smallest structural
+  conversion that preserves public shapes, adds no smem, and keeps the existing
+  CUTLASS operand contract.
+
+## 2026-05-03 19:21 CDT - P1 Register-Transpose Compile Wall
+
+Attempted P1 implementation:
+
+- Added `sm120_nvfp4_paged_v_word_from_page_base`.
+- Replaced the scalar partition-driven V data loop in D128/D256/D512 with four
+  8-lane register-transpose groups per load warp.
+- Each lane loaded one row-major 32-bit V word, used `__shfl_sync` to gather the
+  8 token rows for one output dim, and wrote the packed word through direct
+  `pv_sB(col, k, stage)` coordinates after checking the 4-byte CUTLASS smem
+  colocation invariant.
+
+Result:
+
+- D512 test execution progressed through early cases without a trap, so the
+  direct-coordinate smem invariant did not immediately fail.
+- Cold `ptxas` for `fmha_nvfp4_sm120_d256_causal_True_swa_True_softcap_True_pv_v_False`
+  completed only after roughly 15 minutes.
+- Cold `ptxas` for `fmha_nvfp4_sm120_d512_causal_True_swa_True_softcap_True_pv_v_False`
+  was still running after roughly 27 minutes. I interrupted pytest/nvcc/ptxas
+  with SIGINT, not kill -9, and reverted the uncommitted P1 code.
+
+Decision:
+
+- This register-transpose shape is blocked by compile-time blowup before it can
+  be judged as a production path. It introduces enough direct-coordinate smem
+  address checks, shuffles, and linear-V dequant/requant live state in the D512
+  producer for ptxas to exceed the established acceptable envelope.
+- Do not keep this P1 variant. Move to P2 scale-loop hoist as the next priority.
+  Any future P1 revisit needs a smaller scoped helper boundary or a per-warp
+  scratch design that compiles as a bounded code region instead of inlining the
+  whole transpose/reblock loop into the producer body.
