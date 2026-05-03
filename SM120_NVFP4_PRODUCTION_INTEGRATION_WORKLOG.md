@@ -1728,3 +1728,52 @@ Interpretation:
 - Remaining dominant work is in V producer and scale loops; the Step 1 result
   confirms the scalar K producer was a major component but not the only
   component of the paged slowdown.
+
+## 2026-05-03 16:31 CDT - Step 2 PV V cp.async Stop Point
+
+Attempt:
+
+- Tried to make PV-layout V directly loadable with 32-bit cp.async by changing
+  PV V storage to a true token-contiguous physical layout:
+  `[page, kv_head, head_dim, page_size / 2]`.
+- Added the matching SM120 V word-pointer shape locally and wired the D128,
+  D256, and D512 PV-layout V producer branches to use `cp_async::pred_load_32b`.
+
+Validation result:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py` failed:
+  11 failed, 25 passed.
+- Failures were shape-contract failures, not numerical drift:
+  existing fmha_v2 tests and SM120 multi-KV tests expect
+  `nvfp4_quantize_paged_kv_cache(v_data_layout="pv")` to return the existing
+  NHD-shaped V tensor.
+- The uncommitted Step 2 edits were reverted. The committed Step 1 K cp.async
+  change remains intact.
+
+Conclusion:
+
+- Direct PV V cp.async cannot be applied against the current public
+  `v_data_layout="pv"` tensor shape. That tensor is NHD-shaped and contiguous
+  with last-dimension stride 1:
+  `(pages, page_size, kv_heads, head_dim / 2)`.
+- The SM120 PV producer needs fixed-output-column / adjacent-token words, but
+  the current public PV data tensor stores adjacent output dimensions for a
+  fixed token. A 4-byte cp.async from that source would copy the wrong logical
+  values.
+- Making the public PV tensor physically token-contiguous breaks fmha_v2's
+  current API contract and tests. This is not a safe Step 2 change under the
+  existing public `v_data_layout="pv"` name.
+
+Next viable choices:
+
+- Keep the public PV tensor shape and optimize V by hoisting page-table lookup
+  and row-base computation inside the scalar producer. This preserves the
+  existing API but will not become a single direct cp.async word copy.
+- Add a distinct SM120-specific physical PV data layout/API value for
+  token-contiguous V words, then use direct cp.async in the SM120 producer.
+  That is a public API extension and should be explicit, not silently overloaded
+  onto fmha_v2's existing `v_data_layout="pv"` contract.
+- Build a fmha_v2-style staging abstraction that loads row-major source data
+  and stores the transposed CUTLASS PV operand layout without per-codepoint
+  block-table lookup. That is the closest way to keep the current public PV
+  shape while attacking the same bottleneck structurally.
