@@ -1922,3 +1922,40 @@ Adoption pattern for linear-V:
   existing partition-derived CUTLASS destination stores. This preserves the
   public tensor shape and removes per-codepoint block-table/divmod work before
   considering a staging-smem rewrite.
+
+## 2026-05-03 17:55 CDT - Linear-V Producer Path A Result
+
+Path A implementation:
+
+- Added V data and V scale page-base helpers in
+  `fmha_nvfp4_sm120_paged_kv.cuh`.
+- D128/D256/D512 linear-V producer now hoists the block-table lookup and page
+  bases outside the 8-token inner codepoint loop.
+- Linear-V scale recompute now hoists one 16-token logical page and reuses the
+  cached data/scale page bases for the byte-pair scan.
+- PV-layout V producer uses the same page-base hoist at the scalar load
+  callsite as a side-effect. The public tensor shapes, layout names, test
+  contracts, and spec axes were unchanged.
+
+Correctness:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py -q`: 36 passed.
+- `tests/attention/test_nvfp4_kv_head_dim_512.py tests/utils/test_fp4_kv_quantization.py -q`:
+  62 passed.
+- No tolerance changes.
+
+Reference cell benchmark:
+
+`D=512, group=8, q=512, kv=65536, softcap=30, split_kv_len=32768,
+output_group_span=4, device=2`
+
+| state | paged-PV min ms | paged-linear min ms |
+| --- | ---: | ---: |
+| pre Path A | 1240.798 | 2385.151 |
+| post Path A | 899.385 | 1883.437 |
+
+Path A removes measurable block-table/divmod overhead but does not meet the
+target. Paged-linear remains 2.09x slower than paged-PV at the reference cell,
+so the residual bottleneck is still the linear-V reblock path rather than just
+page-table lookup granularity. Path B needs a smem budget audit before any
+staging-smem implementation.

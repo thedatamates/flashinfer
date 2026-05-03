@@ -180,6 +180,49 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code(
   return static_cast<uint8_t>((byte >> nibble_shift) & 0x0f);
 }
 
+__device__ __forceinline__ int64_t sm120_nvfp4_paged_v_data_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int physical_page) {
+  return params.kv_layout_hnd
+             ? (static_cast<int64_t>(physical_page) * params.v_stride_page +
+                static_cast<int64_t>(params.kv_head) * params.v_stride_dim1)
+             : (static_cast<int64_t>(physical_page) * params.v_stride_page +
+                static_cast<int64_t>(params.kv_head) * params.v_stride_dim2);
+}
+
+__device__ __forceinline__ int64_t sm120_nvfp4_paged_v_scale_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int physical_page) {
+  return params.kv_layout_hnd
+             ? (static_cast<int64_t>(physical_page) * params.v_scale_stride_page +
+                static_cast<int64_t>(params.kv_head) * params.v_scale_stride_dim1)
+             : (static_cast<int64_t>(physical_page) * params.v_scale_stride_page +
+                static_cast<int64_t>(params.kv_head) * params.v_scale_stride_dim2);
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code_pair_from_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int64_t page_base,
+    int page_offset,
+    int packed_col) {
+  const int64_t src =
+      page_base +
+      static_cast<int64_t>(page_offset) *
+          (params.kv_layout_hnd ? params.v_stride_dim2 : params.v_stride_dim1) +
+      static_cast<int64_t>(packed_col) * params.v_stride_dim3;
+  return params.v_pages[src];
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code_from_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int64_t page_base,
+    int page_offset,
+    int dim) {
+  const uint8_t packed = sm120_nvfp4_paged_v_code_pair_from_page_base(
+      params, page_base, page_offset, dim >> 1);
+  return static_cast<uint8_t>((packed >> ((dim & 1) * 4)) & 0x0f);
+}
+
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_linear_code_pair(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int logical_token,
@@ -198,6 +241,24 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_linear_code_pair(
              static_cast<int64_t>(params.kv_head) * params.v_stride_dim2 +
              static_cast<int64_t>(packed_col) * params.v_stride_dim3);
   return params.v_pages[src];
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_linear_scale_from_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int64_t scale_page_base,
+    int page_offset,
+    int scale_col) {
+  const int stored_token = sm120_nvfp4_linear_scale_token(
+      page_offset, scale_col, params.scale_dim, params.v_scale_layout);
+  const int stored_scale_col = sm120_nvfp4_linear_scale_col(
+      page_offset, scale_col, params.scale_dim, params.v_scale_layout);
+  const int64_t src =
+      scale_page_base +
+      static_cast<int64_t>(stored_token) *
+          (params.kv_layout_hnd ? params.v_scale_stride_dim2
+                                : params.v_scale_stride_dim1) +
+      static_cast<int64_t>(stored_scale_col) * params.v_scale_stride_dim3;
+  return params.v_scales[src];
 }
 
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_linear_scale(
@@ -224,6 +285,23 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_linear_scale(
   return params.v_scales[src];
 }
 
+__device__ __forceinline__ float sm120_nvfp4_paged_v_linear_value_from_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int64_t data_page_base,
+    int64_t scale_page_base,
+    int page_offset,
+    int dim) {
+  const int packed_col = dim >> 1;
+  const uint8_t packed = sm120_nvfp4_paged_v_code_pair_from_page_base(
+      params, data_page_base, page_offset, packed_col);
+  const uint8_t code =
+      static_cast<uint8_t>((packed >> ((dim & 1) * 4)) & 0x0f);
+  const uint8_t scale_byte =
+      sm120_nvfp4_paged_v_linear_scale_from_page_base(
+          params, scale_page_base, page_offset, dim >> 4);
+  return e2m1_code_to_fp32(code) * e4m3_byte_to_fp32(scale_byte);
+}
+
 __device__ __forceinline__ float sm120_nvfp4_paged_v_linear_value(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int logical_token,
@@ -236,6 +314,20 @@ __device__ __forceinline__ float sm120_nvfp4_paged_v_linear_value(
   const uint8_t scale_byte =
       sm120_nvfp4_paged_v_linear_scale(params, logical_token, dim >> 4);
   return e2m1_code_to_fp32(code) * e4m3_byte_to_fp32(scale_byte);
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_pv_scale_from_physical_page(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int physical_page,
+    int dim) {
+  const int scale_row = dim / params.scale_dim;
+  const int scale_col = dim - scale_row * params.scale_dim;
+  const int64_t src =
+      static_cast<int64_t>(physical_page) * params.v_scale_stride_page +
+      static_cast<int64_t>(scale_row) * params.v_scale_stride_dim1 +
+      static_cast<int64_t>(params.kv_head) * params.v_scale_stride_dim2 +
+      static_cast<int64_t>(scale_col) * params.v_scale_stride_dim3;
+  return params.v_scales[src];
 }
 
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_pv_scale(

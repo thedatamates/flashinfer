@@ -913,18 +913,47 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         float max_abs0 = 0.0f;
         float max_abs1 = 0.0f;
         if constexpr (!kPvLayoutV) {
+          if (token_group_start < kv_len_tokens) {
+            const int logical_page =
+                token_group_start / paged_kv_params.page_size;
+            const int page_offset0 =
+                token_group_start - logical_page * paged_kv_params.page_size;
+            const int physical_page = paged_kv_params.block_table[logical_page];
+            const int64_t data_page_base =
+                sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
+                                                    physical_page);
+            const int64_t scale_page_base =
+                sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
+                                                     physical_page);
+            const int packed_col = dim0 >> 1;
+            const int scale_col = dim0 >> 4;
+            const int shift0 = (dim0 & 1) * 4;
+            const int shift1 = ((dim0 + 1) & 1) * 4;
 #pragma unroll 1
-          for (int offset = 0; offset < 16; ++offset) {
-            const int t = token_group_start + offset;
-            if (t < kv_len_tokens) {
-              max_abs0 = fmaxf(
-                  max_abs0,
-                  fabsf(sm120_nvfp4_paged_v_linear_value(paged_kv_params, t,
-                                                          dim0)));
-              max_abs1 = fmaxf(
-                  max_abs1,
-                  fabsf(sm120_nvfp4_paged_v_linear_value(paged_kv_params, t,
-                                                          dim0 + 1)));
+            for (int offset = 0; offset < 16; ++offset) {
+              const int t = token_group_start + offset;
+              if (t < kv_len_tokens) {
+                const int page_offset = page_offset0 + offset;
+                const uint8_t packed =
+                    sm120_nvfp4_paged_v_code_pair_from_page_base(
+                        paged_kv_params, data_page_base, page_offset,
+                        packed_col);
+                const uint8_t scale_byte =
+                    sm120_nvfp4_paged_v_linear_scale_from_page_base(
+                        paged_kv_params, scale_page_base, page_offset,
+                        scale_col);
+                const float scale = e4m3_byte_to_fp32(scale_byte);
+                const float val0 =
+                    e2m1_code_to_fp32(
+                        static_cast<uint8_t>((packed >> shift0) & 0x0f)) *
+                    scale;
+                const float val1 =
+                    e2m1_code_to_fp32(
+                        static_cast<uint8_t>((packed >> shift1) & 0x0f)) *
+                    scale;
+                max_abs0 = fmaxf(max_abs0, fabsf(val0));
+                max_abs1 = fmaxf(max_abs1, fabsf(val1));
+              }
             }
           }
         }
@@ -935,29 +964,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       };
 
       auto pv_scale_for = [&](int token, int dim) {
-        if constexpr (kPvLayoutV) {
-          const int logical_page = token / paged_kv_params.page_size;
-          return sm120_nvfp4_paged_v_pv_scale(paged_kv_params, logical_page,
-                                              dim);
-        } else {
-          const int token_group_start = (token / 16) * 16;
-          const int scale_k = token_group_start - kv_tile * kCutlassTileN;
-          auto scale_ref = pv_sSFB(dim - effective_out_group_idx * kOutputTileN,
-                                   scale_k, write_stage);
-          return *cute::recast_ptr<uint8_t>(&scale_ref);
-        }
-      };
-
-      auto pv_code_for = [&](int token, int dim, uint8_t scale) {
-        if (token >= kv_len_tokens) {
-          return uint8_t{0};
-        }
-        if constexpr (kPvLayoutV) {
-          (void)scale;
-          return sm120_nvfp4_paged_v_code(paged_kv_params, token, dim);
-        } else {
-          return uint8_t{0};
-        }
+        const int token_group_start = (token / 16) * 16;
+        const int scale_k = token_group_start - kv_tile * kCutlassTileN;
+        auto scale_ref = pv_sSFB(dim - effective_out_group_idx * kOutputTileN,
+                                 scale_k, write_stage);
+        return *cute::recast_ptr<uint8_t>(&scale_ref);
       };
 
       if constexpr (!kPvLayoutV) {
@@ -1017,6 +1028,20 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
               if ((k0 & 7) != 0) {
                 asm volatile("trap;\n");
               }
+              const int token0 = kv_tile * kCutlassTileN + k0;
+              const int logical_page =
+                  token0 / paged_kv_params.page_size;
+              const int page_offset0 =
+                  token0 - logical_page * paged_kv_params.page_size;
+              const bool has_valid_token = token0 < kv_len_tokens;
+              const int physical_page =
+                  has_valid_token ? paged_kv_params.block_table[logical_page] : 0;
+              const int64_t data_page_base =
+                  sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
+                                                      physical_page);
+              const int64_t scale_page_base =
+                  sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
+                                                       physical_page);
               float vals[8];
 #pragma unroll 1
               for (int j = 0; j < 8; ++j) {
@@ -1040,8 +1065,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 const float pv_scale = fmaxf(e4m3_byte_to_fp32(scale), 1.0e-8f);
                 const float value =
                     token < kv_len_tokens
-                        ? sm120_nvfp4_paged_v_linear_value(paged_kv_params,
-                                                           token, dim)
+                        ? sm120_nvfp4_paged_v_linear_value_from_page_base(
+                              paged_kv_params, data_page_base, scale_page_base,
+                              page_offset0 + j, dim)
                         : 0.0f;
                 vals[j] = value / pv_scale;
               }
@@ -1051,6 +1077,17 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                   (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[4], vals[5])) << 16) |
                   (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[6], vals[7])) << 24);
             } else {
+              const int token0 = kv_tile * kCutlassTileN + k0;
+              const int logical_page =
+                  token0 / paged_kv_params.page_size;
+              const int page_offset0 =
+                  token0 - logical_page * paged_kv_params.page_size;
+              const bool has_valid_token = token0 < kv_len_tokens;
+              const int physical_page =
+                  has_valid_token ? paged_kv_params.block_table[logical_page] : 0;
+              const int64_t data_page_base =
+                  sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
+                                                      physical_page);
 #pragma unroll 1
               for (int j = 0; j < 8; ++j) {
                 auto coord = coord_tensor(i + j);
@@ -1068,7 +1105,12 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 }
                 const int token = kv_tile * kCutlassTileN + k;
                 const int dim = effective_out_group_idx * kOutputTileN + col;
-                const uint8_t code = pv_code_for(token, dim, 0x38);
+                const uint8_t code =
+                    token < kv_len_tokens
+                        ? sm120_nvfp4_paged_v_code_from_page_base(
+                              paged_kv_params, data_page_base,
+                              page_offset0 + j, dim)
+                        : 0;
                 const int byte_offset = int(dst_byte - dst0);
                 const int nibble_shift = (k & 1) ? 4 : 0;
                 packed_word |= static_cast<uint32_t>(code)
@@ -1088,8 +1130,14 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           const int k0 = 2 * packed_k;
           const int token = kv_tile * kCutlassTileN + k0;
           const int dim = effective_out_group_idx * kOutputTileN + col;
-          const uint8_t scale =
-              token < kv_len_tokens ? pv_scale_for(token, dim) : 0x38;
+          uint8_t scale = 0x38;
+          if (token < kv_len_tokens) {
+            const int logical_page = token / paged_kv_params.page_size;
+            const int physical_page =
+                paged_kv_params.block_table[logical_page];
+            scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page(
+                paged_kv_params, physical_page, dim);
+          }
           pv_sSFB(col, k0, write_stage) = make_ue4m3_raw(scale);
         }
       }
