@@ -1583,3 +1583,115 @@ Next diagnostic direction:
 - Compare paged-PV vs dense on the same q/kv cells first; because paged-PV
   bypasses linear-V reblock, it isolates paged scheduling/scratch/combine
   overhead from V-layout conversion.
+
+## 2026-05-03 15:07 CDT - Paged Wrapper Slowdown Localization
+
+Reference cell:
+
+- D512 Gemma global spec: q=512, kv=65536, group=8, causal, no sliding
+  window, logits softcap=30.
+- Existing report row:
+  `reports/prod_gemma_global_d512_g8_softcap30_20260503.csv`.
+- Dense direct: 7.663 ms.
+- Paged-PV wrapper: 1802.426 ms.
+- Paged-linear wrapper: 2955.367 ms.
+- NVFP4 FA2: 9.459 ms.
+
+Tripartite timing result:
+
+- Python wall time around `BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper.run()`:
+  1804.39 ms min, 1805.85 ms mean.
+- CUDA event around the full wrapper call: 1803.29 ms min, 1805.21 ms mean.
+- CUDA event around the single `paged_run_bf16_q` FFI call:
+  1804.06 ms min, 1806.41 ms mean.
+- Output copy after the FFI call: 0.009 ms min, 0.029 ms mean.
+
+Nsight Systems kernel-only result:
+
+- Paged-PV stage kernel:
+  `sm120_nvfp4_qkv_online_register_q_stage_kernel` ran for 1814.034 ms.
+- Paged split-KV combine ran for 0.0108 ms.
+- Paged scratch memset ran for 0.0101 ms.
+- Dense direct stage kernel for the same logical cell ran for 7.674 ms.
+- Dense direct combine ran for 0.0086 ms.
+
+Launch geometry:
+
+- Paged-PV setup for this cell:
+  - `total_q_rows = 4096`
+  - `physical_kv_len = 65536`
+  - `split_kv_tiles = 256`
+  - `num_splits = 2`
+  - `stage_grid = (32, 1, 2)`
+  - `stage_ctas = 64`
+  - `combine_ctas = 4096`
+- Dense uses the same raw stage launch geometry at this shape:
+  `stage_grid = (q_rows / 128, head_dim / (4 * 128), num_splits) =
+  (32, 1, 2)`.
+- The slowdown is not CTA-count explosion. It is per-CTA work inside the
+  paged stage kernel.
+
+Bisection toggles:
+
+- `bf16_q_all_heads_split2`: 1804.80 ms mean.
+- `bf16_q_kv_head0_split2`: 1805.07 ms mean.
+- `prequant_q_all_heads_split2`: 1792.29 ms mean.
+- `prequant_q_kv_head0_split2`: 1792.56 ms mean.
+- `bf16_q_all_heads_split1`: 3601.60 ms mean.
+- `prequant_q_all_heads_split1`: 3589.28 ms mean.
+
+Interpretation:
+
+- Python wrapper overhead is not the missing time.
+- Output copy, scratch memset, and split-KV combine are not the missing time.
+- JIT compile is not included; the D512 `pv_v=True` cache artifact predates
+  the diagnostic and no compiler processes were active.
+- Multi-KV-head grid dispatch is not the missing time; forcing a single
+  `kv_head` leaves runtime unchanged.
+- BF16-Q fused quantization is not the missing time; pre-quantized Q saves only
+  about 12 ms out of 1804 ms.
+- Forcing one split makes the run about 2x slower, so split-KV is providing
+  needed parallelism rather than causing the slowdown.
+- Linear-V reblock is not the primary root cause; paged-PV is already about
+  235x slower than dense at the reference cell. Linear-V adds another about
+  1.64x on top.
+
+Localized code site:
+
+- Wrapper enters the single FFI call at `flashinfer/fmha_nvfp4_sm120.py:426`.
+- The FFI calls `RunPagedBatchImpl`, which launches the raw stage kernel at
+  `csrc/fmha_nvfp4_sm120_paged_common.cuh:660`.
+- The D512 raw stage kernel launch is
+  `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:2134`.
+- Dense and paged use the same stage launch shape; the branch that differs is
+  the `kUsePagedKv` producer path:
+  - K producer: `stage_paged_k_tile` at
+    `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:756`.
+  - V producer: `stage_paged_v_tile` at
+    `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:842`.
+  - Dense K/V path uses bulk TMA copies at
+    `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:1200`
+    and `:1243`.
+
+Specific culprit:
+
+- The paged K/V producers replace the dense TMA bulk load with load-warp
+  scalar partition loops. For every stage tile, the load warp walks CUTLASS
+  copy partitions and calls per-codepoint helpers:
+  - `sm120_nvfp4_paged_k_code` at
+    `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:83`
+    performs page-table lookup, page-offset math, layout stride math, byte
+    load, and nibble extraction for each FP4 codepoint.
+  - `sm120_nvfp4_paged_v_code` at
+    `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:165`
+    performs the same scalar path for V.
+- At D512 the stage loops execute this scalar paged producer for 256 KV tiles
+  per split, two K chunks, four V output groups, and two splits. The compute
+  body is healthy; the paged scalar producer is the 275x wrapper-vs-dense gap.
+
+Next target:
+
+- Replace the D512 paged K/V producer structure with a page-aware bulk movement
+  path. The immediate problem is not wrapper launch count or split combine; it
+  is per-codepoint block-table/stride/nibble extraction inside the stage
+  kernel's load-warp producer.
