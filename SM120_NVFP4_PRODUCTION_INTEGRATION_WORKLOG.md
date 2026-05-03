@@ -690,3 +690,536 @@ Interpretation:
   collapse kv-head dispatch, Q quantization, and ragged padding into the kernel
   launch surface so the SM120 wrapper looks like other FlashInfer prefill
   wrappers.
+
+## 2026-05-02 14:35 CDT — Kernel-Side Multi-KV-Head Dispatch
+
+Implementation:
+
+- Removed the Python per-KV-head attention loop from
+  `BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper.run()`.
+- The wrapper now quantizes all Q heads once, calls `paged_run` once with
+  `kv_head=-1`, and scatters the all-head output back to the caller tensor in
+  one view copy.
+- Extended the common paged C++ launcher so `kv_head >= 0` preserves the legacy
+  single-KV-head path, while `kv_head < 0` launches all KV heads in one kernel
+  grid.
+- Extended the D128/D256/D512 stage kernels so all-head paged launches derive
+  `kv_head` from `blockIdx.x`, while keeping the scratch/output row index as the
+  all-head global Q tile. This preserves the existing per-head varlen batch math
+  and makes `(kv_head, batch, q_tile)` a kernel-side scheduling decision.
+- Updated the paged Q-pad copy, direct output copy, and split-KV combine kernels
+  to understand all-head flattened row layout:
+  `[token, kv_head * group_size + group_offset, head_dim]`.
+- Updated public NVFP4 quantization wrappers to use PyTorch's current CUDA stream
+  by default when callers do not pass an explicit `stream_handle`. This prevents
+  direct public quantization calls from racing with adjacent torch ops.
+
+Validation:
+
+- Syntax and whitespace checks passed:
+  `python -m py_compile flashinfer/fmha_nvfp4_sm120.py flashinfer/quantization/fp4_quantization.py`
+  and `git diff --check`.
+- Targeted all-head vs single-head wrapper gates passed:
+  - D128/group=4: 1 passed in 45.42s on cold JIT build.
+  - D256/group=6: 1 passed in 40.58s on cold JIT build.
+  - D512/group=4: 1 passed in 48.96s on cold JIT build.
+- Full correctness file passed normally after adding test-boundary synchronization
+  around the SM120 wrapper tests:
+  `tests/attention/test_nvfp4_kv_head_dim_512.py`: 35 passed in 1.54s.
+- The same full file also passed with `CUDA_LAUNCH_BLOCKING=1`: 35 passed in
+  1.57s. This confirmed the transient full-suite failures were cross-test async
+  contamination from prior FFI kernels, not an all-head row-mapping error.
+
+Interpretation:
+
+- Multi-KV-head dispatch is now structural and kernel-side. One wrapper run no
+  longer performs `num_kv_heads` Q-slice copies, Q-quant launches, attention
+  launches, and output copies.
+- The wrapper still has two major compensation steps left before it matches the
+  shape of FlashInfer's mature paged prefill wrappers:
+  - Q quantization remains a separate FFI launch before attention.
+  - Ragged Q still goes through a padded Q scratch copy instead of being read and
+    quantized directly by the attention producer.
+- Next structural item: fuse BF16 Q ingestion and NVFP4 Q quantization into the
+  paged attention launch so the kernel accepts BF16 Q directly and the wrapper
+  stops staging a pre-quantized Q cache.
+
+## 2026-05-02 15:05 CDT — BF16 Q Accepted By The Paged FFI Entry Point
+
+Implementation:
+
+- Added `paged_run_bf16_q` to the D128/D256/D512 SM120 NVFP4 paged modules.
+- The new entry point accepts BF16 Q directly, quantizes it to the existing
+  NVFP4 Q packed/scale workspace on the same explicit CUDA stream, then invokes
+  the common paged attention launcher.
+- Updated the production Python wrapper to call `paged_run_bf16_q` instead of
+  calling `quantize_q` as a separate Python-visible FFI operation before
+  `paged_run`.
+- Kept the older `paged_run` and `quantize_q` exports for direct tests,
+  benchmarks, and dense/debug surfaces that still operate on pre-quantized Q.
+- Added synchronization after public KV quantization setup in the SM120 wrapper
+  tests. The attention wrapper itself uses explicit streams; the test sync keeps
+  these tests from inheriting async state from public quantization/setup kernels
+  and prior FFI tests in the same pytest process.
+
+Validation:
+
+- Syntax and whitespace checks passed:
+  `python -m py_compile flashinfer/fmha_nvfp4_sm120.py flashinfer/quantization/fp4_quantization.py`
+  and `git diff --check`.
+- Targeted all-head wrapper gates passed on a fresh BF16-Q JIT cache:
+  - D128/group=4: 1 passed in 49.60s.
+  - D256/group=6 and D512/group=4: 2 passed in 97.96s.
+- Full correctness file passed normally on the BF16-Q path:
+  `tests/attention/test_nvfp4_kv_head_dim_512.py`: 35 passed in 1.55s.
+
+Interpretation:
+
+- The production wrapper no longer orchestrates Q quantization as a separate FFI
+  boundary. BF16-Q ingestion is now part of the SM120 paged module API.
+- This is not yet true in-mainloop Q quantization: the C++ paged entry point
+  still performs a Q-quantization pre-pass into Q packed/scale workspace before
+  launching the attention stage kernel. It is nevertheless the right API shape:
+  callers pass BF16 Q, and future in-mainloop quantization can replace the
+  pre-pass without changing the Python or vLLM-facing wrapper contract.
+- Remaining wrapper compensation is now concentrated in ragged-Q padding/copy
+  scratch. The next structural target is to make the stage kernel consume the
+  ragged BF16 Q layout directly so the padded Q packed/scales scratch copy can
+  be removed.
+
+## 2026-05-02 13:51 CDT — Native Linear-V Path And Wrapper Sync Removal
+
+Implementation:
+
+- Removed the production wrapper synchronization path. There is no
+  `torch.cuda.current_stream(...).synchronize()`, `_join_torch_and_ffi_streams`,
+  or wrapper-side `wait_stream` ordering in the SM120 NVFP4 wrapper hot path.
+- Removed the Python-side normal-linear V conversion bridge from the production
+  wrapper. The wrapper no longer invokes `nvfp4_quantize_paged_kv_cache` during
+  `BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper.run()`.
+- Added `paged_run_bf16_q_linear_v` to the D128/D256/D512 paged modules. This
+  entry point accepts BF16 Q and standard linear FP4 V cache pages, converts V
+  to the PV-reblocked scratch layout inside the SM120 module on the explicit
+  CUDA stream, then launches the paged attention path.
+- Added a native module-side linear-V to PV-V conversion kernel in
+  `csrc/fmha_nvfp4_sm120_paged_common.cuh`. It supports standard packed V pages
+  with TRT-LLM-interleaved or linear V scale layout, and HND or NHD input KV
+  layout.
+- Updated the paged V producer contract: K can still be read directly from HND
+  or NHD cache layout, while PV V scratch is always consumed as NHD. This removes
+  the old Python HND-to-NHD compensation step for K/V.
+- Fixed the D128/D256 PV producer sub-byte race by replacing proxy nibble stores
+  with a word-atomic byte update path, matching the deterministic D512 producer
+  mechanism.
+
+Validation:
+
+- Targeted normal-linear V layout gate passed on SM120:
+  `tests/attention/test_nvfp4_kv_head_dim_512.py::test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x`
+  with 3 passed in 165.53s.
+- Targeted multi-KV-head and standard-wrapper gates passed:
+  `test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x` and
+  `test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x`
+  with 6 passed in 0.59s.
+- Full SM120 NVFP4 attention correctness file passed:
+  `tests/attention/test_nvfp4_kv_head_dim_512.py` with 35 passed in 1.45s.
+
+Interpretation:
+
+- Multi-KV-head dispatch and ragged-Q scheduling are module/kernel-side now; the
+  production wrapper no longer loops over KV heads and no longer runs a
+  Python-visible Q-quant operation before attention.
+- BF16 Q is accepted at the FFI boundary and quantized by a CUDA pre-pass inside
+  the SM120 module into Q scratch. This is not yet in-mainloop Q quantization,
+  but the public wrapper contract now has the right shape for future replacement
+  without changing vLLM-facing call sites.
+- The standard vLLM linear-V input layout is handled by the SM120 module itself.
+  Callers that already store PV-reblocked V can still bypass that conversion by
+  using `v_cache_uses_pv_layout=True`.
+- Remaining cleanup before upstream review: remove dummy pre-quantized Q
+  arguments from the BF16-Q FFI surface if they are no longer needed by direct
+  tests, and evaluate whether full in-mainloop Q quantization is needed for
+  performance or reviewer expectations.
+
+## 2026-05-02 16:35 CDT — Normal-V Reblock Diagnostic State
+
+Implementation state:
+
+- The production wrapper no longer invokes a Python-side or module-side V bridge
+  before attention. Linear V and PV V both flow through the paged attention
+  module; the V layout is now a JIT specialization axis.
+- D128/D256/D512 linear-V producers were changed to the fmha_v2-style two-pass
+  shape: compute PV scales first, stage those scales in shared memory, then
+  load/dequant/requant V data against the staged scale values.
+- The producer still differs from fmha_v2 in one deliberate diagnostic respect:
+  the data pass uses four explicit `fp32_pair_to_e2m1_byte` conversions packed
+  into a 32-bit word instead of `float8_to_e2m1x8`. Both use hardware E2M1
+  conversion on SM100+, but the pairwise path preserves explicit byte ordering
+  in this CUTLASS partition-derived store path.
+
+Validation:
+
+- D256 `test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x[256-6]` still
+  fails narrowly after the pairwise hardware pack change:
+  `diff_hnd.mean() = 5.49e-05` vs the current `5e-05` gate.
+- A repeated cached D256 HND-vs-NHD diagnostic with fresh wrappers per run is
+  sequence-dependent:
+  - Most runs are bit-identical.
+  - Later runs show sparse drift, e.g. max `0.0028` with no elements above
+    `3e-3`, then max `0.00371` with 3 elements above `3e-3`.
+  - The same row/head/dim recurred in the max-diff location in multiple
+    nonzero runs.
+
+Interpretation:
+
+- This no longer looks like a deterministic HND-vs-NHD stride formula error:
+  identical logical tensors frequently produce bit-identical outputs across
+  layouts.
+- The remaining issue is likely an ordering, coverage, or race problem in the
+  in-kernel linear-V path, or a codepoint-boundary sensitivity that the current
+  strict HND-vs-NHD test exposes.
+- No more producer fixes should be applied until a binary-search diagnostic
+  identifies the first stage where NHD and HND diverge: V/K smem operand after
+  producer, QK accumulator, softmax probabilities, PV accumulator, or final
+  output.
+
+## 2026-05-02 17:12 CDT — D256 HND-vs-NHD Producer Boundary Diagnostic
+
+Diagnostic added:
+
+- Added a D256 diagnostic export, `debug_producer_smem`, to the generated
+  SM120 NVFP4 paged module.
+- The diagnostic runs the same partition-derived K and V paged producers used
+  by the normal-V specialization and dumps the physical shared-memory images:
+  - QK/K operand `smem_B`.
+  - QK/K scale `smem_SFB`.
+  - PV/V operand `smem_B`.
+  - PV/V scale `smem_SFB`.
+
+Validation:
+
+- Compared NHD and HND layouts for the same logical D256 cache at:
+  - `kv_head = {0, 1}`.
+  - `kv_tile = {0, 7}`.
+  - `k_outer = {0, 1}`.
+  - `out_group_idx = 0`.
+- All four producer dumps matched byte-for-byte for every case:
+  - `k_smem_b`: match.
+  - `k_smem_sfb`: match.
+  - `v_smem_b`: match.
+  - `v_smem_sfb`: match.
+- Re-ran the targeted pytest gate after rebuilding the D256 normal-V spec:
+  `test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x[256-6]` passed once,
+  then a repeated pytest invocation later observed a sparse final-output max
+  drift of `0.0035`.
+- Reproduced the exact test call sequence manually, including the intermediate
+  PV-layout run, and retained inner SM120 wrapper buffers. That sequence was
+  bit-exact for 12 iterations across:
+  - `out`.
+  - `_out_scratch`.
+  - `_out_group`.
+  - `_partial`.
+  - `_split_m`.
+  - `_split_l`.
+- A follow-up 100-iteration loop of the same exact call sequence found no
+  nonzero final-output difference.
+
+Interpretation:
+
+- The D256 HND-vs-NHD issue is not caused by producer source addressing or
+  layout stride math: the physical K/V operand and scale shared-memory images
+  are identical across layouts.
+- The currently observed failing values are sparse and codepoint-scale at the
+  BF16 final output boundary. The only captured pytest failure after the
+  producer diagnostic was a max drift of `0.0035`; repeated direct/manual runs
+  could not reproduce a downstream difference to capture.
+- No kernel fix was applied after the diagnostic. If the sparse pytest-only
+  drift reappears, the next diagnostic boundary should be an active-stage dump
+  inside the production stage kernel for the selected failing CTA, because the
+  standalone producer boundary has been ruled out.
+
+## 2026-05-02 17:29 CDT — D256 Active-Stage HND-vs-NHD Boundary Diagnostic
+
+Diagnostic added:
+
+- Extended the D256 paged module with `debug_stage_run`, a D256-only replay
+  entry point that uses the same production stage kernel and can dump a selected
+  CTA/tile boundary.
+- Added selected-CTA dumps for:
+  - QK logits in `smem_logits` after QK MMA and before softmax.
+  - P data smem after softmax and before PV MMA.
+  - Logical P scale bytes after softmax and before PV MMA.
+  - O smem after final PV accumulation and before the epilogue-visible output
+    store.
+  - Online row stats (`global_m`, `global_l`).
+- The first version of this diagnostic replayed from Q scratch and produced a
+  false QK-logits divergence because BF16-Q production runs do not use Q scratch
+  as the Q source. The diagnostic was corrected to accept BF16 Q and populate
+  `paged_params.q_bf16`/Q strides exactly like the production BF16-Q path.
+- The P-scale dump was changed from raw physical SFA allocation bytes to the
+  512 logical P-scale bytes that PV MMA can consume. The raw physical allocation
+  has 2048 bytes; the other 1536 bytes are padding/unwritten extent and were a
+  false divergence source.
+
+Validation:
+
+- Reproduced the pytest-like HND-vs-NHD call sequence with the intermediate
+  normal-V vs PV-layout `torch.quantile` work that makes the sparse drift
+  reproduce reliably.
+- A caught run had final-output max drift around `0.00424`.
+- For the final-diff CTA and the CTA owning the replay `out_scratch` max:
+  - `logits`: byte-identical.
+  - `p_smem`: byte-identical.
+  - `p_sfa_logical`: byte-identical.
+  - `o_smem`: byte-identical.
+  - `global_m/global_l`: exact.
+  - Full-grid `out_scratch`: diverged after the epilogue-visible output store
+    (examples: max `0.00262` and `0.00269` in replayed runs).
+- Rechecked batch-1 producer smem using `debug_producer_smem` with the batch-1
+  block-table row:
+  - QK/K operand and scale smem matched for `kv_head=1`, `kv_tile=7`,
+    `k_outer={0,1}`.
+  - PV/V operand and scale smem also matched for the same cases.
+
+Interpretation:
+
+- The D256 HND-vs-NHD drift is not a K/V producer stride or source-addressing
+  bug.
+- With the corrected BF16-Q diagnostic path, the consumed QK logits, softmax
+  probabilities/scales, PV output smem, and online stats match across layouts
+  for caught failures.
+- The first observed real divergence is after O smem and before/at the
+  `out_scratch` writeback. The next fix/debug target is therefore the final
+  `pipeline_corr_epi` handoff and epilogue store path, not the K/V producer or
+  softmax math.
+
+## 2026-05-02 18:33 CDT — D256 Coverage-Class Root Cause And Fix
+
+Diagnostic result:
+
+- Reproduced the D256 normal-V HND-vs-NHD instability only when the test
+  sequence included the intermediate PV-layout run followed by
+  `torch.quantile(...).item()`.
+- Without the intermediate quantile work, repeated NHD-vs-HND linear-V runs were
+  bit-exact for 20/20 iterations.
+- The PV-layout run alone did not trigger drift; the quantile work perturbed the
+  subsequent linear-V stage enough to expose an uninitialized shared-memory
+  coverage gap.
+- Input tensors and metadata (`q`, K/V pages, K/V scales, block tables,
+  `qo_indptr`, `kv_lens`) were snapshotted before and after the PV+quantile
+  sequence and remained byte-identical.
+- Clean direct stage replays were deterministic, but all-CTA active-stage dumps
+  under the quantile-triggered condition showed first divergence in QK logits;
+  P smem, P scales, and O smem divergence were downstream.
+
+Root cause:
+
+- The active D256 path initialized QK/PV B operand smem and SFB scale smem, but
+  did not initialize QK A operand smem or SFA scale smem before BF16-Q staging.
+- Q staging writes through CUTLASS partitioned fragments. The consumer can read
+  the full LDSM/MMA fragment extent, while the producer only writes the covered
+  logical fragment subset. Undefined residue in A/SFA therefore fed QK MMA and
+  manifested as sequence-dependent logits divergence.
+- The earlier logits `-inf` fill was necessary but not sufficient: it protects
+  score positions that QK does not overwrite, but it cannot protect QK itself
+  from stale Q operand/scale smem.
+
+Fix applied:
+
+- Added D256 full QK A byte zero initialization for the paged path at kernel
+  entry.
+- Added D256 full QK SFA neutral-scale (`0x38`) initialization for the paged
+  path at kernel entry.
+- Kept the full score-tile `-inf` initialization before each QK tile writes its
+  logits.
+
+Validation:
+
+- The previous quantile-triggered NHD/HND sequence is now bit-exact for 20/20
+  iterations:
+  - `out_max = 0.0` for every iteration.
+  - `scratch_max = 0.0` for every iteration.
+  - No NaNs.
+- All-CTA active-stage replay under the same trigger now matches byte-for-byte:
+  - `logits`: byte-identical.
+  - `p_smem`: byte-identical.
+  - `p_sfa` logical scale bytes: byte-identical.
+  - O rows reconstructed from O smem: exact.
+  - `out_scratch`: exact.
+
+Follow-up:
+
+- Treat this as a coverage-class issue, not an isolated D256 bug. The production
+  kernels should make smem coverage policy explicit for every producer/consumer
+  smem region: operand data smem gets zero sentinel, UE4M3 scale smem gets
+  neutral `0x38`, logits get `-inf`, and output staging gets zero where consumer
+  coverage is not proven complete.
+
+## 2026-05-02 19:31 CDT — Covered Smem Coverage Policy Across D128/D256/D512
+
+Change:
+
+- Added `fmha_nvfp4_sm120_covered_smem.cuh` with `CoveredSmemTile`, a small
+  wrapper that constructs a CUTE shared-memory tensor and collectively
+  initializes its full physical extent before any CUTLASS consumer can read it.
+- Added sentinel traits for the coverage classes this kernel needs:
+  - `SentinelZero`: bytewise `0x00` for FP4 operand and output-like staging.
+  - `SentinelE4M3One`: bytewise `0x38` for UE4M3 scale smem.
+  - `SentinelNegInf`: typed `-inf` for BF16/FP32 score smem.
+- Made the wrapper pointer-type-parametric because CUTLASS sub-byte smem
+  allocation `begin()` returns CUTE sub-byte iterators, not plain `Element*`.
+- Made the barrier id generic because the active call sites use strongly typed
+  `cutlass::arch::ReservedNamedBarriers` values.
+- Added an explicit `participant_idx` overload so MMA-only logits fill can use
+  `qk_mma_thread_idx` rather than full `threadIdx.x`.
+
+Production kernel adoption:
+
+- Replaced active QK/PV/P smem tensor construction in D128, D256, and D512 with
+  `CoveredSmemTile` wrappers:
+  - QK A/B operand smem: zero sentinel.
+  - QK SFA/SFB scale smem: neutral `0x38` sentinel.
+  - PV B operand smem: zero sentinel.
+  - PV SFB scale smem: neutral `0x38` sentinel.
+  - P staging A/SFA smem: zero and neutral `0x38` sentinels.
+- Replaced the per-QK-tile logits manual fill with `NegInfSmemTile` in all
+  three head-dim kernels. D256 already had the manual fill; D128 and D512 now
+  get the same full-score-tile policy.
+- Removed the D256/D512 one-off active-path B/SFB init blocks that were the
+  previous piecemeal coverage fixes.
+
+Audit:
+
+- The active production stage kernel no longer builds raw CUTLASS smem tensors
+  for QK/PV/P producer-consumer staging without an explicit coverage wrapper.
+- Remaining raw `make_tensor(make_smem_ptr(...))` sites are outside the active
+  production allocation path:
+  - The standalone atom/probe diagnostic body.
+  - The Q register-staging read helper, which consumes already-covered Q/SFA
+    smem and does not allocate a producer-visible staging region.
+  - D256 diagnostic producer/debug code.
+
+Validation:
+
+- Built all production-flag SM120 JIT specs on the local machine:
+  - D128 linear-V (`kPvLayoutV=false`).
+  - D256 linear-V (`kPvLayoutV=false`).
+  - D512 linear-V (`kPvLayoutV=false`).
+  - D128 PV-layout V (`kPvLayoutV=true`).
+  - D256 PV-layout V (`kPvLayoutV=true`).
+  - D512 PV-layout V (`kPvLayoutV=true`).
+- The first D128/D256/D512 compile attempts accidentally used
+  `FLASHINFER_JIT_VERBOSE=1`; this codebase treats that as debug mode and emits
+  `-G -O0`. Stale debug cache directories were moved aside and the specs were
+  rebuilt with `FLASHINFER_JIT_DEBUG=0`, producing the intended `-DNDEBUG -O3`
+  builds.
+- Runtime pytest on this machine cannot execute SM120 kernels because the local
+  GPU is an RTX 4090 (`sm_89`). The SM120 NVFP4 attention test file collects and
+  skips cleanly:
+  - `tests/attention/test_nvfp4_kv_head_dim_512.py`: 35 skipped with the
+    expected SM120/SM121 requirement.
+
+Follow-up:
+
+- Re-run the D128/D256/D512 runtime correctness diagnostics on an SM120/SM121
+  system. The local validation here proves compilation and test collection, not
+  device execution.
+- After runtime correctness is clean, measure the cost of the systematic
+  coverage fills. Correctness first; if the fill cost is material, optimize the
+  fill placement or prove specific producer/consumer regions are fully covered
+  before removing any sentinel initialization.
+
+## 2026-05-02 20:44 CDT — Covered Smem Adoption Completed And SM120 Runtime Gate
+
+Correction to the previous validation note:
+
+- The host has multiple GPUs. The default visible device was GPU 0, an RTX 4090
+  (`sm_89`), which caused the first pytest run to skip the SM120 tests.
+- GPU 2 is an RTX PRO 6000 Blackwell Max-Q Workstation Edition (`sm_120`) and is
+  the correct local device for this validation.
+
+Additional adoption work:
+
+- Tightened `CoveredSmemTile` so it can be used as the real data-flow handle,
+  not only as an init side effect:
+  - Added `CoveredSmemNoInit` construction for aliased smem regions.
+  - Added `fill_and_sync(...)` so aliased regions can be initialized at the
+    data-dependency boundary where the next consumer needs a fresh sentinel.
+- Converted the remaining raw helper smem construction sites in D128/D256/D512:
+  - The standalone atom/probe helper now constructs QK A/B/SFA/SFB through
+    covered tensors.
+  - `cutlass_qk_tma_q_register_stage` now accepts the already-covered QK A/SFA
+    tensor handles instead of reconstructing raw tensors from `TensorStorage`.
+- Converted logits handling from side-effect-only initialization to real covered
+  tensor handles:
+  - A no-init `NegInfSmemTile` handle is constructed for each physical logits
+    stage.
+  - `run_qk_tile()` calls `fill_and_sync()` at the QK-to-softmax dependency
+    point, after QK B aliasing is no longer active for that score stage.
+  - QK writes and softmax reads now go through the covered logits tensor handle
+    using the existing physical skew index.
+- A grep audit no longer finds raw `make_tensor(make_smem_ptr(...))` smem
+  construction, `(void)logits_covered`, or raw `smem_logits_stage[...]` access
+  in the D128/D256/D512 production headers.
+
+Build validation:
+
+- Rebuilt the primary production specs with `FLASHINFER_JIT_DEBUG=0` and
+  `-DNDEBUG -O3`:
+  - D128/D256/D512, `kPvLayoutV=false`.
+  - D128/D256/D512, `kPvLayoutV=true`.
+- Prebuilt the D512 sliding-window specs that the test suite exercises:
+  - D512, sliding-window, `kPvLayoutV=false`.
+  - D512, sliding-window, `kPvLayoutV=true`.
+
+Runtime validation:
+
+- Ran the SM120 NVFP4 attention test shard on GPU 2:
+  - Command shape: `CUDA_VISIBLE_DEVICES=2 ... pytest
+    tests/attention/test_nvfp4_kv_head_dim_512.py -q --tb=short -rs`
+  - Result: `35 passed in 2.03s`.
+
+Interpretation:
+
+- The coverage abstraction is now load-bearing in the code, not just a fill
+  statement beside raw pointer accesses.
+- The known SM120 correctness suite passes with the completed covered-smem
+  adoption.
+
+## 2026-05-02 21:22 CDT — Covered Smem Paranoia Validation
+
+Paranoia checks after the completed covered-smem adoption:
+
+- Re-ran the originally flaky production-layout test
+  `test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x[256-6]` 50 times in a
+  loop on GPU 2 (`sm_120`).
+  - Result: 50/50 passed.
+  - Each iteration reported about 0.46-0.48 seconds with the JIT cache warm.
+- Tightened the bridge-era tolerance relaxations and reran the full SM120 NVFP4
+  attention test file on GPU 2.
+  - D512 multi-KV-vs-single-KV tolerance tightened from `3e-3` to `2e-3`.
+  - Linear-V-vs-PV tolerance tightened from mean `3e-3`, p99 `1.2e-2`, max
+    `2.5e-2` to mean `2e-3`, p99 `1.0e-2`, max `2.0e-2`.
+  - HND-vs-NHD tolerance tightened back to mean `1e-5`, max `1e-3`.
+  - Result: `tests/attention/test_nvfp4_kv_head_dim_512.py` passed all 35 tests
+    in 2.06 seconds.
+- Tried a more aggressive linear-V-vs-PV mean threshold of `1e-3`.
+  - Result: failed at D128 with observed mean absolute difference about
+    `0.0012`.
+  - Interpretation: the remaining linear-V-vs-PV gap is normal FP4 reblock
+    quantization noise, not the previous intermittent state-residue failure.
+- Measured one targeted cold-cache rebuild by moving aside only the D256
+  production linear-V spec cache:
+  - Spec:
+    `fmha_nvfp4_sm120_d256_causal_True_swa_True_softcap_True_pv_v_False`.
+  - Result: 172.26 seconds.
+
+Interpretation:
+
+- The prior intermittent D256 normal-V failure did not reproduce under 50
+  consecutive executions.
+- The bridge-era tolerance relaxations can be tightened materially now that the
+  bridge has been removed and smem coverage is systematic.
+- Cold-cache compile time for the D256 linear-V production spec is still above
+  the desired 40-90 second envelope; compile-time work remains, even though
+  runtime correctness is stable.

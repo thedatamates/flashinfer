@@ -1101,6 +1101,7 @@ def test_nvfp4_xqa_decode_sharp_tokens_sm12x(head_dim):
 @pytest.mark.parametrize("head_dim,group", [(128, 4), (256, 6), (512, 4)])
 def test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x(head_dim, group):
     _requires_sm12x_nvfp4()
+    torch.cuda.synchronize()
 
     device = torch.device("cuda")
     page_size = 16
@@ -1156,6 +1157,7 @@ def test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x(head_dim, group):
             k, v, "NHD", v_data_layout="pv", v_scale_layout="pv"
         )
     )
+    torch.cuda.synchronize()
 
     workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
     wrapper = BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(workspace)
@@ -1209,8 +1211,9 @@ def test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x(head_dim, group):
         expected_slices.append(out_slice)
 
     expected = torch.cat(expected_slices, dim=1)
+    torch.cuda.synchronize()
     assert torch.isfinite(out.float()).all()
-    multi_kv_atol = 3e-3 if head_dim == 512 else 1e-3
+    multi_kv_atol = 2e-3 if head_dim == 512 else 1e-3
     torch.testing.assert_close(out, expected, rtol=0, atol=multi_kv_atol)
 
 
@@ -1219,6 +1222,7 @@ def test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm1
     head_dim, group
 ):
     _requires_sm12x_nvfp4()
+    torch.cuda.synchronize()
 
     device = torch.device("cuda")
     page_size = 16
@@ -1283,6 +1287,7 @@ def test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm1
             k, v, "NHD", v_data_layout="pv", v_scale_layout="pv"
         )
     )
+    torch.cuda.synchronize()
 
     workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
     standard = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
@@ -1342,6 +1347,7 @@ def test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm1
 @pytest.mark.parametrize("head_dim,group", [(128, 4), (256, 6), (512, 4)])
 def test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x(head_dim, group):
     _requires_sm12x_nvfp4()
+    torch.cuda.synchronize()
 
     device = torch.device("cuda")
     page_size = 16
@@ -1401,6 +1407,7 @@ def test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x(head_dim, group):
             k, v, "NHD", v_data_layout="pv", v_scale_layout="pv"
         )
     )
+    torch.cuda.synchronize()
     assert torch.equal(k_normal, k_pv)
     assert torch.equal(k_sf.view(torch.uint8), k_sf_pv.view(torch.uint8))
     assert k_scale == k_scale_pv
@@ -1450,9 +1457,9 @@ def test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x(head_dim, group):
     assert torch.isfinite(out_normal.float()).all()
     assert torch.isfinite(out_pv.float()).all()
     diff = (out_normal.float() - out_pv.float()).abs().flatten()
-    assert diff.mean() < 3e-3
-    assert torch.quantile(diff, 0.99) < 1.2e-2
-    assert diff.max() < 2.5e-2
+    assert diff.mean() < 2e-3
+    assert torch.quantile(diff, 0.99) < 1.0e-2
+    assert diff.max() < 2e-2
 
     out_normal_hnd_ref = run(v_normal, v_sf_normal, False)
 

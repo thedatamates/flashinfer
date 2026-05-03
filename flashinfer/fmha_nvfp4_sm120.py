@@ -24,7 +24,6 @@ import torch
 
 from .api_logging import flashinfer_api
 from .jit import gen_fmha_nvfp4_sm120_module
-from .quantization.fp4_quantization import nvfp4_quantize_paged_kv_cache
 from .utils import check_shape_dtype_device
 
 
@@ -72,13 +71,14 @@ def _get_sm120_nvfp4_fmha_module(
     causal: bool,
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
+    v_cache_uses_pv_layout: bool,
 ):
     return gen_fmha_nvfp4_sm120_module(
         head_dim,
         causal=causal,
         use_sliding_window=use_sliding_window,
         use_logits_soft_cap=use_logits_soft_cap,
-        v_cache_uses_pv_layout=True,
+        v_cache_uses_pv_layout=v_cache_uses_pv_layout,
     ).build_and_load()
 
 
@@ -98,15 +98,15 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
 
     This wrapper exposes the productionized SM120 fused FMHA kernels for
     D128/D256/D512. Standard vLLM paged NVFP4 KV uses linear V layout at the
-    public API boundary; the wrapper converts that V cache to the PV physical
-    layout required by the SM120 block-scaled PV MMA before launching attention.
+    public API boundary; the attention V producer reblocks it into the PV
+    physical layout required by the SM120 block-scaled PV MMA inside the fused
+    kernel.
 
     Callers that already store PV-layout V from
     :func:`flashinfer.nvfp4_quantize_paged_kv_cache` with
     ``v_data_layout="pv"`` and ``v_scale_layout="pv"`` can pass
     ``v_cache_uses_pv_layout=True`` to skip that conversion. In both cases the
-    attention kernel itself stages K and PV-layout V directly from the paged
-    block table.
+    attention kernel stages K/V directly from the paged block table.
     """
 
     def __init__(self, workspace_buffer: torch.Tensor, kv_layout: str = "NHD") -> None:
@@ -172,6 +172,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
 
         qo_cpu = qo_indptr.to("cpu", dtype=torch.int64)
         kv_cpu = kv_lens.to("cpu", dtype=torch.int64)
+        block_cpu = block_tables.to("cpu", dtype=torch.int64)
         batch_size = int(qo_cpu.numel() - 1)
         if int(kv_cpu.numel()) != batch_size:
             raise ValueError("kv_lens must have one entry per sequence.")
@@ -181,6 +182,9 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             raise ValueError("qo_indptr must be non-decreasing.")
         if torch.any(kv_cpu <= 0):
             raise ValueError("kv_lens entries must be positive.")
+        valid_pages = block_cpu[block_cpu >= 0]
+        if valid_pages.numel() == 0:
+            raise ValueError("block_tables must contain at least one physical page.")
 
         self._qo_indptr = qo_indptr
         self._qo_indptr_device = qo_indptr.to(
@@ -195,6 +199,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         self._total_q_len = int(qo_cpu[-1].item())
         self._max_q_len = int(q_lens.max().item()) if batch_size > 0 else 0
         self._max_kv_len = int(kv_cpu.max().item()) if batch_size > 0 else 0
+        self._max_physical_pages = int(valid_pages.max().item()) + 1
         self._num_qo_heads = int(num_qo_heads)
         self._num_kv_heads = int(num_kv_heads)
         self._group_size = int(num_qo_heads // num_kv_heads)
@@ -211,16 +216,19 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             self._causal,
             self._window_left > 0,
             self._logits_soft_cap > 0.0,
+            self._v_cache_uses_pv_layout,
         )
 
         tile_m = _tile_m_for_head_dim(head_dim)
-        max_q_rows = self._max_q_len * self._group_size
-        padded_q_rows_per_seq = _round_up(max_q_rows, tile_m)
-        batch_padded_q_rows = batch_size * padded_q_rows_per_seq
+        max_q_rows_per_kv_head = self._max_q_len * self._group_size
+        padded_q_rows_per_seq = _round_up(max_q_rows_per_kv_head, tile_m)
+        batch_padded_q_rows = (
+            self._num_kv_heads * batch_size * padded_q_rows_per_seq
+        )
         physical_kv_len = _round_up(self._max_kv_len, 128)
         self._physical_kv_len = physical_kv_len
         num_splits = math.ceil((physical_kv_len // 128) / self._split_kv_tiles)
-        total_q_rows = self._total_q_len * self._group_size
+        total_q_rows = self._total_q_len * self._num_qo_heads
 
         self._scratch_bases = []
 
@@ -229,9 +237,6 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             self._scratch_bases.append(base)
             return tensor
 
-        self._q_group = alloc(
-            (self._total_q_len, self._group_size, head_dim), torch.bfloat16
-        )
         self._q_packed = alloc((total_q_rows, head_dim // 2), torch.uint8)
         self._q_scales = alloc((total_q_rows, head_dim // 16), torch.uint8)
         self._q_packed_scratch = alloc(
@@ -328,8 +333,6 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 f"got {tuple(v_sf_pages_input_u8.shape)}."
             )
 
-        stream = torch.cuda.current_stream(q.device).cuda_stream
-
         if self._v_cache_uses_pv_layout:
             run_k_pages = k_pages
             run_k_sf_pages_u8 = k_sf_pages_u8
@@ -338,88 +341,75 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             run_kv_layout_hnd = False
             run_k_scale = float(k_scale)
             run_v_scale = float(v_scale)
+            v_scale_layout_code = 0
         else:
-            if self._kv_layout == "HND":
-                k_pages_nhd = k_pages.permute(0, 2, 1, 3).contiguous()
-                k_sf_pages_nhd = k_sf_pages_u8.permute(0, 2, 1, 3).contiguous()
-                v_pages_nhd = v_pages_input.permute(0, 2, 1, 3).contiguous()
-                v_sf_pages_nhd = v_sf_pages_input_u8.permute(0, 2, 1, 3).contiguous()
-            else:
-                k_pages_nhd = k_pages
-                k_sf_pages_nhd = k_sf_pages_u8
-                v_pages_nhd = v_pages_input
-                v_sf_pages_nhd = v_sf_pages_input_u8
-
-            (
-                (run_k_pages, run_v_pages_pv),
-                (run_k_sf_pages, run_v_sf_pages_pv),
-                run_k_scale,
-                run_v_scale,
-            ) = nvfp4_quantize_paged_kv_cache(
-                k_pages_nhd,
-                v_pages_nhd,
-                "NHD",
-                v_scale_layout="pv",
-                v_data_layout="pv",
-                kv_cache_sf=(k_sf_pages_nhd, v_sf_pages_nhd),
-                k_global_scale=float(k_scale),
-                v_global_scale=float(v_scale),
-                stream_handle=stream,
-            )
-            run_k_sf_pages_u8 = _as_uint8_scale(run_k_sf_pages)
-            run_v_sf_pages_pv_u8 = _as_uint8_scale(run_v_sf_pages_pv)
-            run_kv_layout_hnd = False
+            if v_cache_sf_layout == "pv":
+                raise ValueError(
+                    "v_cache_sf_layout='pv' requires v_cache_uses_pv_layout=True."
+                )
+            if k_pages.shape[0] < self._max_physical_pages:
+                raise ValueError(
+                    "paged_kv_cache has fewer physical pages than block_tables reference."
+                )
+            run_k_pages = k_pages
+            run_k_sf_pages_u8 = k_sf_pages_u8
+            run_v_pages_pv = v_pages_input
+            run_v_sf_pages_pv_u8 = v_sf_pages_input_u8
+            run_kv_layout_hnd = self._kv_layout == "HND"
+            run_k_scale = float(k_scale)
+            run_v_scale = float(v_scale)
+            v_scale_layout_code = 1 if v_cache_sf_layout == "linear" else 0
 
         if out is None:
             out = torch.zeros_like(q)
         else:
             check_shape_dtype_device(out, q.shape, torch.bfloat16, q.device, "out")
 
-        for kv_head in range(self._num_kv_heads):
-            qo_start = kv_head * self._group_size
-            qo_stop = qo_start + self._group_size
-            self._q_group.copy_(q[:, qo_start:qo_stop, :])
-            self._module.quantize_q(
-                self._q_group, self._q_packed, self._q_scales, stream
+        stream = torch.cuda.current_stream(q.device).cuda_stream
+        q_run = q if q.is_contiguous() else q.contiguous()
+        self._partial.zero_()
+        self._split_m.fill_(-float("inf"))
+        self._split_l.zero_()
+        self._out_scratch.zero_()
+        self._out_group.zero_()
+        self._module.paged_run_bf16_q(
+            q_run,
+            self._q_packed,
+            self._q_scales,
+            run_k_pages,
+            run_k_sf_pages_u8,
+            run_v_pages_pv,
+            run_v_sf_pages_pv_u8,
+            self._block_tables,
+            self._qo_indptr_device,
+            self._kv_lens_device,
+            self._q_packed_scratch,
+            self._q_scales_scratch,
+            self._partial,
+            self._split_m,
+            self._split_l,
+            self._out_scratch,
+            self._out_group,
+            self._workspace_buffer,
+            self._physical_kv_len,
+            float(run_k_scale),
+            float(run_v_scale),
+            -1,
+            self._split_kv_tiles,
+            self._group_size,
+            self._causal,
+            self._window_left,
+            self._logits_soft_cap,
+            self._output_group_span,
+            run_kv_layout_hnd,
+            v_scale_layout_code,
+            stream,
+        )
+        out.copy_(
+            self._out_group.view(
+                self._total_q_len, self._num_qo_heads, self._head_dim
             )
-            self._out_scratch.zero_()
-            self._out_group.zero_()
-            self._module.paged_run(
-                self._q_packed,
-                self._q_scales,
-                run_k_pages,
-                run_k_sf_pages_u8,
-                run_v_pages_pv,
-                run_v_sf_pages_pv_u8,
-                self._block_tables,
-                self._qo_indptr_device,
-                self._kv_lens_device,
-                self._q_packed_scratch,
-                self._q_scales_scratch,
-                self._partial,
-                self._split_m,
-                self._split_l,
-                self._out_scratch,
-                self._out_group,
-                self._workspace_buffer,
-                self._physical_kv_len,
-                float(run_k_scale),
-                float(run_v_scale),
-                kv_head,
-                self._split_kv_tiles,
-                self._group_size,
-                self._causal,
-                self._window_left,
-                self._logits_soft_cap,
-                self._output_group_span,
-                run_kv_layout_hnd,
-                stream,
-            )
-            out[:, qo_start:qo_stop, :].copy_(
-                self._out_group.view(
-                    self._total_q_len, self._group_size, self._head_dim
-                )
-            )
+        )
 
         return out
 

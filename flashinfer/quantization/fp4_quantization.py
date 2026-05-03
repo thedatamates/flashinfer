@@ -48,6 +48,12 @@ from ..utils import (
 from ..tllm_enums import SfLayout
 
 
+def _current_cuda_stream_handle(tensor: torch.Tensor, stream_handle: int = 0) -> int:
+    if stream_handle != 0 or not tensor.is_cuda:
+        return stream_handle
+    return torch.cuda.current_stream(tensor.device).cuda_stream
+
+
 def _compute_swizzled_layout_sf_size(total_row, total_column, row_size=128):
     padded_row = round_up(total_row, row_size)
     padded_column = round_up(total_column, 4)
@@ -788,6 +794,7 @@ def fp4_quantize(
     assert input.shape[-1] % sf_vec_size == 0
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
+    stream_handle = _current_cuda_stream_handle(input, stream_handle)
     # get input device sm version
     major, minor = get_compute_capability(input.device)
     x_q, sf = get_fp4_quantization_module(f"{major}{minor}").fp4_quantize_sm100(
@@ -1292,6 +1299,7 @@ def nvfp4_quantize_paged_kv_cache(
         v_global_scale: Global scale for V (float), equal to ``1 / v_global_sf``.
     """
     _FLOAT8_E4M3_MAX = 448.0  # torch.finfo(torch.float8_e4m3fn).max
+    stream_handle = _current_cuda_stream_handle(k_cache, stream_handle)
     # Extract dimensions based on layout
     if kv_layout == "NHD":
         num_pages, page_size, num_kv_heads, last_dim = k_cache.shape
@@ -1775,6 +1783,7 @@ def nvfp4_kv_dequantize(
     if K % _NVFP4_BLOCK_SIZE != 0:
         raise ValueError(f"K dimension ({K}) must be divisible by {_NVFP4_BLOCK_SIZE}")
     output = torch.empty((M, K), dtype=output_dtype, device=fp4_data.device)
+    stream_handle = _current_cuda_stream_handle(fp4_data, stream_handle)
     get_fp4_kv_dequantization_module().nvfp4_kv_dequant(
         fp4_data, block_scales, global_scale, output, stream_handle
     )
@@ -1815,6 +1824,7 @@ def nvfp4_kv_quantize(
     block_scales = torch.empty(
         (M, K // _NVFP4_BLOCK_SIZE), dtype=torch.uint8, device=input.device
     )
+    stream_handle = _current_cuda_stream_handle(input, stream_handle)
     get_fp4_kv_quantization_module().nvfp4_kv_quant(
         input, global_scale, fp4_output, block_scales, stream_handle
     )

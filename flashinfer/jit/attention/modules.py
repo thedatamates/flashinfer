@@ -1822,18 +1822,12 @@ def gen_fmha_nvfp4_sm120_module(
 ) -> JitSpec:
     if head_dim not in (128, 256, 512):
         raise ValueError("SM120 NVFP4 FMHA supports head_dim in {128, 256, 512}.")
-    if not v_cache_uses_pv_layout:
-        raise ValueError(
-            "SM120 NVFP4 FMHA JIT modules consume PV-layout V internally. The "
-            "standard vLLM linear paged-KV input layout is converted by "
-            "BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper before launching "
-            "attention."
-        )
     uri = (
         f"fmha_nvfp4_sm120_d{head_dim}_"
         f"causal_{causal}_"
         f"swa_{use_sliding_window}_"
-        f"softcap_{use_logits_soft_cap}"
+        f"softcap_{use_logits_soft_cap}_"
+        f"pv_v_{v_cache_uses_pv_layout}"
     )
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / uri
     os.makedirs(gen_directory, exist_ok=True)
@@ -1847,6 +1841,7 @@ def gen_fmha_nvfp4_sm120_module(
             causal=str(causal).lower(),
             use_sliding_window=str(use_sliding_window).lower(),
             use_logits_soft_cap=str(use_logits_soft_cap).lower(),
+            use_pv_layout_v=str(v_cache_uses_pv_layout).lower(),
         ),
     )
     source_paths = [

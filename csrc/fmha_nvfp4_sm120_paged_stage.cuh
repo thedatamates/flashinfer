@@ -30,7 +30,7 @@ using RawPagedRunFn = cudaError_t (*)(
     float logits_soft_cap, int q_rows, int kv_len, cudaStream_t stream,
     PagedParams paged_params, const int32_t* qo_indptr,
     const int32_t* kv_lens, int batch_size, int q_tiles_per_sequence,
-    bool skip_internal_combine);
+    int num_kv_heads, bool all_kv_heads, bool skip_internal_combine);
 
 using RawDenseRunFn = cudaError_t (*)(
     uint8_t* q_packed, uint8_t* q_scales, uint8_t* k_packed,

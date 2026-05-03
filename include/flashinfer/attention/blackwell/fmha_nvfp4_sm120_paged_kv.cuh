@@ -2,6 +2,7 @@
 
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_quantization.cuh>
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -36,11 +37,48 @@ struct Sm120Nvfp4PagedKvLoadParams {
   int packed_dim = 0;
   int scale_dim = 0;
   int kv_layout_hnd = 0;
+  int v_scale_layout = 0;
+  const __nv_bfloat16* q_bf16 = nullptr;
+  int64_t q_stride_token = 0;
+  int64_t q_stride_head = 0;
+  int64_t q_stride_dim = 0;
+  int64_t q_stride_row = 0;
+  int q_is_3d = 1;
 
   __device__ __forceinline__ bool enabled() const {
     return block_table != nullptr;
   }
 };
+
+__device__ __forceinline__ float sm120_nvfp4_paged_q_bf16_value(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int q_begin,
+    int local_row,
+    int group_size,
+    int num_kv_heads,
+    bool all_kv_heads,
+    int dim) {
+  const int token_offset = local_row / group_size;
+  const int group_offset = local_row - token_offset * group_size;
+  if (params.q_is_3d) {
+    const int head =
+        (all_kv_heads ? params.kv_head * group_size : 0) + group_offset;
+    const int token = q_begin + token_offset;
+    const int64_t src =
+        static_cast<int64_t>(token) * params.q_stride_token +
+        static_cast<int64_t>(head) * params.q_stride_head +
+        static_cast<int64_t>(dim) * params.q_stride_dim;
+    return __bfloat162float(params.q_bf16[src]);
+  }
+  const int row =
+      all_kv_heads
+          ? (q_begin + token_offset) * (num_kv_heads * group_size) +
+                params.kv_head * group_size + group_offset
+          : q_begin * group_size + local_row;
+  const int64_t src = static_cast<int64_t>(row) * params.q_stride_row +
+                      static_cast<int64_t>(dim) * params.q_stride_dim;
+  return __bfloat162float(params.q_bf16[src]);
+}
 
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_k_code(
     const Sm120Nvfp4PagedKvLoadParams& params,
@@ -106,6 +144,24 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_k_scale(
   return params.k_scales[src];
 }
 
+__device__ __forceinline__ int sm120_nvfp4_linear_scale_token(
+    int token, int scale_col, int scale_dim, int scale_layout) {
+  if (scale_layout == 0) {
+    const int scale_group = scale_dim / 4;
+    return (token / 4) * 4 + (scale_col / scale_group);
+  }
+  return token;
+}
+
+__device__ __forceinline__ int sm120_nvfp4_linear_scale_col(
+    int token, int scale_col, int scale_dim, int scale_layout) {
+  if (scale_layout == 0) {
+    const int scale_group = scale_dim / 4;
+    return (scale_col % scale_group) * 4 + (token & 3);
+  }
+  return scale_col;
+}
+
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int logical_token,
@@ -116,6 +172,22 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code(
   const int packed_col = dim >> 1;
   const int nibble_shift = (dim & 1) * 4;
   const int64_t src =
+      static_cast<int64_t>(physical_page) * params.v_stride_page +
+      static_cast<int64_t>(page_offset) * params.v_stride_dim1 +
+      static_cast<int64_t>(params.kv_head) * params.v_stride_dim2 +
+      static_cast<int64_t>(packed_col) * params.v_stride_dim3;
+  const uint8_t byte = params.v_pages[src];
+  return static_cast<uint8_t>((byte >> nibble_shift) & 0x0f);
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_linear_code_pair(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_token,
+    int packed_col) {
+  const int logical_page = logical_token / params.page_size;
+  const int page_offset = logical_token - logical_page * params.page_size;
+  const int physical_page = params.block_table[logical_page];
+  const int64_t src =
       params.kv_layout_hnd
           ? (static_cast<int64_t>(physical_page) * params.v_stride_page +
              static_cast<int64_t>(params.kv_head) * params.v_stride_dim1 +
@@ -125,8 +197,45 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code(
              static_cast<int64_t>(page_offset) * params.v_stride_dim1 +
              static_cast<int64_t>(params.kv_head) * params.v_stride_dim2 +
              static_cast<int64_t>(packed_col) * params.v_stride_dim3);
-  const uint8_t byte = params.v_pages[src];
-  return static_cast<uint8_t>((byte >> nibble_shift) & 0x0f);
+  return params.v_pages[src];
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_linear_scale(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_token,
+    int scale_col) {
+  const int logical_page = logical_token / params.page_size;
+  const int page_offset = logical_token - logical_page * params.page_size;
+  const int physical_page = params.block_table[logical_page];
+  const int stored_token = sm120_nvfp4_linear_scale_token(
+      page_offset, scale_col, params.scale_dim, params.v_scale_layout);
+  const int stored_scale_col = sm120_nvfp4_linear_scale_col(
+      page_offset, scale_col, params.scale_dim, params.v_scale_layout);
+  const int64_t src =
+      params.kv_layout_hnd
+          ? (static_cast<int64_t>(physical_page) * params.v_scale_stride_page +
+             static_cast<int64_t>(params.kv_head) * params.v_scale_stride_dim1 +
+             static_cast<int64_t>(stored_token) * params.v_scale_stride_dim2 +
+             static_cast<int64_t>(stored_scale_col) * params.v_scale_stride_dim3)
+          : (static_cast<int64_t>(physical_page) * params.v_scale_stride_page +
+             static_cast<int64_t>(stored_token) * params.v_scale_stride_dim1 +
+             static_cast<int64_t>(params.kv_head) * params.v_scale_stride_dim2 +
+             static_cast<int64_t>(stored_scale_col) * params.v_scale_stride_dim3);
+  return params.v_scales[src];
+}
+
+__device__ __forceinline__ float sm120_nvfp4_paged_v_linear_value(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int logical_token,
+    int dim) {
+  const int packed_col = dim >> 1;
+  const uint8_t packed =
+      sm120_nvfp4_paged_v_linear_code_pair(params, logical_token, packed_col);
+  const uint8_t code =
+      static_cast<uint8_t>((packed >> ((dim & 1) * 4)) & 0x0f);
+  const uint8_t scale_byte =
+      sm120_nvfp4_paged_v_linear_scale(params, logical_token, dim >> 4);
+  return e2m1_code_to_fp32(code) * e4m3_byte_to_fp32(scale_byte);
 }
 
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_pv_scale(
