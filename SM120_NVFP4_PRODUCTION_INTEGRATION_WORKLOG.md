@@ -1777,3 +1777,148 @@ Next viable choices:
   and stores the transposed CUTLASS PV operand layout without per-codepoint
   block-table lookup. That is the closest way to keep the current public PV
   shape while attacking the same bottleneck structurally.
+
+## 2026-05-03 17:02 CDT - Reference Audit For Linear-V Producer
+
+Reference: `include/flashinfer/attention/hopper/sparse_mainloop.cuh`
+
+- Load primitive: `cutlass::arch::cp_async_zfill<sizeof(Vec),
+  cutlass::arch::CacheOperation::Global>`.
+- Block-table walk granularity: per KV position row in `prefetch_kv_offset`,
+  stored in a register rolling buffer and reused by shuffle in
+  `load_kv_with_gather`. The block table is not touched per element.
+- Partial-page / OOB handling: `valid_read` controls whether the row offset is
+  populated; `guard` predicates the cp.async zfill load for tail rows.
+- Direct quote:
+
+```cpp
+// include/flashinfer/attention/hopper/sparse_mainloop.cuh:294
+if (valid_read) {
+  // Use divmod to find page and offset within page
+  uint32_t page_iter, entry_idx;
+  mainloop_params.page_size.divmod(kv_idx_read, page_iter, entry_idx);
+  IdType page_idx = kv_indices_ptr[page_iter];
+  // Pre-compute: page_idx * page_stride + entry_idx * stride_n
+  my_kv_offset[parity] = page_idx * k_page_stride + entry_idx * k_stride_n;
+} else {
+  my_kv_offset[parity] = 0;
+}
+
+// include/flashinfer/attention/hopper/sparse_mainloop.cuh:329
+int src_thread = group_id * THREADS_PER_GROUP + kv_offset / KV_STRIDE;
+int64_t base_offset = __shfl_sync(FULL_MASK, my_kv_offset[parity], src_thread);
+
+// Final address: base_ptr + base_offset + d_idx
+// where base_offset = page_idx * page_stride + entry_idx * stride_n
+Vec const* src_ptr = reinterpret_cast<Vec const*>(base_ptr + base_offset + d_idx);
+cutlass::arch::cp_async_zfill<sizeof(Vec), cutlass::arch::CacheOperation::Global>(
+    &dst(i), src_ptr, guard);
+```
+
+Reference: `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h`
+
+- Load primitive: `Ldgsts_helper<USE_LDGSTS>::load`, which dispatches LDGSTS /
+  cp.async-style staging when enabled and otherwise uses the fallback LDG path.
+- Block-table walk granularity: per `row_idx` in the `LDGS` loop. The code
+  computes one page base pointer per row, then builds `ptrs[ii]` for the row
+  vector load.
+- Partial-page / OOB handling: `preds[ii]` requires `row_idx < actual_seqlen_`
+  and `col_in_bytes_ < VALID_BYTES_PER_ROW`; the load helper consumes those
+  predicates.
+- Direct quote:
+
+```cpp
+// csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1281
+for (int ii = 0; ii < LDGS; ++ii) {
+  int row_idx = row_ + ii * (int)ROWS_PER_LDG;
+  int paged_kv_block_idx = (row_idx >> paged_kv_log2_block_size_);
+  char const* local_kv_ptr = reinterpret_cast<char*>(
+      paged_kv_block_pool_ptr_ +
+      params_kv_block_size_in_bytes_ * paged_kv_global_block_offsets_[paged_kv_block_idx]);
+
+  // Predicates.
+  // TODO: do we need to make sure row_idx < ROWS ?
+  preds[ii] = row_idx < actual_seqlen_;
+  preds[ii] &= col_in_bytes_ < VALID_BYTES_PER_ROW;
+
+  // Pointers.
+  int row_idx_in_block = row_idx & ((1 << paged_kv_log2_block_size_) - 1);
+  ptrs[ii] =
+      local_kv_ptr + head_col_in_bytes + (int64_t)row_idx_in_block * token_stride_in_bytes_;
+
+}
+
+// csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1300
+// Trigger LDGSTS or the LDGs.
+// The predicates protect against out-of-bound access in rows and cols
+Ldgsts_helper<USE_LDGSTS>::load(this, smem_tile, ptrs, preds);
+```
+
+Reference: `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d128.cuh`
+
+- Load primitive: `cp_async::pred_load_32b` for each 8-nibble / 4-byte K
+  partition.
+- Block-table walk granularity: per packed 4-byte K word. The D128 producer
+  validates that the CUTLASS B smem partition maps 8 adjacent K nibbles to one
+  4-byte destination, then delegates the page-table walk to
+  `sm120_nvfp4_paged_k_word_ptr`.
+- Partial-page / OOB handling: `in_bounds = token < kv_len_tokens`; out-of-range
+  words use `kFillZero` through predicated cp.async.
+- Direct quote:
+
+```cpp
+// include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d128.cuh:829
+const int token = kv_tile * kCutlassTileN + row0;
+const int dim0 = k_outer * kCutlassTileK + k0;
+#pragma unroll
+for (int j = 0; j < 8; ++j) {
+  auto coord = coord_tensor(i + j);
+  auto ref = dst(i + j);
+  uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
+  const int row = int(cute::get<0>(coord));
+  const int k = int(cute::get<1>(coord));
+  // CUTLASS B smem must colocate the 8 logical K nibbles in 4 bytes.
+  if (row != row0 || k != k0 + j ||
+      dst_byte != dst0 + (j >> 1)) {
+    asm volatile("trap;\n");
+  }
+}
+const bool in_bounds = token < kv_len_tokens;
+const uint32_t* src =
+    in_bounds
+        ? sm120_nvfp4_paged_k_word_ptr(paged_kv_params, token,
+                                       dim0)
+        : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
+cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
+    reinterpret_cast<uint32_t*>(dst0), src, in_bounds);
+
+// include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:110
+const int logical_page = logical_token / params.page_size;
+const int page_offset = logical_token - logical_page * params.page_size;
+const int physical_page = params.block_table[logical_page];
+const int packed_col = dim >> 1;
+const int64_t src =
+    params.kv_layout_hnd
+        ? (static_cast<int64_t>(physical_page) * params.k_stride_page +
+           static_cast<int64_t>(params.kv_head) * params.k_stride_dim1 +
+           static_cast<int64_t>(page_offset) * params.k_stride_dim2 +
+           static_cast<int64_t>(packed_col) * params.k_stride_dim3)
+        : (static_cast<int64_t>(physical_page) * params.k_stride_page +
+           static_cast<int64_t>(page_offset) * params.k_stride_dim1 +
+           static_cast<int64_t>(params.kv_head) * params.k_stride_dim2 +
+           static_cast<int64_t>(packed_col) * params.k_stride_dim3);
+return reinterpret_cast<const uint32_t*>(params.k_pages + src);
+```
+
+Adoption pattern for linear-V:
+
+- The public linear-V tensor is dim-contiguous, while the CUTLASS PV operand
+  partition consumes 8 token-contiguous FP4 nibbles for one output column. That
+  rules out direct gmem-to-operand cp.async for linear-V without an intermediate
+  transpose/reblock stage. The safe no-smem-cost pattern to adopt is the row
+  base hoist from the Hopper and fmha_v2 references: compute page/table/row base
+  once per logical token row or 16-token page group, reuse that base for all
+  scalar byte loads needed by the fp32 dequant/requant path, and keep the
+  existing partition-derived CUTLASS destination stores. This preserves the
+  public tensor shape and removes per-codepoint block-table/divmod work before
+  considering a staging-smem rewrite.
