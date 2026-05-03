@@ -1217,6 +1217,118 @@ def test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x(head_dim, group):
     torch.testing.assert_close(out, expected, rtol=0, atol=multi_kv_atol)
 
 
+def test_sm120_nvfp4_wrapper_scratch_poison_does_not_affect_output_sm12x():
+    _requires_sm12x_nvfp4()
+    torch.cuda.synchronize()
+
+    device = torch.device("cuda")
+    head_dim = 256
+    group = 6
+    page_size = 16
+    q_lens = [128, 96]
+    kv_lens = [1024, 768]
+    num_kv_heads = 2
+    num_qo_heads = group * num_kv_heads
+    pages_per_seq = [(kv_len + page_size - 1) // page_size for kv_len in kv_lens]
+    total_pages = sum(pages_per_seq)
+    table_width = max(pages_per_seq)
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(120777)
+    q_base = (
+        torch.randn(
+            (sum(q_lens), num_qo_heads + 1, head_dim),
+            device=device,
+            generator=gen,
+        )
+        / 4
+    ).to(torch.bfloat16)
+    q = q_base[:, :num_qo_heads, :]
+    assert not q.is_contiguous()
+    assert q.stride(-1) == 1
+
+    k = (
+        torch.randn(
+            (total_pages, page_size, num_kv_heads, head_dim),
+            device=device,
+            generator=gen,
+        )
+        / 4
+    ).to(torch.bfloat16)
+    v = (
+        torch.randn(
+            (total_pages, page_size, num_kv_heads, head_dim),
+            device=device,
+            generator=gen,
+        )
+        / 4
+    ).to(torch.bfloat16)
+
+    block_tables = torch.full(
+        (len(q_lens), table_width), -1, dtype=torch.int32, device=device
+    )
+    page_cursor = 0
+    for batch_idx, pages in enumerate(pages_per_seq):
+        block_tables[batch_idx, :pages] = torch.arange(
+            page_cursor, page_cursor + pages, dtype=torch.int32, device=device
+        )
+        page_cursor += pages
+
+    qo_indptr = torch.tensor(
+        [0, q_lens[0], sum(q_lens)], dtype=torch.int32, device="cpu"
+    )
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32, device="cpu")
+    (k_fp4, v_fp4), (k_sf, v_sf), k_scale, v_scale = (
+        nvfp4_quantize_paged_kv_cache(
+            k, v, "NHD", v_data_layout="pv", v_scale_layout="pv"
+        )
+    )
+    torch.cuda.synchronize()
+
+    workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
+    wrapper = BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper(workspace)
+    wrapper.plan(
+        qo_indptr,
+        block_tables,
+        kv_lens_t,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        causal=True,
+        window_left=512,
+        logits_soft_cap=50.0,
+        split_kv_len=512,
+    )
+
+    def poison_scratch(seed: int) -> None:
+        byte_value = (seed * 37) & 0xFF
+        wrapper._workspace_buffer.fill_(byte_value)
+        wrapper._q_packed.fill_((byte_value + 1) & 0xFF)
+        wrapper._q_scales.fill_((byte_value + 2) & 0xFF)
+        wrapper._q_packed_scratch.fill_((byte_value + 3) & 0xFF)
+        wrapper._q_scales_scratch.fill_((byte_value + 4) & 0xFF)
+        wrapper._partial.fill_(float(seed))
+        wrapper._split_m.fill_(float(seed))
+        wrapper._split_l.fill_(float(seed))
+        wrapper._out_scratch.fill_(float(seed))
+        wrapper._out_group.fill_(float(seed))
+
+    poison_scratch(1)
+    out_a = wrapper.run(
+        q, (k_fp4, v_fp4), (k_sf, v_sf), k_scale=k_scale, v_scale=v_scale
+    )
+    torch.cuda.synchronize()
+    poison_scratch(7)
+    out_b = wrapper.run(
+        q, (k_fp4, v_fp4), (k_sf, v_sf), k_scale=k_scale, v_scale=v_scale
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(out_a.float()).all()
+    assert torch.isfinite(out_b.float()).all()
+    torch.testing.assert_close(out_a, out_b, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("head_dim,group", [(128, 4), (256, 6), (512, 4)])
 def test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x(
     head_dim, group

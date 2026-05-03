@@ -714,7 +714,9 @@ static void RunPagedBatchBf16QImpl(
     int64_t sliding_window, double logits_soft_cap,
     int64_t output_group_span, bool kv_layout_hnd, int64_t v_scale_layout,
     int64_t stream_handle) {
-  CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
+  CHECK_CUDA(q);
+  TVM_FFI_ICHECK_EQ(q.dtype(), dl_bfloat16)
+      << "Inconsistency of Tensor type: q";
   CHECK_INPUT_AND_TYPE(q_packed_scratch, dl_uint8);
   CHECK_INPUT_AND_TYPE(q_scales_scratch, dl_uint8);
   CHECK_INPUT_AND_TYPE(block_tables, dl_int32);
@@ -722,7 +724,8 @@ static void RunPagedBatchBf16QImpl(
   CheckCudaTypeLastDimContiguous(k_pages, dl_uint8, "k_pages");
   TVM_FFI_ICHECK(q.ndim() == 2 || q.ndim() == 3)
       << "q must have shape [rows, D] or [q_len, heads, D]";
-  CheckCudaTypeLastDimContiguous(q, dl_bfloat16, "q");
+  TVM_FFI_ICHECK_EQ(q.stride(q.ndim() - 1), 1)
+      << "q must be contiguous in the last dimension";
   CHECK_DIM(2, q_packed_scratch);
   CHECK_DIM(2, q_scales_scratch);
   CHECK_DIM(2, block_tables);

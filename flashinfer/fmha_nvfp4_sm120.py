@@ -93,6 +93,24 @@ def _as_uint8_scale(scale: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _check_cuda_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    dtype: torch.dtype,
+    device: torch.device,
+    require_last_dim_contiguous: bool = True,
+) -> None:
+    if tensor.dtype != dtype or not tensor.is_cuda:
+        raise ValueError(f"{name} must be a CUDA {dtype} tensor.")
+    if tensor.device != device:
+        raise ValueError(f"{name} must be on device {device}, got {tensor.device}.")
+    if tensor.ndim == 0:
+        raise ValueError(f"{name} must have at least one dimension.")
+    if require_last_dim_contiguous and tensor.stride(-1) != 1:
+        raise ValueError(f"{name} must be contiguous in the last dimension.")
+
+
 class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
     r"""SM120 NVFP4 paged prefill wrapper for BF16 Q/O and NVFP4 KV.
 
@@ -152,6 +170,10 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             raise ValueError("num_qo_heads must be divisible by num_kv_heads.")
         if split_kv_len <= 0 or split_kv_len % 128 != 0:
             raise ValueError("split_kv_len must be a positive multiple of 128.")
+        if window_left < -1 or window_left == 0:
+            raise ValueError(
+                "window_left must be -1 to disable SWA or a positive window size."
+            )
         if output_group_span is None:
             output_group_span = _default_output_group_span(head_dim)
         if output_group_span not in (1, 2, 4):
@@ -163,12 +185,26 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         if v_cache_uses_pv_layout and self._kv_layout != "NHD":
             raise ValueError("PV-layout V cache is currently supported only with NHD layout.")
 
+        if qo_indptr.dtype != torch.int32:
+            raise ValueError("qo_indptr must have dtype torch.int32.")
+        if qo_indptr.ndim != 1:
+            raise ValueError("qo_indptr must have shape [batch_size + 1].")
         if qo_indptr.numel() < 2:
             raise ValueError("qo_indptr must have shape [batch_size + 1].")
         if block_tables.dtype != torch.int32 or not block_tables.is_cuda:
             raise ValueError("block_tables must be a CUDA torch.int32 tensor.")
+        if block_tables.device != self.device:
+            raise ValueError(
+                f"block_tables must be on device {self.device}, got {block_tables.device}."
+            )
+        if block_tables.ndim != 2:
+            raise ValueError("block_tables must have shape [batch_size, max_pages].")
+        if block_tables.stride(1) != 1:
+            raise ValueError("block_tables must be contiguous in the page dimension.")
         if kv_lens.dtype != torch.int32:
             raise ValueError("kv_lens must have dtype torch.int32.")
+        if kv_lens.ndim != 1:
+            raise ValueError("kv_lens must have shape [batch_size].")
 
         qo_cpu = qo_indptr.to("cpu", dtype=torch.int64)
         kv_cpu = kv_lens.to("cpu", dtype=torch.int64)
@@ -176,15 +212,28 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         batch_size = int(qo_cpu.numel() - 1)
         if int(kv_cpu.numel()) != batch_size:
             raise ValueError("kv_lens must have one entry per sequence.")
+        if int(block_cpu.shape[0]) != batch_size:
+            raise ValueError("block_tables must have one row per sequence.")
 
         q_lens = qo_cpu[1:] - qo_cpu[:-1]
         if torch.any(q_lens < 0):
             raise ValueError("qo_indptr must be non-decreasing.")
         if torch.any(kv_cpu <= 0):
             raise ValueError("kv_lens entries must be positive.")
-        valid_pages = block_cpu[block_cpu >= 0]
-        if valid_pages.numel() == 0:
-            raise ValueError("block_tables must contain at least one physical page.")
+        required_pages = torch.div(
+            kv_cpu + page_size - 1, page_size, rounding_mode="floor"
+        )
+        if torch.any(required_pages > block_cpu.shape[1]):
+            raise ValueError("block_tables rows do not cover kv_lens.")
+        active_blocks = [
+            block_cpu[batch_idx, : int(required_pages[batch_idx].item())]
+            for batch_idx in range(batch_size)
+        ]
+        active_pages = (
+            torch.cat(active_blocks) if active_blocks else block_cpu.new_empty((0,))
+        )
+        if active_pages.numel() == 0 or torch.any(active_pages < 0):
+            raise ValueError("block_tables must contain valid page indices for every KV token.")
 
         self._qo_indptr = qo_indptr
         self._qo_indptr_device = qo_indptr.to(
@@ -199,7 +248,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         self._total_q_len = int(qo_cpu[-1].item())
         self._max_q_len = int(q_lens.max().item()) if batch_size > 0 else 0
         self._max_kv_len = int(kv_cpu.max().item()) if batch_size > 0 else 0
-        self._max_physical_pages = int(valid_pages.max().item()) + 1
+        self._max_physical_pages = int(active_pages.max().item()) + 1
         self._num_qo_heads = int(num_qo_heads)
         self._num_kv_heads = int(num_kv_heads)
         self._group_size = int(num_qo_heads // num_kv_heads)
@@ -273,6 +322,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             raise RuntimeError("SM120 NVFP4 module was not initialized by plan().")
         if q.dtype != torch.bfloat16 or not q.is_cuda:
             raise ValueError("q must be a CUDA torch.bfloat16 tensor.")
+        if q.device != self.device:
+            raise ValueError(f"q must be on device {self.device}, got {q.device}.")
         if q.shape != (
             self._total_q_len,
             self._num_qo_heads,
@@ -283,11 +334,31 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 f"({self._total_q_len}, {self._num_qo_heads}, {self._head_dim}), "
                 f"got {tuple(q.shape)}."
             )
+        if q.stride(-1) != 1:
+            raise ValueError("q must be contiguous in the last dimension.")
 
         k_pages, v_pages_input = paged_kv_cache
         k_sf_pages, v_sf_pages_input = kv_cache_sf
+        _check_cuda_tensor(
+            k_pages, name="k_pages", dtype=torch.uint8, device=self.device
+        )
+        _check_cuda_tensor(
+            v_pages_input, name="v_pages", dtype=torch.uint8, device=self.device
+        )
         k_sf_pages_u8 = _as_uint8_scale(k_sf_pages)
         v_sf_pages_input_u8 = _as_uint8_scale(v_sf_pages_input)
+        _check_cuda_tensor(
+            k_sf_pages_u8,
+            name="k scale pages",
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        _check_cuda_tensor(
+            v_sf_pages_input_u8,
+            name="V scale pages",
+            dtype=torch.uint8,
+            device=self.device,
+        )
         if v_cache_sf_layout not in ("trtllm_interleaved", "linear", "pv"):
             raise ValueError(
                 "v_cache_sf_layout must be 'trtllm_interleaved', 'linear', or 'pv'."
@@ -317,6 +388,10 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             )
         if v_pages_input.shape != k_pages.shape:
             raise ValueError("V pages must have the same shape as K pages.")
+        if k_pages.shape[0] < self._max_physical_pages:
+            raise ValueError(
+                "paged_kv_cache has fewer physical pages than block_tables reference."
+            )
         expected_sf_shape = (
             (k_pages.shape[0], self._num_kv_heads, self._page_size, self._head_dim // 16)
             if self._kv_layout == "HND"
@@ -333,11 +408,6 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 f"got {tuple(v_sf_pages_input_u8.shape)}."
             )
 
-        if not self._v_cache_uses_pv_layout:
-            if k_pages.shape[0] < self._max_physical_pages:
-                raise ValueError(
-                    "paged_kv_cache has fewer physical pages than block_tables reference."
-                )
         run_kv_layout_hnd = (
             False if self._v_cache_uses_pv_layout else self._kv_layout == "HND"
         )
@@ -353,9 +423,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             check_shape_dtype_device(out, q.shape, torch.bfloat16, q.device, "out")
 
         stream = torch.cuda.current_stream(q.device).cuda_stream
-        q_run = q if q.is_contiguous() else q.contiguous()
         self._module.paged_run_bf16_q(
-            q_run,
+            q,
             self._q_packed,
             self._q_scales,
             k_pages,

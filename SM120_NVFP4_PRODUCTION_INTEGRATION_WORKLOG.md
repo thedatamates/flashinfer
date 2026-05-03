@@ -1280,3 +1280,98 @@ Interpretation:
 - D512 cold compile remains materially slow even after removing the probe
   templates; compile-time reduction is still an open area separate from this
   cleanup.
+
+## 2026-05-02 22:45 CDT — SM120 NVFP4 Silent-Failure Risk Audit
+
+Audit target:
+
+- Reviewed a list of remaining "silent correctness/perf" risks after the
+  production cleanup pass:
+  - Hidden Q contiguity copy in the Python wrapper.
+  - Scratch residue in `_workspace_buffer`, Q scratch, split-KV partial/stat
+    buffers, and output scratch.
+  - Block-table/page-layout mistakes that could otherwise surface only as
+    kernel traps or arbitrary memory reads.
+  - Sliding-window disabled state (`window_left=-1`) vs active-SWA state.
+  - Stream plumbing and bridge-era scratch clear assumptions.
+
+Findings:
+
+- The defensive `_partial`, `_split_m`, `_split_l`, `_out_scratch`, and
+  `_out_group` clears had already been removed in the cleanup commit, so that
+  part of the risk list was stale.
+- The SM120 NVFP4 FFI path already uses an explicit stream handle from
+  `torch.cuda.current_stream(...).cuda_stream`; it no longer relies on
+  `get_stream(...)` for the paged BF16-Q path.
+- CUTLASS workspace residue is handled inside the D128/D256/D512 launchers:
+  each launch zeros the required CUTLASS workspace range with `cudaMemsetAsync`
+  before initializing QK/PV workspaces.
+- The paged split-KV combine reads the current per-sequence `num_splits`, not
+  the maximum split count, so it does not intentionally reduce unwritten split
+  slots.
+- The remaining real issues were wrapper/FFI contract clarity:
+  - Python silently copied non-contiguous Q with `q.contiguous()`.
+  - The C++ FFI check still required full Q contiguity even though the BF16-Q
+    kernel path carries Q strides and only needs last-dimension contiguity.
+  - `block_tables` validation did not explicitly require 2-D,
+    page-dimension-contiguous rows, per-sequence coverage for `kv_lens`, or
+    non-negative active page entries before the FFI call.
+  - Physical page-count validation only ran for the linear-V path; PV-layout V
+    should fail early too if `block_tables` references pages beyond the cache.
+
+Changes:
+
+- Removed the hidden Python `q.contiguous()` copy. The wrapper now passes the
+  user's Q tensor directly and requires only last-dimension contiguity.
+- Relaxed the BF16-Q FFI entry from full `CHECK_INPUT_AND_TYPE(q, dl_bfloat16)`
+  contiguity to CUDA/dtype plus last-dimension-contiguous validation, matching
+  the stride-aware kernel path.
+- Added Python-side validation for:
+  - `window_left == -1` or positive; `0` and less than `-1` now fail.
+  - `qo_indptr` dtype/shape.
+  - `kv_lens` dtype/shape.
+  - `block_tables` dtype/device/shape, page-dimension contiguity, row count,
+    active page coverage, and non-negative active page IDs.
+  - K/V and scale tensor device/dtype/last-dimension contiguity.
+  - Unconditional physical page count coverage for both PV-layout and
+    linear-V paths.
+- Added `test_sm120_nvfp4_wrapper_scratch_poison_does_not_affect_output_sm12x`:
+  - Uses D256/group=6 with multi-KV, ragged Q, split-KV (`split_kv_len=512`),
+    and a non-contiguous Q view whose last dimension is contiguous.
+  - Poisons `_workspace_buffer`, `_q_packed`, `_q_scales`,
+    `_q_packed_scratch`, `_q_scales_scratch`, `_partial`, `_split_m`,
+    `_split_l`, `_out_scratch`, and `_out_group` with different values before
+    repeated runs.
+  - Asserts bit-exact output equality across the poisoned runs.
+
+Validation:
+
+- First run of the new scratch-poison test failed because the C++ FFI still
+  required full Q contiguity:
+  - Failure site: `RunPagedBatchBf16QImpl`, `CHECK_INPUT_AND_TYPE(q,
+    dl_bfloat16)`.
+  - Fix: replace that full-contiguity check with CUDA/dtype and
+    last-dimension-contiguous checks.
+- Re-ran the new scratch-poison test:
+  - Result: `1 passed in 88.42s`.
+- Ran focused wrapper validation:
+  - `test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x`
+  - `test_sm120_nvfp4_wrapper_scratch_poison_does_not_affect_output_sm12x`
+  - `test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x`
+  - `test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x`
+  - Result: `10 passed in 1224.48s`.
+  - Runtime was dominated by cold `ptxas` for
+    `fmha_nvfp4_sm120_d512_causal_True_swa_True_softcap_True_pv_v_False`.
+- Ran the full SM120 NVFP4 attention test file with the warmed cache:
+  - Result: `36 passed in 2.07s`.
+
+Interpretation:
+
+- The wrapper no longer hides a full Q memcpy. If the caller provides an
+  unsupported Q layout, the wrapper raises instead of silently copying.
+- Scratch-residue coverage is now explicitly tested across the global scratch
+  surfaces that were not covered by the smem wrapper work.
+- The active block-table/page validation turns several possible kernel-trap or
+  arbitrary-read cases into Python-side errors.
+- The D512 linear-V cold-compile cliff remains unchanged; this audit targeted
+  correctness/perf-silent behavior, not ptxas time.
