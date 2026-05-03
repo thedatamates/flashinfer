@@ -1959,3 +1959,50 @@ target. Paged-linear remains 2.09x slower than paged-PV at the reference cell,
 so the residual bottleneck is still the linear-V reblock path rather than just
 page-table lookup granularity. Path B needs a smem budget audit before any
 staging-smem implementation.
+
+## 2026-05-03 18:04 CDT - Path B Smem Budget Audit
+
+Path B proposal:
+
+- Add a staging region for row-major V loads before packing into the CUTLASS PV
+  operand.
+- Required staging size per stage: `kCutlassTileN * head_dim / 2` bytes.
+- SM120 opt-in budget used by the kernel static asserts: 99 KiB = 101376 bytes.
+
+Measured with a throwaway host compile that includes the three production
+headers and prints `sizeof(Sm120Nvfp4QkvLoadCollectiveStorage)`:
+
+| head_dim | current smem bytes | slack bytes | staging bytes | current + staging |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 66560 | 34816 | 8192 | 74752 |
+| 256 | 50176 | 51200 | 16384 | 66560 |
+| 512 | 96256 | 5120 | 32768 | 129024 |
+
+Result:
+
+- D128 and D256 have enough unused smem for the proposed staging region.
+- D512 does not. Adding the required 32768-byte staging tile would exceed the
+  99 KiB budget by 27648 bytes.
+
+Alias audit for D512:
+
+- `qk_tensors.smem_B` is aliased as `smem_logits0` and `smem_epilogue_o`.
+  The load warp preloads V while MMA warps consume QK logits/PV and while the
+  epilogue role later consumes O, so this region is not a safe V staging alias
+  without restructuring the producer/consumer schedule.
+- `qk_tensors.smem_A` and `qk_tensors.smem_SFA` are reused as P/P-scale stages
+  for PV and are live across the same tile loop that consumes staged V.
+- `v_smem_B` and `v_smem_SFB` are the CUTLASS PV operand and scale operand
+  consumed by the PV MMA pipeline; using them as a row-major staging tile would
+  clobber the data the consumer expects.
+- Pipeline/stat storage has only small fixed buffers and cannot hold a
+  `128 * 512 / 2 = 32768` byte V staging tile.
+
+Conclusion:
+
+The Path B full-tile staging-smem design is not legal for the D512 production
+kernel without a larger schedule/storage restructure, smaller tile shape, or a
+new aliasing scheme that serializes V staging against QK/logits/P/O use. Because
+D512 is the reference production cell and the task requires all head dims with
+no public layout change, implementing D128/D256-only staging would introduce a
+head-dim fallback split and leave the production blocker unresolved.
