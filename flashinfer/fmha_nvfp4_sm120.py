@@ -333,32 +333,19 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 f"got {tuple(v_sf_pages_input_u8.shape)}."
             )
 
-        if self._v_cache_uses_pv_layout:
-            run_k_pages = k_pages
-            run_k_sf_pages_u8 = k_sf_pages_u8
-            run_v_pages_pv = v_pages_input
-            run_v_sf_pages_pv_u8 = v_sf_pages_input_u8
-            run_kv_layout_hnd = False
-            run_k_scale = float(k_scale)
-            run_v_scale = float(v_scale)
-            v_scale_layout_code = 0
-        else:
-            if v_cache_sf_layout == "pv":
-                raise ValueError(
-                    "v_cache_sf_layout='pv' requires v_cache_uses_pv_layout=True."
-                )
+        if not self._v_cache_uses_pv_layout:
             if k_pages.shape[0] < self._max_physical_pages:
                 raise ValueError(
                     "paged_kv_cache has fewer physical pages than block_tables reference."
                 )
-            run_k_pages = k_pages
-            run_k_sf_pages_u8 = k_sf_pages_u8
-            run_v_pages_pv = v_pages_input
-            run_v_sf_pages_pv_u8 = v_sf_pages_input_u8
-            run_kv_layout_hnd = self._kv_layout == "HND"
-            run_k_scale = float(k_scale)
-            run_v_scale = float(v_scale)
-            v_scale_layout_code = 1 if v_cache_sf_layout == "linear" else 0
+        run_kv_layout_hnd = (
+            False if self._v_cache_uses_pv_layout else self._kv_layout == "HND"
+        )
+        v_scale_layout_code = (
+            0
+            if self._v_cache_uses_pv_layout
+            else 1 if v_cache_sf_layout == "linear" else 0
+        )
 
         if out is None:
             out = torch.zeros_like(q)
@@ -367,19 +354,14 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
 
         stream = torch.cuda.current_stream(q.device).cuda_stream
         q_run = q if q.is_contiguous() else q.contiguous()
-        self._partial.zero_()
-        self._split_m.fill_(-float("inf"))
-        self._split_l.zero_()
-        self._out_scratch.zero_()
-        self._out_group.zero_()
         self._module.paged_run_bf16_q(
             q_run,
             self._q_packed,
             self._q_scales,
-            run_k_pages,
-            run_k_sf_pages_u8,
-            run_v_pages_pv,
-            run_v_sf_pages_pv_u8,
+            k_pages,
+            k_sf_pages_u8,
+            v_pages_input,
+            v_sf_pages_input_u8,
             self._block_tables,
             self._qo_indptr_device,
             self._kv_lens_device,
@@ -392,8 +374,8 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             self._out_group,
             self._workspace_buffer,
             self._physical_kv_len,
-            float(run_k_scale),
-            float(run_v_scale),
+            float(k_scale),
+            float(v_scale),
             -1,
             self._split_kv_tiles,
             self._group_size,

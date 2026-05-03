@@ -1223,3 +1223,60 @@ Interpretation:
 - Cold-cache compile time for the D256 linear-V production spec is still above
   the desired 40-90 second envelope; compile-time work remains, even though
   runtime correctness is stable.
+
+## 2026-05-02 22:00 CDT — SM120 NVFP4 Production Cleanup Pass
+
+Cleanup scope:
+
+- Removed the standalone debug GEMM probe infrastructure from the D128/D256/D512
+  production headers:
+  - Deleted `smem_fp4_debug_code`.
+  - Deleted the `cutlass_smem_atom_gemm_tile_body_impl` probe templates.
+  - Deleted the `cutlass_smem_atom_gemm_tile_body` wrappers.
+  - Kept `cutlass_qk_tma_q_register_stage` because it is still used by the
+    production MMA path to stage Q fragments from the Q pipeline.
+- Removed D256-only debug FFI surface:
+  - Deleted the `debug_producer_smem` export.
+  - Deleted the `debug_stage_run` export.
+  - Removed `Sm120Nvfp4D256StageDebugParams` and the kernel-side diagnostic
+    copy plumbing.
+- Removed debug/dev constants that had no remaining production use:
+  - `kDebugHead`.
+  - `kBenchRows`.
+  - `kBenchQTiles`.
+  - Fixed-shape scaffold constants such as `kQLen`, `kGroup`, `kKvLen`,
+    `kPackedHeadDim`, `kScaleCols`, `kQRows`, `kProbPackedCols`,
+    `kProbScaleCols`, `kShapeBMaxKvLen`, `kShapeBMaxKvTiles`, `kSplitKvLen`,
+    and `kNumKvSplits`.
+- Audited producer traps:
+  - Removed the dead `pv_code_for` false-branch trap.
+  - Kept structural invariant traps for 8-nibble partitions, 4-byte smem
+    alignment, byte-pair colocation, and compact P staging contiguity.
+  - Added one-line comments at the kept trap sites explaining the invariant.
+- Cleaned wrapper staging:
+  - Removed duplicate PV scale-layout validation.
+  - Removed `run_*` aliases that were pure renames before the FFI call.
+  - Flattened the PV-vs-linear branch to only compute `run_kv_layout_hnd` and
+    `v_scale_layout_code`.
+  - Removed defensive `_partial.zero_()`, `_split_m.fill_(-inf)`,
+    `_split_l.zero_()`, `_out_scratch.zero_()`, and `_out_group.zero_()`.
+
+Validation:
+
+- Ran the SM120 NVFP4 attention test shard on GPU 2 after the cleanup:
+  - Command shape: `CUDA_VISIBLE_DEVICES=2 ... pytest
+    tests/attention/test_nvfp4_kv_head_dim_512.py -q --tb=short -rs`
+  - Result: `35 passed in 1308.50s`.
+- The long runtime was dominated by cold JIT rebuilds. Process inspection during
+  the run showed `ptxas` compiling the D512 linear-V spec at 99.9% CPU for
+  several minutes.
+
+Interpretation:
+
+- The production headers no longer carry the debug GEMM probe infrastructure or
+  D256 diagnostic FFI plumbing.
+- The wrapper scratch clears are not required by the current correctness suite
+  after covered-smem adoption and full producer/output coverage fixes.
+- D512 cold compile remains materially slow even after removing the probe
+  templates; compile-time reduction is still an open area separate from this
+  cleanup.

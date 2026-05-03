@@ -28,16 +28,8 @@
 
 namespace flashinfer::attention::blackwell::sm120_nvfp4::d256 {
 
-// D256 specialization seed. This starts as the D512 scaffold, but lives in a
-// separate translation unit so we can shrink storage/pipelines without risking
-// the established D512 path.
-constexpr int kQLen = 512;
-constexpr int kGroup = 2;
-constexpr int kKvLen = 32768;
+// SM120 NVFP4 fused attention specialization for D=256 heads.
 constexpr int kHeadDim = 256;
-constexpr int kPackedHeadDim = kHeadDim / 2;
-constexpr int kScaleCols = kHeadDim / 16;
-constexpr int kQRows = kQLen * kGroup;
 constexpr int kTileM = 16;
 constexpr int kTileN = 16;
 constexpr int kCutlassTileM = 64;
@@ -49,16 +41,7 @@ constexpr int kSoftmaxThreadsPerRow = 4;
 constexpr int kQkTileN = kCutlassTileN;
 constexpr int kOutputTileN = 128;
 constexpr int kCutlassTileK128 = 128;
-constexpr int kDebugHead = 0;
-constexpr int kProbPackedCols = kKvLen / 2;
-constexpr int kProbScaleCols = kKvLen / 16;
-constexpr int kShapeBMaxKvLen = 262144;
-constexpr int kShapeBMaxKvTiles = kShapeBMaxKvLen / kCutlassTileN;
 constexpr int kFusedWarpsPerCta = 8;
-constexpr int kSplitKvLen = 1024;
-constexpr int kNumKvSplits = kKvLen / kSplitKvLen;
-constexpr int kBenchRows = 128;
-constexpr int kBenchQTiles = kBenchRows / kTileM;
 constexpr int kColumnGroups = kHeadDim / (kTileN * kFusedWarpsPerCta);
 constexpr float kProbGlobalScale = 6.0f * 448.0f;
 
@@ -397,405 +380,13 @@ struct Sm120Nvfp4QkvLoadCollectiveStorage {
 static_assert(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage) <= (99u << 10),
               "SM120 Q/K/V load collective storage must fit SM120 opt-in shared memory");
 
-struct Sm120Nvfp4D256StageDebugParams {
-  uint8_t* logits = nullptr;
-  uint8_t* p_smem = nullptr;
-  uint8_t* p_sfa = nullptr;
-  uint8_t* o_smem = nullptr;
-  uint8_t* out_store = nullptr;
-  float* stats = nullptr;
-  int32_t* sizes = nullptr;
-  int block_x = -1;
-  int block_y = -1;
-  int block_z = -1;
-  int tile = -1;
-};
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
-__device__ __forceinline__ bool sm120_d256_debug_stage_selected(
-    Sm120Nvfp4D256StageDebugParams debug) {
-  return debug.sizes != nullptr && debug.block_x == int(blockIdx.x) &&
-         debug.block_y == int(blockIdx.y) && debug.block_z == int(blockIdx.z);
-}
-
-__device__ __forceinline__ bool sm120_d256_debug_all_output_ctas(
-    Sm120Nvfp4D256StageDebugParams debug) {
-  return debug.sizes != nullptr && debug.block_x == -2 &&
-         (debug.block_y < 0 || debug.block_y == int(blockIdx.y)) &&
-         (debug.block_z < 0 || debug.block_z == int(blockIdx.z));
-}
-
-__device__ __forceinline__ void sm120_d256_debug_copy_bytes_mma(
-    uint8_t* dst, const void* src, int bytes, int mma_thread_idx) {
-  if (dst == nullptr) {
-    return;
-  }
-  const uint8_t* src_bytes = reinterpret_cast<const uint8_t*>(src);
-  for (int idx = mma_thread_idx; idx < bytes;
-       idx += kSm120Nvfp4FmhaMmaSoftmaxThreadCount) {
-    dst[idx] = src_bytes[idx];
-  }
-}
-
-__device__ __forceinline__ void sm120_d256_debug_copy_floats_mma(
-    float* dst, const float* src, int elems, int mma_thread_idx) {
-  if (dst == nullptr) {
-    return;
-  }
-  for (int idx = mma_thread_idx; idx < elems;
-       idx += kSm120Nvfp4FmhaMmaSoftmaxThreadCount) {
-    dst[idx] = src[idx];
-  }
-}
-
-__device__ __forceinline__ void sm120_d256_debug_copy_bytes_epilogue(
-    uint8_t* dst, const void* src, int bytes, int epilogue_thread_idx) {
-  if (dst == nullptr) {
-    return;
-  }
-  const uint8_t* src_bytes = reinterpret_cast<const uint8_t*>(src);
-  for (int idx = epilogue_thread_idx; idx < bytes;
-       idx += kSm120Nvfp4FmhaOutputThreadCount) {
-    dst[idx] = src_bytes[idx];
-  }
-}
-#endif
-
 __device__ __forceinline__ cutlass::float_ue4m3_t make_ue4m3_raw(uint8_t raw) {
   cutlass::float_ue4m3_t value;
   value.storage = raw;
   return value;
 }
 
-__device__ __forceinline__ uint8_t smem_fp4_debug_code(uint8_t code,
-                                                       int mode) {
-  code &= 0x0f;
-  if (mode == 1) {
-    return static_cast<uint8_t>(code << 2);
-  }
-  if (mode == 2) {
-    return static_cast<uint8_t>(code << 4);
-  }
-  if (mode == 3) {
-    return static_cast<uint8_t>(code | (code << 4));
-  }
-  return code;
-}
-
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
-template <typename Mainloop, typename ThreadBlockShape, int TileM, int TileN,
-          int TileK>
-__device__ __forceinline__ void cutlass_smem_atom_gemm_tile_body_impl(
-    typename Mainloop::TensorStorage& storage,
-    const uint8_t* q_packed,
-    const uint8_t* q_scales,
-    const uint8_t* k_packed,
-    const uint8_t* k_scales,
-    float* out_tile,
-    int q_row_base,
-    int q_col_base,
-    int q_packed_cols,
-    int q_scale_cols,
-    int kv_row_base,
-    int kv_col_base,
-    int kv_packed_cols,
-    int kv_scale_cols,
-    int k_tile_limit,
-    int out_stride,
-    int out_row_base,
-    int out_col_base,
-    int data_debug_mode,
-    int scale_debug_mode) {
-  using cute::_;
-
-  const int block_thread_idx = int(threadIdx.x);
-  const bool mma_thread_active = block_thread_idx < Mainloop::ThreadCount;
-  const int thread_idx = mma_thread_active ? block_thread_idx : 0;
-  auto tiled_mma = typename Mainloop::TiledMma{};
-  auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-  Mainloop collective;
-
-  auto accum = cute::partition_fragment_C(
-      tiled_mma, cute::take<0, 2>(ThreadBlockShape{}));
-  cute::clear(accum);
-
-  constexpr auto kCoveredSmemInitBarrier =
-      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier;
-  using SmemAllocA = typename Mainloop::SmemAllocTypeA;
-  using SmemAllocB = typename Mainloop::SmemAllocTypeB;
-  auto sA_ptr = storage.smem_A.begin();
-  ZeroSmemTile<SmemAllocA, typename Mainloop::SmemLayoutA, decltype(sA_ptr)>
-      sA_covered(sA_ptr, typename Mainloop::SmemLayoutA{}, blockDim.x,
-                 kCoveredSmemInitBarrier);
-  auto sA = sA_covered.tensor();
-  auto sB_ptr = storage.smem_B.begin();
-  ZeroSmemTile<SmemAllocB, typename Mainloop::SmemLayoutB, decltype(sB_ptr)>
-      sB_covered(sB_ptr, typename Mainloop::SmemLayoutB{}, blockDim.x,
-                 kCoveredSmemInitBarrier);
-  auto sB = sB_covered.tensor();
-  auto sSFA_ptr = storage.smem_SFA.begin();
-  E4M3OneSmemTile<cutlass::float_ue4m3_t,
-                  typename Mainloop::SmemLayoutSFA, decltype(sSFA_ptr)>
-      sSFA_covered(sSFA_ptr, typename Mainloop::SmemLayoutSFA{}, blockDim.x,
-                   kCoveredSmemInitBarrier);
-  auto sSFA = sSFA_covered.tensor();
-  auto sSFB_ptr = storage.smem_SFB.begin();
-  E4M3OneSmemTile<cutlass::float_ue4m3_t,
-                  typename Mainloop::SmemLayoutSFB, decltype(sSFB_ptr)>
-      sSFB_covered(sSFB_ptr, typename Mainloop::SmemLayoutSFB{}, blockDim.x,
-                   kCoveredSmemInitBarrier);
-  auto sSFB = sSFB_covered.tensor();
-
-  auto tCrA = thread_mma.partition_fragment_A(sA(_, _, cute::Int<0>{}));
-  auto tCrB = thread_mma.partition_fragment_B(sB(_, _, cute::Int<0>{}));
-  auto tCrSFA = collective.partition_fragment_SFA(sSFA(_, _, cute::Int<0>{}),
-                                                  thread_mma);
-  auto tCrSFB = collective.partition_fragment_SFB(sSFB(_, _, cute::Int<0>{}),
-                                                  thread_mma);
-
-  auto smem_tiled_copy_A = cute::make_tiled_copy_A(
-      typename Mainloop::SmemCopyAtomA{}, tiled_mma);
-  auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(thread_idx);
-  auto tCsA = smem_thr_copy_A.partition_S(
-      cute::as_position_independent_swizzle_tensor(sA));
-  auto tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
-  auto cA = cute::make_identity_tensor(
-      cute::make_shape(cute::Int<TileM>{}, cute::Int<TileK>{},
-                       cute::Int<1>{}));
-  auto tAsA_prod = smem_thr_copy_A.partition_D(sA);
-  auto tAcA_prod = smem_thr_copy_A.partition_D(cA);
-
-  auto smem_tiled_copy_B = cute::make_tiled_copy_B(
-      typename Mainloop::SmemCopyAtomB{}, tiled_mma);
-  auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx);
-  auto tCsB = smem_thr_copy_B.partition_S(
-      cute::as_position_independent_swizzle_tensor(sB));
-  auto tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
-  auto cB = cute::make_identity_tensor(
-      cute::make_shape(cute::Int<TileN>{}, cute::Int<TileK>{},
-                       cute::Int<1>{}));
-  auto tBsB_prod = smem_thr_copy_B.partition_D(sB);
-  auto tBcB_prod = smem_thr_copy_B.partition_D(cB);
-
-  auto tile_shape_mnk = cute::tile_shape(tiled_mma);
-  auto smem_tiled_copy_SFA = cute::make_tiled_copy_impl(
-      typename Mainloop::SmemCopyAtomSFA{},
-      collective.get_layoutSFA_TV(tiled_mma),
-      cute::make_shape(cute::size<0>(tile_shape_mnk),
-                       cute::size<2>(tile_shape_mnk)));
-  auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
-  auto tCsSFA = smem_thr_copy_SFA.partition_S(
-      cute::as_position_independent_swizzle_tensor(sSFA));
-  auto tCrSFA_copy_view = smem_thr_copy_SFA.retile_D(tCrSFA);
-
-  auto smem_tiled_copy_SFB = cute::make_tiled_copy_impl(
-      typename Mainloop::SmemCopyAtomSFB{},
-      collective.get_layoutSFB_TV(tiled_mma),
-      cute::make_shape(cute::size<1>(tile_shape_mnk),
-                       cute::size<2>(tile_shape_mnk)));
-  auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
-  auto tCsSFB = smem_thr_copy_SFB.partition_S(
-      cute::as_position_independent_swizzle_tensor(sSFB));
-  auto tCrSFB_copy_view = smem_thr_copy_SFB.retile_D(tCrSFB);
-
-  auto copy_kblock = [&](auto k_block) {
-    cute::copy(smem_tiled_copy_A, tCsA(_, _, k_block, cute::Int<0>{}),
-               tCrA_copy_view(_, _, k_block));
-    cute::copy(smem_tiled_copy_B, tCsB(_, _, k_block, cute::Int<0>{}),
-               tCrB_copy_view(_, _, k_block));
-
-    using MMAOp = typename Mainloop::TiledMma::MMA_Op;
-    fp4_shift_A(MMAOp{}, tCrA_copy_view(_, _, k_block));
-    fp4_shift_B(MMAOp{}, tCrB_copy_view(_, _, k_block));
-
-    cute::copy(tCsSFA(_, _, k_block, cute::Int<0>{}),
-               tCrSFA_copy_view(_, _, k_block));
-    cute::copy(tCsSFB(_, _, k_block, cute::Int<0>{}),
-               tCrSFB_copy_view(_, _, k_block));
-  };
-
-  auto gemm_kblock = [&](auto k_block) {
-    cute::gemm(tiled_mma,
-               cute::make_zip_tensor(tCrA(_, _, k_block),
-                                     tCrSFA(_, _, k_block)),
-               cute::make_zip_tensor(tCrB(_, _, k_block),
-                                     tCrSFB(_, _, k_block)),
-               accum);
-  };
-
-  constexpr int kTileElements = TileM * TileK;
-  const int active_k_tile_limit = (data_debug_mode == 5) ? 1 : k_tile_limit;
-  uint8_t* smem_a_bytes = cute::recast_ptr<uint8_t>(storage.smem_A.begin());
-  uint8_t* smem_b_bytes = cute::recast_ptr<uint8_t>(storage.smem_B.begin());
-  constexpr int kSmemABytes =
-      (cute::cosize_v<typename Mainloop::SmemLayoutA> + 1) / 2;
-  constexpr int kSmemBBytes =
-      (cute::cosize_v<typename Mainloop::SmemLayoutB> + 1) / 2;
-  auto write_partitioned_fp4 = [&](auto tDst,
-                                   auto tCoord,
-                                   const uint8_t* packed,
-                                   int source_row_base,
-                                   int source_col_base,
-                                   int packed_cols,
-                                   int k_base,
-                                   int mode) {
-    for (int i = 0; i < int(cute::size(tDst)); ++i) {
-      auto coord = tCoord(i);
-      const int row = int(cute::get<0>(coord));
-      const int k = int(cute::get<1>(coord));
-      const int source_col = source_col_base + k_base + k;
-      const uint8_t byte =
-          packed[(source_row_base + row) * packed_cols + (source_col >> 1)];
-      const uint8_t code = smem_fp4_debug_code(
-          static_cast<uint8_t>((source_col & 1) ? ((byte >> 4) & 0x0f)
-                                                : (byte & 0x0f)),
-          mode);
-      tDst(i) = cute::uint4_t(code);
-    }
-  };
-  auto K_BLOCK_MAX_PROD = cute::size<2>(tAsA_prod);
-  for (int k_tile = 0; k_tile < active_k_tile_limit; ++k_tile) {
-    const int k_base = k_tile * TileK;
-    for (int idx = block_thread_idx; idx < kSmemABytes; idx += blockDim.x) {
-      smem_a_bytes[idx] = 0;
-    }
-    for (int idx = block_thread_idx; idx < kSmemBBytes; idx += blockDim.x) {
-      smem_b_bytes[idx] = 0;
-    }
-    __syncthreads();
-    if (mma_thread_active) {
-      cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{}, [&](auto k_block) {
-        write_partitioned_fp4(tAsA_prod(_, _, k_block, cute::Int<0>{}),
-                              tAcA_prod(_, _, k_block, cute::Int<0>{}),
-                              q_packed, q_row_base, q_col_base, q_packed_cols,
-                              k_base, data_debug_mode);
-        write_partitioned_fp4(tBsB_prod(_, _, k_block, cute::Int<0>{}),
-                              tBcB_prod(_, _, k_block, cute::Int<0>{}),
-                              k_packed, kv_row_base, kv_col_base,
-                              kv_packed_cols, k_base, data_debug_mode);
-      });
-    }
-    for (int idx = block_thread_idx; idx < kTileElements / 2; idx += blockDim.x) {
-      const int row = idx / (TileK / 2);
-      const int packed_k = idx - row * (TileK / 2);
-      const int k0 = 2 * packed_k;
-      const int q_scale_col = (q_col_base + k_base + k0) >> 4;
-      const int kv_scale_col = (kv_col_base + k_base + k0) >> 4;
-      sSFA(row, k0, cute::Int<0>{}) =
-          make_ue4m3_raw(q_scales[(q_row_base + row) * q_scale_cols +
-                                   q_scale_col]);
-      sSFB(row, k0, cute::Int<0>{}) =
-          make_ue4m3_raw(k_scales[(kv_row_base + row) * kv_scale_cols +
-                                   kv_scale_col]);
-    }
-    if (data_debug_mode == 4) {
-      for (int idx = block_thread_idx;
-           idx < cute::cosize_v<typename Mainloop::SmemLayoutA>;
-           idx += blockDim.x) {
-        storage.smem_A.begin()[idx] = 2;
-      }
-      for (int idx = block_thread_idx;
-           idx < cute::cosize_v<typename Mainloop::SmemLayoutB>;
-           idx += blockDim.x) {
-        storage.smem_B.begin()[idx] = 2;
-      }
-    }
-    if (data_debug_mode == 6) {
-      uint8_t* smem_a_bytes =
-          cute::recast_ptr<uint8_t>(storage.smem_A.begin());
-      uint8_t* smem_b_bytes =
-          cute::recast_ptr<uint8_t>(storage.smem_B.begin());
-      constexpr int kSmemABytes =
-          (cute::cosize_v<typename Mainloop::SmemLayoutA> + 1) / 2;
-      constexpr int kSmemBBytes =
-          (cute::cosize_v<typename Mainloop::SmemLayoutB> + 1) / 2;
-      for (int idx = block_thread_idx;
-           idx < kSmemABytes;
-           idx += blockDim.x) {
-        smem_a_bytes[idx] = 0x22;
-      }
-      for (int idx = block_thread_idx;
-           idx < kSmemBBytes;
-           idx += blockDim.x) {
-        smem_b_bytes[idx] = 0x22;
-      }
-    }
-    if (scale_debug_mode == 1) {
-      for (int idx = block_thread_idx;
-           idx < cute::cosize_v<typename Mainloop::SmemLayoutSFA>;
-           idx += blockDim.x) {
-        storage.smem_SFA.begin()[idx] = make_ue4m3_raw(0x38);
-      }
-      for (int idx = block_thread_idx;
-           idx < cute::cosize_v<typename Mainloop::SmemLayoutSFB>;
-           idx += blockDim.x) {
-        storage.smem_SFB.begin()[idx] = make_ue4m3_raw(0x38);
-      }
-    }
-    __syncthreads();
-
-    if (mma_thread_active) {
-      auto K_BLOCK_MAX = cute::size<2>(tCrA);
-      copy_kblock(cute::Int<0>{});
-      cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
-        auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
-        if (k_block_next > 0) {
-          copy_kblock(k_block_next);
-        }
-        gemm_kblock(k_block);
-      });
-    }
-    __syncthreads();
-  }
-
-  if (mma_thread_active) {
-    auto cC = cute::make_identity_tensor(
-        cute::take<0, 2>(ThreadBlockShape{}));
-    auto tCcC = thread_mma.partition_C(cC);
-    for (int i = 0; i < cute::size(accum); ++i) {
-      auto coord = tCcC(i);
-      const int row = int(cute::get<0>(coord));
-      const int col = int(cute::get<1>(coord));
-      if (row < TileM && col < TileN) {
-        out_tile[(out_row_base + row) * out_stride + out_col_base + col] =
-            accum(i);
-      }
-    }
-  }
-}
-
-__device__ __forceinline__ void cutlass_smem_atom_gemm_tile_body(
-    typename CutlassCollectiveMainloop::TensorStorage& storage,
-    const uint8_t* q_packed,
-    const uint8_t* q_scales,
-    const uint8_t* k_packed,
-    const uint8_t* k_scales,
-    float* out_tile,
-    int q_row_base,
-    int q_col_base,
-    int q_packed_cols,
-    int q_scale_cols,
-    int kv_row_base,
-    int kv_col_base,
-    int kv_packed_cols,
-    int kv_scale_cols,
-    int k_tile_limit,
-    int out_stride,
-    int out_row_base,
-    int out_col_base,
-    int data_debug_mode,
-    int scale_debug_mode) {
-  cutlass_smem_atom_gemm_tile_body_impl<CutlassCollectiveMainloop,
-                                        CutlassThreadBlockShape,
-                                        kCutlassTileM,
-                                        kCutlassTileN,
-                                        kCutlassTileK>(
-      storage, q_packed, q_scales, k_packed, k_scales, out_tile, q_row_base,
-      q_col_base, q_packed_cols, q_scale_cols, kv_row_base, kv_col_base,
-      kv_packed_cols, kv_scale_cols, k_tile_limit, out_stride, out_row_base,
-      out_col_base, data_debug_mode, scale_debug_mode);
-}
-
 template <class FrgTensorA, class FrgTensorSFA, class SmemTensorA,
           class SmemTensorSFA>
 __device__ __forceinline__ void cutlass_qk_tma_q_register_stage(
@@ -918,8 +509,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     int batch_size,
     int q_tiles_per_sequence,
     int num_kv_heads,
-    bool all_kv_heads,
-    Sm120Nvfp4D256StageDebugParams debug = {}) {
+    bool all_kv_heads) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
   using cute::_;
   static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
@@ -1011,9 +601,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           ? thread_idx - kSm120Nvfp4FmhaWarpEpilogue * cutlass::NumThreadsPerWarp
           : 0;
   const int output_thread_idx = is_epilogue ? epilogue_thread_idx : lane_idx;
-  const bool debug_stage_selected = sm120_d256_debug_stage_selected(debug);
-  const bool debug_all_output_ctas = sm120_d256_debug_all_output_ctas(debug);
-
   for (int row = thread_idx; row < kCutlassTileM; row += blockDim.x) {
     storage.global_m[row] = -INFINITY;
     storage.global_l[row] = 0.0f;
@@ -1021,21 +608,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     storage.old_scale_stage[1][row] = 0.0f;
   }
   __syncthreads();
-  if ((debug_stage_selected || debug_all_output_ctas) && thread_idx == 0) {
-    debug.sizes[0] = kSm120Nvfp4LogitsBytes;
-    debug.sizes[1] = kSm120Nvfp4PvPStageBytes;
-    debug.sizes[2] = kCutlassTileM * (kCutlassTileN / 16) *
-                     static_cast<int>(sizeof(cutlass::float_ue4m3_t));
-    debug.sizes[3] = kOutputGroupSpan * kCutlassTileM * kOutputTileN *
-                     static_cast<int>(sizeof(__nv_bfloat16));
-    debug.sizes[4] = 2 * kCutlassTileM * static_cast<int>(sizeof(float));
-    debug.sizes[5] = effective_num_kv_tiles;
-    debug.sizes[6] = effective_split_idx;
-    debug.sizes[7] = q_block_idx;
-    debug.sizes[8] = kOutputGroupSpan * kCutlassTileM * kOutputTileN *
-                     static_cast<int>(sizeof(__nv_bfloat16));
-  }
-
   typename Sm120Nvfp4PipelineE::Params pipeline_corr_epi_params{};
   if (is_mma) {
     pipeline_corr_epi_params.role =
@@ -1144,9 +716,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       qk_sB_covered(qk_sB_ptr, typename CutlassCollectiveMainloop::SmemLayoutB{},
                     blockDim.x, kCoveredSmemInitBarrier);
   auto qk_sB = qk_sB_covered.tensor();
-  // SM120 has no TMEM, so the 77 S/P/O lifetime is represented with compact
-  // shared-memory aliasing. B is the transient score/O region while K reuse is
-  // blocked; A/SFA are free after Q is resident and hold two compact P stages.
+  // SM120 has no TMEM, so QK logits, softmax probabilities, and PV staging use
+  // compact shared-memory aliasing once each producer-consumer phase releases
+  // its operand storage.
   __nv_bfloat16* smem_logits0 = nullptr;
   if constexpr (kSm120Nvfp4AliasLogitsInQkB) {
     smem_logits0 =
@@ -1264,6 +836,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                        [&](auto k_block) {
           auto dst = tBsB_prod(_, _, k_block, write_stage);
           auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+          // K producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
             asm volatile("trap;\n");
           }
@@ -1273,6 +846,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             const int k0 = int(cute::get<1>(coord0));
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+            // K producer writes each packed word through a 4-byte smem store.
             if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
               asm volatile("trap;\n");
             }
@@ -1286,6 +860,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
               uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
               const int row = int(cute::get<0>(coord));
               const int k = int(cute::get<1>(coord));
+              // K smem layout must colocate each FP4 pair inside the word.
               if (row != row0 || k != k0 + j ||
                   dst_byte < dst0 || dst_byte >= dst0 + 4 ||
                   pair_byte != dst_byte) {
@@ -1381,7 +956,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           (void)scale;
           return sm120_nvfp4_paged_v_code(paged_kv_params, token, dim);
         } else {
-          asm volatile("trap;\n");
           return uint8_t{0};
         }
       };
@@ -1423,6 +997,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                        [&](auto k_block) {
           auto dst = tBsB_prod(_, _, k_block, write_stage);
           auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+          // V producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
             asm volatile("trap;\n");
           }
@@ -1432,11 +1007,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             const int k0 = int(cute::get<1>(coord0));
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+            // V producer writes each packed word through a 4-byte smem store.
             if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
               asm volatile("trap;\n");
             }
             uint32_t packed_word = 0;
             if constexpr (!kPvLayoutV) {
+              // Linear-V reblock groups 8 contiguous token positions per word.
               if ((k0 & 7) != 0) {
                 asm volatile("trap;\n");
               }
@@ -1450,6 +1027,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
                 const int col = int(cute::get<0>(coord));
                 const int k = int(cute::get<1>(coord));
+                // Linear-V reblock requires byte-pair colocation within the word.
                 if (col != col0 || k != k0 + j ||
                     dst_byte < dst0 || dst_byte >= dst0 + 4 ||
                     pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
@@ -1482,6 +1060,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
                 const int col = int(cute::get<0>(coord));
                 const int k = int(cute::get<1>(coord));
+                // PV-layout V must map each logical pair to one physical byte.
                 if (col != col0 || k != k0 + j ||
                     dst_byte < dst0 || dst_byte >= dst0 + 4 ||
                     pair_byte != dst_byte) {
@@ -1559,6 +1138,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                        [&](auto k_block) {
           auto dst = tAsA_prod(_, _, k_block, write_stage);
           auto coord_tensor = tAcA_prod(_, _, k_block, cute::Int<0>{});
+          // Q producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
             asm volatile("trap;\n");
           }
@@ -1568,6 +1148,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             const int k0 = int(cute::get<1>(coord0));
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+            // Q producer writes each packed word through a 4-byte smem store.
             if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
               asm volatile("trap;\n");
             }
@@ -1581,6 +1162,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
               uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
               const int row = int(cute::get<0>(coord));
               const int k = int(cute::get<1>(coord));
+              // Q smem layout must colocate each FP4 pair inside the word.
               if (row != row0 || k != k0 + j || dst_byte < dst0 ||
                   dst_byte >= dst0 + 4 || pair_byte != dst_byte) {
                 asm volatile("trap;\n");
@@ -1841,25 +1423,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       sm120_epilogue_store_bf16_tile(
           smem_epilogue_o, out_tile + group_offset * kOutputTileN,
           out_stride_cols, store_thread_idx);
-      if ((debug_stage_selected || debug_all_output_ctas) &&
-          debug.tile == effective_num_kv_tiles - 1) {
-        __syncwarp();
-        const int out_group_bytes =
-            kCutlassTileM * kOutputTileN *
-            static_cast<int>(sizeof(__nv_bfloat16));
-        const int block_output_offset =
-            debug_all_output_ctas
-                ? (int(blockIdx.y) * int(gridDim.x) + int(blockIdx.x)) *
-                      kOutputGroupSpan * out_group_bytes
-                : 0;
-        sm120_d256_debug_copy_bytes_epilogue(
-            debug.out_store == nullptr
-                ? nullptr
-                : debug.out_store + block_output_offset +
-                      group_offset * out_group_bytes,
-            out_tile + group_offset * kOutputTileN, out_group_bytes,
-            store_thread_idx);
-      }
       if (group_offset == 0 && split_m != nullptr && split_l != nullptr) {
         for (int row = store_thread_idx; row < kCutlassTileM;
              row += kSm120Nvfp4FmhaOutputThreadCount) {
@@ -2309,6 +1872,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             dst1 == dst0 + 1 && dst2 == dst0 + 2 && dst3 == dst0 + 3 &&
             dst4 == dst0 + 4 && dst5 == dst0 + 5 && dst6 == dst0 + 6 &&
             dst7 == dst0 + 7;
+        // P staging stores two 32-bit words and requires 8 contiguous bytes.
         if (contiguous && ((reinterpret_cast<uintptr_t>(dst0) & 0x3u) == 0)) {
           *reinterpret_cast<uint32_t*>(dst0) = packed_lo;
           *reinterpret_cast<uint32_t*>(dst0 + 4) = packed_hi;
@@ -2338,20 +1902,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
       const __nv_bfloat16* smem_logits_stage =
           (tile & 1) == 0 ? smem_logits0 : smem_logits1;
-      if ((debug_stage_selected || debug_all_output_ctas) &&
-          debug.tile == tile) {
-        const int debug_cta_offset =
-            debug_all_output_ctas ? (int(blockIdx.y) * int(gridDim.x) +
-                                     int(blockIdx.x))
-                                  : 0;
-        sm120_d256_debug_copy_bytes_mma(
-            debug.logits == nullptr
-                ? nullptr
-                : debug.logits + debug_cta_offset * kSm120Nvfp4LogitsBytes,
-            smem_logits_stage,
-                                        kSm120Nvfp4LogitsBytes,
-                                        qk_mma_thread_idx);
-      }
       if ((tile & 1) == 0) {
         mma_stage_probability_row(p_sA0, p_sSFA0_m, logits0, tile,
                                   final_tile);
@@ -2362,31 +1912,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       cutlass::arch::NamedBarrier::sync(
           CutlassCollectiveMainloop::ThreadCount,
           cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-      if ((debug_stage_selected || debug_all_output_ctas) &&
-          debug.tile == tile) {
-        const int debug_cta_offset =
-            debug_all_output_ctas ? (int(blockIdx.y) * int(gridDim.x) +
-                                     int(blockIdx.x))
-                                  : 0;
-        sm120_d256_debug_copy_bytes_mma(
-            debug.p_smem == nullptr
-                ? nullptr
-                : debug.p_smem +
-                      debug_cta_offset * kSm120Nvfp4PvPStageBytes,
-            p_smem_a0_bytes, kSm120Nvfp4PvPStageBytes, qk_mma_thread_idx);
-        if (debug.p_sfa != nullptr) {
-          constexpr int kPScaleGroups = kCutlassTileN / 16;
-          for (int idx = qk_mma_thread_idx;
-               idx < kCutlassTileM * kPScaleGroups;
-               idx += kSm120Nvfp4FmhaMmaSoftmaxThreadCount) {
-            const int row = idx / kPScaleGroups;
-            const int scale_group = idx - row * kPScaleGroups;
-            debug.p_sfa[debug_cta_offset * kSm120Nvfp4PvLogicalScaleStageElems +
-                        idx] =
-                p_sSFA0_m(row, scale_group * 16, cute::Int<0>{}).storage;
-          }
-        }
-      }
     };
 
     auto release_k_chunk = [&]() {
@@ -2484,30 +2009,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             pv_accum, pv_tCcC, smem_epilogue_o, storage.global_l,
             pv_base_scale, split_m == nullptr);
         commit_output_stage(true);
-        if ((debug_stage_selected || debug_all_output_ctas) &&
-            debug.tile == tile) {
-          const int o_group_bytes =
-              kCutlassTileM * kOutputTileN *
-              static_cast<int>(sizeof(__nv_bfloat16));
-          const int block_output_offset =
-              debug_all_output_ctas
-                  ? (int(blockIdx.y) * int(gridDim.x) + int(blockIdx.x)) *
-                        kOutputGroupSpan * o_group_bytes
-                  : 0;
-          sm120_d256_debug_copy_bytes_mma(
-              debug.o_smem == nullptr
-                  ? nullptr
-                  : debug.o_smem + block_output_offset +
-                        group_offset * o_group_bytes,
-              smem_epilogue_o, o_group_bytes, qk_mma_thread_idx);
-          if (debug_stage_selected) {
-            sm120_d256_debug_copy_floats_mma(debug.stats, storage.global_m,
-                                             kCutlassTileM, qk_mma_thread_idx);
-            sm120_d256_debug_copy_floats_mma(
-                debug.stats == nullptr ? nullptr : debug.stats + kCutlassTileM,
-                storage.global_l, kCutlassTileM, qk_mma_thread_idx);
-          }
-        }
       }
     };
 
@@ -2589,376 +2090,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 #endif
 }
 
-template <bool kPvLayoutV>
-__global__ __launch_bounds__(kSm120Nvfp4FmhaThreadCount, 1)
-void sm120_nvfp4_d256_debug_producer_smem_kernel(
-    Sm120Nvfp4PagedKvLoadParams paged_kv_params,
-    int kv_len_tokens,
-    int kv_tile,
-    int k_outer,
-    int out_group_idx,
-    uint8_t* k_smem_b,
-    uint8_t* k_smem_sfb,
-    uint8_t* v_smem_b,
-    uint8_t* v_smem_sfb,
-    int32_t* sizes) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
-  using cute::_;
-  extern __shared__ __align__(128) char smem[];
-  auto& storage = *reinterpret_cast<Sm120Nvfp4QkvLoadCollectiveStorage*>(smem);
-
-  constexpr int kQkSmemBBytes =
-      (cute::cosize_v<typename CutlassCollectiveMainloop::SmemLayoutB> + 1) /
-      2;
-  constexpr int kQkSmemSfbBytes =
-      cute::cosize_v<typename CutlassCollectiveMainloop::SmemLayoutSFB>;
-  constexpr int kPvSmemBBytes =
-      (cute::cosize_v<typename CutlassCollectiveMainloopK128Stage2::SmemLayoutB> +
-       1) /
-      2;
-  constexpr int kPvSmemSfbBytes =
-      cute::cosize_v<typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFB>;
-
-  if (threadIdx.x == 0 && sizes != nullptr) {
-    sizes[0] = kQkSmemBBytes;
-    sizes[1] = kQkSmemSfbBytes;
-    sizes[2] = kPvSmemBBytes;
-    sizes[3] = kPvSmemSfbBytes;
-  }
-
-  uint8_t* qk_smem_b_bytes =
-      cute::recast_ptr<uint8_t>(storage.qk_tensors.smem_B.begin());
-  uint8_t* pv_smem_b_bytes =
-      cute::recast_ptr<uint8_t>(storage.v_smem_B.begin());
-  for (int idx = int(threadIdx.x); idx < kQkSmemBBytes; idx += blockDim.x) {
-    qk_smem_b_bytes[idx] = 0;
-  }
-  for (int idx = int(threadIdx.x); idx < kPvSmemBBytes; idx += blockDim.x) {
-    pv_smem_b_bytes[idx] = 0;
-  }
-  for (int idx = int(threadIdx.x); idx < kQkSmemSfbBytes; idx += blockDim.x) {
-    storage.qk_tensors.smem_SFB.begin()[idx] = make_ue4m3_raw(0x38);
-  }
-  for (int idx = int(threadIdx.x); idx < kPvSmemSfbBytes; idx += blockDim.x) {
-    storage.v_smem_SFB.begin()[idx] = make_ue4m3_raw(0x38);
-  }
-  __syncthreads();
-
-  const int lane_idx = int(threadIdx.x) % cutlass::NumThreadsPerWarp;
-  if (int(threadIdx.x) < cutlass::NumThreadsPerWarp) {
-    CutlassCollectiveMainloop qk_collective;
-    auto qk_tiled_mma = typename CutlassCollectiveMainloop::TiledMma{};
-    auto qk_sB = cute::make_tensor(
-        cute::make_smem_ptr(storage.qk_tensors.smem_B.begin()),
-        typename CutlassCollectiveMainloop::SmemLayoutB{});
-    auto qk_sSFB = cute::make_tensor(
-        cute::make_smem_ptr(storage.qk_tensors.smem_SFB.begin()),
-        typename CutlassCollectiveMainloop::SmemLayoutSFB{});
-
-    auto smem_tiled_copy_K = cute::make_tiled_copy_B(
-        typename CutlassCollectiveMainloop::SmemCopyAtomB{}, qk_tiled_mma);
-    auto cK = cute::make_identity_tensor(
-        cute::make_shape(cute::Int<kCutlassTileN>{},
-                         cute::Int<kCutlassTileK>{}, cute::Int<1>{}));
-    for (int copy_thread = lane_idx;
-         copy_thread < CutlassCollectiveMainloop::ThreadCount;
-         copy_thread += cutlass::NumThreadsPerWarp) {
-      auto smem_thr_copy_B = smem_tiled_copy_K.get_thread_slice(copy_thread);
-      auto tBsB_prod = smem_thr_copy_B.partition_D(qk_sB);
-      auto tBcB_prod = smem_thr_copy_B.partition_D(cK);
-      auto K_BLOCK_MAX_PROD = cute::size<2>(tBsB_prod);
-      cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
-                     [&](auto k_block) {
-        auto dst = tBsB_prod(_, _, k_block, cute::Int<0>{});
-        auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
-        if (int(cute::size(dst)) % 8 != 0) {
-          asm volatile("trap;\n");
-        }
-        for (int i = 0; i < int(cute::size(dst)); i += 8) {
-          auto coord0 = coord_tensor(i);
-          const int row0 = int(cute::get<0>(coord0));
-          const int k0 = int(cute::get<1>(coord0));
-          auto ref0 = dst(i);
-          uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
-          if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
-            asm volatile("trap;\n");
-          }
-          uint32_t packed_word = 0;
-#pragma unroll
-          for (int j = 0; j < 8; ++j) {
-            auto coord = coord_tensor(i + j);
-            auto ref = dst(i + j);
-            auto pair_ref = dst(i + (j ^ 1));
-            uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
-            uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
-            const int row = int(cute::get<0>(coord));
-            const int k = int(cute::get<1>(coord));
-            if (row != row0 || k != k0 + j ||
-                dst_byte < dst0 || dst_byte >= dst0 + 4 ||
-                pair_byte != dst_byte) {
-              asm volatile("trap;\n");
-            }
-            const int token = kv_tile * kCutlassTileN + row;
-            const int dim = k_outer * kCutlassTileK + k;
-            const uint8_t code =
-                token < kv_len_tokens
-                    ? sm120_nvfp4_paged_k_code(paged_kv_params, token, dim)
-                    : 0;
-            const int byte_offset = int(dst_byte - dst0);
-            const int nibble_shift = (k & 1) ? 4 : 0;
-            packed_word |= static_cast<uint32_t>(code)
-                           << (8 * byte_offset + nibble_shift);
-          }
-          *reinterpret_cast<uint32_t*>(dst0) = packed_word;
-        }
-      });
-    }
-
-    for (int idx = lane_idx; idx < kCutlassTileN * kCutlassTileK / 2;
-         idx += cutlass::NumThreadsPerWarp) {
-      const int row = idx / (kCutlassTileK / 2);
-      const int packed_k = idx - row * (kCutlassTileK / 2);
-      const int k0 = 2 * packed_k;
-      const int token = kv_tile * kCutlassTileN + row;
-      const int scale_col = (k_outer * kCutlassTileK + k0) >> 4;
-      const uint8_t scale =
-          token < kv_len_tokens
-              ? sm120_nvfp4_paged_k_scale(paged_kv_params, token, scale_col)
-              : 0x38;
-      qk_sSFB(row, k0, cute::Int<0>{}) = make_ue4m3_raw(scale);
-    }
-
-    CutlassCollectiveMainloopK128Stage2 pv_collective;
-    auto pv_tiled_mma =
-        typename CutlassCollectiveMainloopK128Stage2::TiledMma{};
-    auto pv_sB = cute::make_tensor(
-        cute::make_smem_ptr(storage.v_smem_B.begin()),
-        typename CutlassCollectiveMainloopK128Stage2::SmemLayoutB{});
-    auto pv_sSFB = cute::make_tensor(
-        cute::make_smem_ptr(storage.v_smem_SFB.begin()),
-        typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFB{});
-
-    auto pv_scale_pair_for = [&](int token_group_start, int dim0,
-                                 uint8_t& sf0, uint8_t& sf1) {
-      float max_abs0 = 0.0f;
-      float max_abs1 = 0.0f;
-      if constexpr (!kPvLayoutV) {
-#pragma unroll 1
-        for (int offset = 0; offset < 16; ++offset) {
-          const int t = token_group_start + offset;
-          if (t < kv_len_tokens) {
-            max_abs0 = fmaxf(
-                max_abs0,
-                fabsf(sm120_nvfp4_paged_v_linear_value(paged_kv_params, t,
-                                                        dim0)));
-            max_abs1 = fmaxf(
-                max_abs1,
-                fabsf(sm120_nvfp4_paged_v_linear_value(paged_kv_params, t,
-                                                        dim0 + 1)));
-          }
-        }
-      }
-      const float scale0 = max_abs0 > 0.0f ? max_abs0 / 6.0f : 1.0f;
-      const float scale1 = max_abs1 > 0.0f ? max_abs1 / 6.0f : 1.0f;
-      sf0 = fp32_to_e4m3_byte(scale0);
-      sf1 = fp32_to_e4m3_byte(scale1);
-    };
-
-    auto pv_scale_for = [&](int token, int dim) {
-      if constexpr (kPvLayoutV) {
-        const int logical_page = token / paged_kv_params.page_size;
-        return sm120_nvfp4_paged_v_pv_scale(paged_kv_params, logical_page,
-                                            dim);
-      } else {
-        const int token_group_start = (token / 16) * 16;
-        const int scale_k = token_group_start - kv_tile * kCutlassTileN;
-        auto scale_ref = pv_sSFB(dim - out_group_idx * kOutputTileN, scale_k,
-                                 cute::Int<0>{});
-        return *cute::recast_ptr<uint8_t>(&scale_ref);
-      }
-    };
-
-    if constexpr (!kPvLayoutV) {
-      constexpr int kTokenScaleGroups = kCutlassTileN / 16;
-      for (int idx = lane_idx;
-           idx < (kOutputTileN / 2) * kTokenScaleGroups;
-           idx += cutlass::NumThreadsPerWarp) {
-        const int col_pair = idx / kTokenScaleGroups;
-        const int token_group = idx - col_pair * kTokenScaleGroups;
-        const int col0 = 2 * col_pair;
-        const int local_k0 = 16 * token_group;
-        const int token_group_start = kv_tile * kCutlassTileN + local_k0;
-        const int dim0 = out_group_idx * kOutputTileN + col0;
-        uint8_t sf0 = 0x38;
-        uint8_t sf1 = 0x38;
-        pv_scale_pair_for(token_group_start, dim0, sf0, sf1);
-#pragma unroll
-        for (int k_offset = 0; k_offset < 16; k_offset += 2) {
-          pv_sSFB(col0, local_k0 + k_offset, cute::Int<0>{}) =
-              make_ue4m3_raw(sf0);
-          pv_sSFB(col0 + 1, local_k0 + k_offset, cute::Int<0>{}) =
-              make_ue4m3_raw(sf1);
-        }
-      }
-      __syncwarp();
-    }
-
-    auto smem_tiled_copy_V = cute::make_tiled_copy_B(
-        typename CutlassCollectiveMainloopK128Stage2::SmemCopyAtomB{},
-        pv_tiled_mma);
-    auto cV = cute::make_identity_tensor(
-        cute::make_shape(cute::Int<kOutputTileN>{},
-                         cute::Int<kCutlassTileN>{}, cute::Int<1>{}));
-    for (int copy_thread = lane_idx;
-         copy_thread < CutlassCollectiveMainloopK128Stage2::ThreadCount;
-         copy_thread += cutlass::NumThreadsPerWarp) {
-      auto smem_thr_copy_B = smem_tiled_copy_V.get_thread_slice(copy_thread);
-      auto tBsB_prod = smem_thr_copy_B.partition_D(pv_sB);
-      auto tBcB_prod = smem_thr_copy_B.partition_D(cV);
-      auto K_BLOCK_MAX_PROD = cute::size<2>(tBsB_prod);
-      cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
-                     [&](auto k_block) {
-        auto dst = tBsB_prod(_, _, k_block, cute::Int<0>{});
-        auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
-        if (int(cute::size(dst)) % 8 != 0) {
-          asm volatile("trap;\n");
-        }
-        for (int i = 0; i < int(cute::size(dst)); i += 8) {
-          auto coord0 = coord_tensor(i);
-          const int col0 = int(cute::get<0>(coord0));
-          const int k0 = int(cute::get<1>(coord0));
-          auto ref0 = dst(i);
-          uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
-          if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
-            asm volatile("trap;\n");
-          }
-          uint32_t packed_word = 0;
-          if constexpr (!kPvLayoutV) {
-            if ((k0 & 7) != 0) {
-              asm volatile("trap;\n");
-            }
-            float vals[8];
-#pragma unroll 1
-            for (int j = 0; j < 8; ++j) {
-              auto coord = coord_tensor(i + j);
-              auto ref = dst(i + j);
-              auto pair_ref = dst(i + (j ^ 1));
-              uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
-              uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
-              const int col = int(cute::get<0>(coord));
-              const int k = int(cute::get<1>(coord));
-              if (col != col0 || k != k0 + j ||
-                  dst_byte < dst0 || dst_byte >= dst0 + 4 ||
-                  pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
-                asm volatile("trap;\n");
-              }
-              const int token = kv_tile * kCutlassTileN + k;
-              const int dim = out_group_idx * kOutputTileN + col;
-              const uint8_t scale =
-                  token < kv_len_tokens ? pv_scale_for(token, dim) : 0x38;
-              const float pv_scale = fmaxf(e4m3_byte_to_fp32(scale), 1.0e-8f);
-              const float value =
-                  token < kv_len_tokens
-                      ? sm120_nvfp4_paged_v_linear_value(paged_kv_params,
-                                                         token, dim)
-                      : 0.0f;
-              vals[j] = value / pv_scale;
-            }
-            packed_word =
-                static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[0], vals[1])) |
-                (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[2], vals[3])) << 8) |
-                (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[4], vals[5])) << 16) |
-                (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[6], vals[7])) << 24);
-          } else {
-#pragma unroll 1
-            for (int j = 0; j < 8; ++j) {
-              auto coord = coord_tensor(i + j);
-              auto ref = dst(i + j);
-              auto pair_ref = dst(i + (j ^ 1));
-              uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
-              uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
-              const int col = int(cute::get<0>(coord));
-              const int k = int(cute::get<1>(coord));
-              if (col != col0 || k != k0 + j ||
-                  dst_byte < dst0 || dst_byte >= dst0 + 4 ||
-                  pair_byte != dst_byte) {
-                asm volatile("trap;\n");
-              }
-              const int token = kv_tile * kCutlassTileN + k;
-              const int dim = out_group_idx * kOutputTileN + col;
-              const uint8_t code =
-                  token < kv_len_tokens
-                      ? sm120_nvfp4_paged_v_code(paged_kv_params, token, dim)
-                      : 0;
-              const int byte_offset = int(dst_byte - dst0);
-              const int nibble_shift = (k & 1) ? 4 : 0;
-              packed_word |= static_cast<uint32_t>(code)
-                             << (8 * byte_offset + nibble_shift);
-            }
-          }
-          *reinterpret_cast<uint32_t*>(dst0) = packed_word;
-        }
-      });
-    }
-
-    if constexpr (kPvLayoutV) {
-      for (int idx = lane_idx; idx < kOutputTileN * kCutlassTileN / 2;
-           idx += cutlass::NumThreadsPerWarp) {
-        const int col = idx / (kCutlassTileN / 2);
-        const int packed_k = idx - col * (kCutlassTileN / 2);
-        const int k0 = 2 * packed_k;
-        const int token = kv_tile * kCutlassTileN + k0;
-        const int dim = out_group_idx * kOutputTileN + col;
-        const uint8_t scale =
-            token < kv_len_tokens ? pv_scale_for(token, dim) : 0x38;
-        pv_sSFB(col, k0, cute::Int<0>{}) = make_ue4m3_raw(scale);
-      }
-    }
-  }
-  __syncthreads();
-
-  for (int idx = int(threadIdx.x); idx < kQkSmemBBytes; idx += blockDim.x) {
-    k_smem_b[idx] = qk_smem_b_bytes[idx];
-  }
-  for (int idx = int(threadIdx.x); idx < kPvSmemBBytes; idx += blockDim.x) {
-    v_smem_b[idx] = pv_smem_b_bytes[idx];
-  }
-  for (int idx = int(threadIdx.x); idx < kQkSmemSfbBytes; idx += blockDim.x) {
-    k_smem_sfb[idx] = storage.qk_tensors.smem_SFB.begin()[idx].storage;
-  }
-  for (int idx = int(threadIdx.x); idx < kPvSmemSfbBytes; idx += blockDim.x) {
-    v_smem_sfb[idx] = storage.v_smem_SFB.begin()[idx].storage;
-  }
-#endif
-}
-
-template <bool kPvLayoutV>
-cudaError_t sm120_nvfp4_d256_debug_producer_smem_raw(
-    Sm120Nvfp4PagedKvLoadParams paged_kv_params,
-    int kv_len_tokens,
-    int kv_tile,
-    int k_outer,
-    int out_group_idx,
-    uint8_t* k_smem_b,
-    uint8_t* k_smem_sfb,
-    uint8_t* v_smem_b,
-    uint8_t* v_smem_sfb,
-    int32_t* sizes,
-    cudaStream_t stream) {
-  auto kernel = sm120_nvfp4_d256_debug_producer_smem_kernel<kPvLayoutV>;
-  constexpr int kSmemBytes =
-      static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));
-  cudaError_t status = cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  kernel<<<1, kSm120Nvfp4FmhaThreadCount, kSmemBytes, stream>>>(
-      paged_kv_params, kv_len_tokens, kv_tile, k_outer, out_group_idx,
-      k_smem_b, k_smem_sfb, v_smem_b, v_smem_sfb, sizes);
-  return cudaGetLastError();
-}
-
 template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
           bool kUseSlidingWindow, bool kUseLogitsSoftCap,
           bool kPvLayoutV = true>
@@ -2995,8 +2126,7 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
     int q_tiles_per_sequence = 0,
     int num_kv_heads = 1,
     bool all_kv_heads = false,
-    bool skip_internal_combine = false,
-    Sm120Nvfp4D256StageDebugParams debug = {}) {
+    bool skip_internal_combine = false) {
   static_assert(kOutputGroupSpan == 1 || kOutputGroupSpan == 2 ||
                     kOutputGroupSpan == 4,
                 "SM120 split-KV launcher supports span 1, 2, or 4");
@@ -3085,7 +2215,7 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
       causal ? 1 : 0, sliding_window, logits_soft_cap, 0, head_dim,
       stage_split_m, stage_split_l, q_rows, stage_output_stride,
       paged_kv_params, qo_indptr, kv_lens, batch_size, q_tiles_per_sequence,
-      num_kv_heads, all_kv_heads, debug);
+      num_kv_heads, all_kv_heads);
   status = cudaGetLastError();
   return status;
 }

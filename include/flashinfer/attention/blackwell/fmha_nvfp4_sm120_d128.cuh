@@ -28,16 +28,8 @@
 
 namespace flashinfer::attention::blackwell::sm120_nvfp4::d128 {
 
-// D128 specialization seed. This starts as the D512 scaffold, but lives in a
-// separate translation unit so we can shrink storage/pipelines without risking
-// the established D512 path.
-constexpr int kQLen = 512;
-constexpr int kGroup = 2;
-constexpr int kKvLen = 32768;
+// SM120 NVFP4 fused attention specialization for D=128 heads.
 constexpr int kHeadDim = 128;
-constexpr int kPackedHeadDim = kHeadDim / 2;
-constexpr int kScaleCols = kHeadDim / 16;
-constexpr int kQRows = kQLen * kGroup;
 constexpr int kTileM = 16;
 constexpr int kTileN = 16;
 constexpr int kCutlassTileM = 64;
@@ -49,16 +41,7 @@ constexpr int kSoftmaxThreadsPerRow = 4;
 constexpr int kQkTileN = kCutlassTileN;
 constexpr int kOutputTileN = 128;
 constexpr int kCutlassTileK128 = 128;
-constexpr int kDebugHead = 0;
-constexpr int kProbPackedCols = kKvLen / 2;
-constexpr int kProbScaleCols = kKvLen / 16;
-constexpr int kShapeBMaxKvLen = 262144;
-constexpr int kShapeBMaxKvTiles = kShapeBMaxKvLen / kCutlassTileN;
 constexpr int kFusedWarpsPerCta = 8;
-constexpr int kSplitKvLen = 1024;
-constexpr int kNumKvSplits = kKvLen / kSplitKvLen;
-constexpr int kBenchRows = 128;
-constexpr int kBenchQTiles = kBenchRows / kTileM;
 constexpr int kColumnGroups = kHeadDim / (kTileN * kFusedWarpsPerCta);
 constexpr float kProbGlobalScale = 6.0f * 448.0f;
 
@@ -383,335 +366,7 @@ __device__ __forceinline__ cutlass::float_ue4m3_t make_ue4m3_raw(uint8_t raw) {
   return value;
 }
 
-__device__ __forceinline__ uint8_t smem_fp4_debug_code(uint8_t code,
-                                                       int mode) {
-  code &= 0x0f;
-  if (mode == 1) {
-    return static_cast<uint8_t>(code << 2);
-  }
-  if (mode == 2) {
-    return static_cast<uint8_t>(code << 4);
-  }
-  if (mode == 3) {
-    return static_cast<uint8_t>(code | (code << 4));
-  }
-  return code;
-}
-
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210)
-template <typename Mainloop, typename ThreadBlockShape, int TileM, int TileN,
-          int TileK>
-__device__ __forceinline__ void cutlass_smem_atom_gemm_tile_body_impl(
-    typename Mainloop::TensorStorage& storage,
-    const uint8_t* q_packed,
-    const uint8_t* q_scales,
-    const uint8_t* k_packed,
-    const uint8_t* k_scales,
-    float* out_tile,
-    int q_row_base,
-    int q_col_base,
-    int q_packed_cols,
-    int q_scale_cols,
-    int kv_row_base,
-    int kv_col_base,
-    int kv_packed_cols,
-    int kv_scale_cols,
-    int k_tile_limit,
-    int out_stride,
-    int out_row_base,
-    int out_col_base,
-    int data_debug_mode,
-    int scale_debug_mode) {
-  using cute::_;
-
-  const int block_thread_idx = int(threadIdx.x);
-  const bool mma_thread_active = block_thread_idx < Mainloop::ThreadCount;
-  const int thread_idx = mma_thread_active ? block_thread_idx : 0;
-  auto tiled_mma = typename Mainloop::TiledMma{};
-  auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
-  Mainloop collective;
-
-  auto accum = cute::partition_fragment_C(
-      tiled_mma, cute::take<0, 2>(ThreadBlockShape{}));
-  cute::clear(accum);
-
-  constexpr auto kCoveredSmemInitBarrier =
-      cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier;
-  using SmemAllocA = typename Mainloop::SmemAllocTypeA;
-  using SmemAllocB = typename Mainloop::SmemAllocTypeB;
-  auto sA_ptr = storage.smem_A.begin();
-  ZeroSmemTile<SmemAllocA, typename Mainloop::SmemLayoutA, decltype(sA_ptr)>
-      sA_covered(sA_ptr, typename Mainloop::SmemLayoutA{}, blockDim.x,
-                 kCoveredSmemInitBarrier);
-  auto sA = sA_covered.tensor();
-  auto sB_ptr = storage.smem_B.begin();
-  ZeroSmemTile<SmemAllocB, typename Mainloop::SmemLayoutB, decltype(sB_ptr)>
-      sB_covered(sB_ptr, typename Mainloop::SmemLayoutB{}, blockDim.x,
-                 kCoveredSmemInitBarrier);
-  auto sB = sB_covered.tensor();
-  auto sSFA_ptr = storage.smem_SFA.begin();
-  E4M3OneSmemTile<cutlass::float_ue4m3_t,
-                  typename Mainloop::SmemLayoutSFA, decltype(sSFA_ptr)>
-      sSFA_covered(sSFA_ptr, typename Mainloop::SmemLayoutSFA{}, blockDim.x,
-                   kCoveredSmemInitBarrier);
-  auto sSFA = sSFA_covered.tensor();
-  auto sSFB_ptr = storage.smem_SFB.begin();
-  E4M3OneSmemTile<cutlass::float_ue4m3_t,
-                  typename Mainloop::SmemLayoutSFB, decltype(sSFB_ptr)>
-      sSFB_covered(sSFB_ptr, typename Mainloop::SmemLayoutSFB{}, blockDim.x,
-                   kCoveredSmemInitBarrier);
-  auto sSFB = sSFB_covered.tensor();
-
-  auto tCrA = thread_mma.partition_fragment_A(sA(_, _, cute::Int<0>{}));
-  auto tCrB = thread_mma.partition_fragment_B(sB(_, _, cute::Int<0>{}));
-  auto tCrSFA = collective.partition_fragment_SFA(sSFA(_, _, cute::Int<0>{}),
-                                                  thread_mma);
-  auto tCrSFB = collective.partition_fragment_SFB(sSFB(_, _, cute::Int<0>{}),
-                                                  thread_mma);
-
-  auto smem_tiled_copy_A = cute::make_tiled_copy_A(
-      typename Mainloop::SmemCopyAtomA{}, tiled_mma);
-  auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(thread_idx);
-  auto tCsA = smem_thr_copy_A.partition_S(
-      cute::as_position_independent_swizzle_tensor(sA));
-  auto tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
-  auto cA = cute::make_identity_tensor(
-      cute::make_shape(cute::Int<TileM>{}, cute::Int<TileK>{},
-                       cute::Int<1>{}));
-  auto tAsA_prod = smem_thr_copy_A.partition_D(sA);
-  auto tAcA_prod = smem_thr_copy_A.partition_D(cA);
-
-  auto smem_tiled_copy_B = cute::make_tiled_copy_B(
-      typename Mainloop::SmemCopyAtomB{}, tiled_mma);
-  auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx);
-  auto tCsB = smem_thr_copy_B.partition_S(
-      cute::as_position_independent_swizzle_tensor(sB));
-  auto tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
-  auto cB = cute::make_identity_tensor(
-      cute::make_shape(cute::Int<TileN>{}, cute::Int<TileK>{},
-                       cute::Int<1>{}));
-  auto tBsB_prod = smem_thr_copy_B.partition_D(sB);
-  auto tBcB_prod = smem_thr_copy_B.partition_D(cB);
-
-  auto tile_shape_mnk = cute::tile_shape(tiled_mma);
-  auto smem_tiled_copy_SFA = cute::make_tiled_copy_impl(
-      typename Mainloop::SmemCopyAtomSFA{},
-      collective.get_layoutSFA_TV(tiled_mma),
-      cute::make_shape(cute::size<0>(tile_shape_mnk),
-                       cute::size<2>(tile_shape_mnk)));
-  auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
-  auto tCsSFA = smem_thr_copy_SFA.partition_S(
-      cute::as_position_independent_swizzle_tensor(sSFA));
-  auto tCrSFA_copy_view = smem_thr_copy_SFA.retile_D(tCrSFA);
-
-  auto smem_tiled_copy_SFB = cute::make_tiled_copy_impl(
-      typename Mainloop::SmemCopyAtomSFB{},
-      collective.get_layoutSFB_TV(tiled_mma),
-      cute::make_shape(cute::size<1>(tile_shape_mnk),
-                       cute::size<2>(tile_shape_mnk)));
-  auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
-  auto tCsSFB = smem_thr_copy_SFB.partition_S(
-      cute::as_position_independent_swizzle_tensor(sSFB));
-  auto tCrSFB_copy_view = smem_thr_copy_SFB.retile_D(tCrSFB);
-
-  auto copy_kblock = [&](auto k_block) {
-    cute::copy(smem_tiled_copy_A, tCsA(_, _, k_block, cute::Int<0>{}),
-               tCrA_copy_view(_, _, k_block));
-    cute::copy(smem_tiled_copy_B, tCsB(_, _, k_block, cute::Int<0>{}),
-               tCrB_copy_view(_, _, k_block));
-
-    using MMAOp = typename Mainloop::TiledMma::MMA_Op;
-    fp4_shift_A(MMAOp{}, tCrA_copy_view(_, _, k_block));
-    fp4_shift_B(MMAOp{}, tCrB_copy_view(_, _, k_block));
-
-    cute::copy(tCsSFA(_, _, k_block, cute::Int<0>{}),
-               tCrSFA_copy_view(_, _, k_block));
-    cute::copy(tCsSFB(_, _, k_block, cute::Int<0>{}),
-               tCrSFB_copy_view(_, _, k_block));
-  };
-
-  auto gemm_kblock = [&](auto k_block) {
-    cute::gemm(tiled_mma,
-               cute::make_zip_tensor(tCrA(_, _, k_block),
-                                     tCrSFA(_, _, k_block)),
-               cute::make_zip_tensor(tCrB(_, _, k_block),
-                                     tCrSFB(_, _, k_block)),
-               accum);
-  };
-
-  constexpr int kTileElements = TileM * TileK;
-  const int active_k_tile_limit = (data_debug_mode == 5) ? 1 : k_tile_limit;
-  uint8_t* smem_a_bytes = cute::recast_ptr<uint8_t>(storage.smem_A.begin());
-  uint8_t* smem_b_bytes = cute::recast_ptr<uint8_t>(storage.smem_B.begin());
-  constexpr int kSmemABytes =
-      (cute::cosize_v<typename Mainloop::SmemLayoutA> + 1) / 2;
-  constexpr int kSmemBBytes =
-      (cute::cosize_v<typename Mainloop::SmemLayoutB> + 1) / 2;
-  auto write_partitioned_fp4 = [&](auto tDst,
-                                   auto tCoord,
-                                   const uint8_t* packed,
-                                   int source_row_base,
-                                   int source_col_base,
-                                   int packed_cols,
-                                   int k_base,
-                                   int mode) {
-    for (int i = 0; i < int(cute::size(tDst)); ++i) {
-      auto coord = tCoord(i);
-      const int row = int(cute::get<0>(coord));
-      const int k = int(cute::get<1>(coord));
-      const int source_col = source_col_base + k_base + k;
-      const uint8_t byte =
-          packed[(source_row_base + row) * packed_cols + (source_col >> 1)];
-      const uint8_t code = smem_fp4_debug_code(
-          static_cast<uint8_t>((source_col & 1) ? ((byte >> 4) & 0x0f)
-                                                : (byte & 0x0f)),
-          mode);
-      tDst(i) = cute::uint4_t(code);
-    }
-  };
-  auto K_BLOCK_MAX_PROD = cute::size<2>(tAsA_prod);
-  for (int k_tile = 0; k_tile < active_k_tile_limit; ++k_tile) {
-    const int k_base = k_tile * TileK;
-    for (int idx = block_thread_idx; idx < kSmemABytes; idx += blockDim.x) {
-      smem_a_bytes[idx] = 0;
-    }
-    for (int idx = block_thread_idx; idx < kSmemBBytes; idx += blockDim.x) {
-      smem_b_bytes[idx] = 0;
-    }
-    __syncthreads();
-    if (mma_thread_active) {
-      cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{}, [&](auto k_block) {
-        write_partitioned_fp4(tAsA_prod(_, _, k_block, cute::Int<0>{}),
-                              tAcA_prod(_, _, k_block, cute::Int<0>{}),
-                              q_packed, q_row_base, q_col_base, q_packed_cols,
-                              k_base, data_debug_mode);
-        write_partitioned_fp4(tBsB_prod(_, _, k_block, cute::Int<0>{}),
-                              tBcB_prod(_, _, k_block, cute::Int<0>{}),
-                              k_packed, kv_row_base, kv_col_base,
-                              kv_packed_cols, k_base, data_debug_mode);
-      });
-    }
-    for (int idx = block_thread_idx; idx < kTileElements / 2; idx += blockDim.x) {
-      const int row = idx / (TileK / 2);
-      const int packed_k = idx - row * (TileK / 2);
-      const int k0 = 2 * packed_k;
-      const int q_scale_col = (q_col_base + k_base + k0) >> 4;
-      const int kv_scale_col = (kv_col_base + k_base + k0) >> 4;
-      sSFA(row, k0, cute::Int<0>{}) =
-          make_ue4m3_raw(q_scales[(q_row_base + row) * q_scale_cols +
-                                   q_scale_col]);
-      sSFB(row, k0, cute::Int<0>{}) =
-          make_ue4m3_raw(k_scales[(kv_row_base + row) * kv_scale_cols +
-                                   kv_scale_col]);
-    }
-    if (data_debug_mode == 4) {
-      for (int idx = block_thread_idx;
-           idx < cute::cosize_v<typename Mainloop::SmemLayoutA>;
-           idx += blockDim.x) {
-        storage.smem_A.begin()[idx] = 2;
-      }
-      for (int idx = block_thread_idx;
-           idx < cute::cosize_v<typename Mainloop::SmemLayoutB>;
-           idx += blockDim.x) {
-        storage.smem_B.begin()[idx] = 2;
-      }
-    }
-    if (data_debug_mode == 6) {
-      uint8_t* smem_a_bytes =
-          cute::recast_ptr<uint8_t>(storage.smem_A.begin());
-      uint8_t* smem_b_bytes =
-          cute::recast_ptr<uint8_t>(storage.smem_B.begin());
-      constexpr int kSmemABytes =
-          (cute::cosize_v<typename Mainloop::SmemLayoutA> + 1) / 2;
-      constexpr int kSmemBBytes =
-          (cute::cosize_v<typename Mainloop::SmemLayoutB> + 1) / 2;
-      for (int idx = block_thread_idx;
-           idx < kSmemABytes;
-           idx += blockDim.x) {
-        smem_a_bytes[idx] = 0x22;
-      }
-      for (int idx = block_thread_idx;
-           idx < kSmemBBytes;
-           idx += blockDim.x) {
-        smem_b_bytes[idx] = 0x22;
-      }
-    }
-    if (scale_debug_mode == 1) {
-      for (int idx = block_thread_idx;
-           idx < cute::cosize_v<typename Mainloop::SmemLayoutSFA>;
-           idx += blockDim.x) {
-        storage.smem_SFA.begin()[idx] = make_ue4m3_raw(0x38);
-      }
-      for (int idx = block_thread_idx;
-           idx < cute::cosize_v<typename Mainloop::SmemLayoutSFB>;
-           idx += blockDim.x) {
-        storage.smem_SFB.begin()[idx] = make_ue4m3_raw(0x38);
-      }
-    }
-    __syncthreads();
-
-    if (mma_thread_active) {
-      auto K_BLOCK_MAX = cute::size<2>(tCrA);
-      copy_kblock(cute::Int<0>{});
-      cute::for_each(cute::make_int_sequence<K_BLOCK_MAX>{}, [&](auto k_block) {
-        auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
-        if (k_block_next > 0) {
-          copy_kblock(k_block_next);
-        }
-        gemm_kblock(k_block);
-      });
-    }
-    __syncthreads();
-  }
-
-  if (mma_thread_active) {
-    auto cC = cute::make_identity_tensor(
-        cute::take<0, 2>(ThreadBlockShape{}));
-    auto tCcC = thread_mma.partition_C(cC);
-    for (int i = 0; i < cute::size(accum); ++i) {
-      auto coord = tCcC(i);
-      const int row = int(cute::get<0>(coord));
-      const int col = int(cute::get<1>(coord));
-      if (row < TileM && col < TileN) {
-        out_tile[(out_row_base + row) * out_stride + out_col_base + col] =
-            accum(i);
-      }
-    }
-  }
-}
-
-__device__ __forceinline__ void cutlass_smem_atom_gemm_tile_body(
-    typename CutlassCollectiveMainloop::TensorStorage& storage,
-    const uint8_t* q_packed,
-    const uint8_t* q_scales,
-    const uint8_t* k_packed,
-    const uint8_t* k_scales,
-    float* out_tile,
-    int q_row_base,
-    int q_col_base,
-    int q_packed_cols,
-    int q_scale_cols,
-    int kv_row_base,
-    int kv_col_base,
-    int kv_packed_cols,
-    int kv_scale_cols,
-    int k_tile_limit,
-    int out_stride,
-    int out_row_base,
-    int out_col_base,
-    int data_debug_mode,
-    int scale_debug_mode) {
-  cutlass_smem_atom_gemm_tile_body_impl<CutlassCollectiveMainloop,
-                                        CutlassThreadBlockShape,
-                                        kCutlassTileM,
-                                        kCutlassTileN,
-                                        kCutlassTileK>(
-      storage, q_packed, q_scales, k_packed, k_scales, out_tile, q_row_base,
-      q_col_base, q_packed_cols, q_scale_cols, kv_row_base, kv_col_base,
-      kv_packed_cols, kv_scale_cols, k_tile_limit, out_stride, out_row_base,
-      out_col_base, data_debug_mode, scale_debug_mode);
-}
-
 template <class FrgTensorA, class FrgTensorSFA, class SmemTensorA,
           class SmemTensorSFA>
 __device__ __forceinline__ void cutlass_qk_tma_q_register_stage(
@@ -1043,9 +698,9 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
       qk_sB_covered(qk_sB_ptr, typename CutlassCollectiveMainloop::SmemLayoutB{},
                     blockDim.x, kCoveredSmemInitBarrier);
   auto qk_sB = qk_sB_covered.tensor();
-  // SM120 has no TMEM, so the 77 S/P/O lifetime is represented with compact
-  // shared-memory aliasing. B is the transient score/O region while K reuse is
-  // blocked; A/SFA are free after Q is resident and hold two compact P stages.
+  // SM120 has no TMEM, so QK logits, softmax probabilities, and PV staging use
+  // compact shared-memory aliasing once each producer-consumer phase releases
+  // its operand storage.
   __nv_bfloat16* smem_logits0 =
       reinterpret_cast<__nv_bfloat16*>(storage.logits_smem.data);
   __nv_bfloat16* smem_epilogue_o = smem_logits0;
@@ -1156,6 +811,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                        [&](auto k_block) {
           auto dst = tBsB_prod(_, _, k_block, write_stage);
           auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+          // K producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
             asm volatile("trap;\n");
           }
@@ -1165,6 +821,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
             const int k0 = int(cute::get<1>(coord0));
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+            // K producer requires 4-byte-aligned contiguous dim stride.
             if (((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) ||
                 ((k0 & 7) != 0) || paged_kv_params.k_stride_dim3 != 1) {
               asm volatile("trap;\n");
@@ -1178,6 +835,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
               uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
               const int row = int(cute::get<0>(coord));
               const int k = int(cute::get<1>(coord));
+              // CUTLASS B smem must colocate the 8 logical K nibbles in 4 bytes.
               if (row != row0 || k != k0 + j ||
                   dst_byte != dst0 + (j >> 1)) {
                 asm volatile("trap;\n");
@@ -1272,7 +930,6 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
           (void)scale;
           return sm120_nvfp4_paged_v_code(paged_kv_params, token, dim);
         } else {
-          asm volatile("trap;\n");
           return uint8_t{0};
         }
       };
@@ -1314,6 +971,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                        [&](auto k_block) {
           auto dst = tBsB_prod(_, _, k_block, write_stage);
           auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+          // V producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
             asm volatile("trap;\n");
           }
@@ -1323,11 +981,13 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
             const int k0 = int(cute::get<1>(coord0));
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+            // V producer writes each packed word through a 4-byte smem store.
             if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
               asm volatile("trap;\n");
             }
             uint32_t packed_word = 0;
             if constexpr (!kPvLayoutV) {
+              // Linear-V reblock groups 8 contiguous token positions per word.
               if ((k0 & 7) != 0) {
                 asm volatile("trap;\n");
               }
@@ -1341,6 +1001,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                 uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
                 const int col = int(cute::get<0>(coord));
                 const int k = int(cute::get<1>(coord));
+                // Linear-V reblock requires byte-pair colocation within the word.
                 if (col != col0 || k != k0 + j ||
                     dst_byte < dst0 || dst_byte >= dst0 + 4 ||
                     pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
@@ -1373,6 +1034,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                 uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
                 const int col = int(cute::get<0>(coord));
                 const int k = int(cute::get<1>(coord));
+                // PV-layout V must map each logical pair to one physical byte.
                 if (col != col0 || k != k0 + j ||
                     dst_byte < dst0 || dst_byte >= dst0 + 4 ||
                     pair_byte != dst_byte) {
@@ -1450,6 +1112,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                        [&](auto k_block) {
           auto dst = tAsA_prod(_, _, k_block, write_stage);
           auto coord_tensor = tAcA_prod(_, _, k_block, cute::Int<0>{});
+          // Q producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
             asm volatile("trap;\n");
           }
@@ -1459,6 +1122,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
             const int k0 = int(cute::get<1>(coord0));
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+            // Q producer writes each packed word through a 4-byte smem store.
             if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
               asm volatile("trap;\n");
             }
@@ -1472,6 +1136,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
               uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
               const int row = int(cute::get<0>(coord));
               const int k = int(cute::get<1>(coord));
+              // Q smem layout must colocate each FP4 pair inside the word.
               if (row != row0 || k != k0 + j || dst_byte < dst0 ||
                   dst_byte >= dst0 + 4 || pair_byte != dst_byte) {
                 asm volatile("trap;\n");
@@ -2092,6 +1757,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
             dst1 == dst0 + 1 && dst2 == dst0 + 2 && dst3 == dst0 + 3 &&
             dst4 == dst0 + 4 && dst5 == dst0 + 5 && dst6 == dst0 + 6 &&
             dst7 == dst0 + 7;
+        // P staging stores two 32-bit words and requires 8 contiguous bytes.
         if (contiguous && ((reinterpret_cast<uintptr_t>(dst0) & 0x3u) == 0)) {
           *reinterpret_cast<uint32_t*>(dst0) = packed_lo;
           *reinterpret_cast<uint32_t*>(dst0 + 4) = packed_hi;
