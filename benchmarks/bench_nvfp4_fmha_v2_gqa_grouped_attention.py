@@ -291,7 +291,8 @@ def main() -> None:
         raise ValueError("group sizes must be positive.")
 
     torch.manual_seed(0)
-    device = torch.device(f"cuda:{args.device}")
+    torch.cuda.set_device(args.device)
+    device = torch.device("cuda", args.device)
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     pages_per_seq = (args.kv_len + args.page_size - 1) // args.page_size
     total_pages = args.batch_size * pages_per_seq
@@ -350,6 +351,7 @@ def main() -> None:
         "fp4_v_layout": args.fp4_v_layout,
         "fp4_v_sf_layout": args.fp4_v_sf_layout,
         "causal": args.causal,
+        "window_left": args.window_left,
         "logits_soft_cap": args.logits_soft_cap,
         "groups": {},
     }

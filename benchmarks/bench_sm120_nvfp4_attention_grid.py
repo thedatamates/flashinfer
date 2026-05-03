@@ -36,6 +36,31 @@ def parse_int_list(value: str, *, default: tuple[int, ...]) -> tuple[int, ...]:
     return parsed
 
 
+def parse_cells(value: str) -> tuple[tuple[int, int], ...]:
+    cells: list[tuple[int, int]] = []
+    for raw_part in value.replace(";", ",").split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            q_text, kv_text = part.split(":", 1)
+        elif "x" in part:
+            q_text, kv_text = part.split("x", 1)
+        else:
+            raise ValueError(
+                "--cells entries must use q:kv or qxkv format, "
+                f"got {part!r}"
+            )
+        q_len = int(q_text)
+        kv_len = int(kv_text)
+        if q_len <= 0 or kv_len <= 0:
+            raise ValueError("--cells q and kv values must be positive")
+        cells.append((q_len, kv_len))
+    if not cells:
+        raise ValueError("--cells did not contain any q:kv pairs")
+    return tuple(cells)
+
+
 def default_output_group_span(head_dim: int) -> int:
     if head_dim == 128:
         return 1
@@ -67,9 +92,15 @@ def fused_split_kv_len(args: argparse.Namespace) -> int:
 
 
 def build_cells(args: argparse.Namespace) -> list[Cell]:
+    groups = parse_int_list(args.groups, default=DEFAULT_GROUPS)
+    if args.cells:
+        return [
+            Cell(q_len=q_len, kv_len=kv_len, head_dim=args.head_dim, group=group)
+            for group in groups
+            for q_len, kv_len in parse_cells(args.cells)
+        ]
     q_lens = parse_int_list(args.q_lens, default=DEFAULT_Q_LENS)
     kv_lens = parse_int_list(args.kv_lens, default=DEFAULT_KV_LENS)
-    groups = parse_int_list(args.groups, default=DEFAULT_GROUPS)
     return [
         Cell(q_len=q_len, kv_len=kv_len, head_dim=args.head_dim, group=group)
         for group in groups
@@ -225,6 +256,9 @@ def summarize(
             "kernel": kernel,
             "api": data.get("api"),
             "v_layout": data.get("v_layout"),
+            "causal": data.get("causal"),
+            "sliding_window": data.get("sliding_window"),
+            "logits_soft_cap": data.get("logits_soft_cap"),
             "fused_output_group_span": fused_output_group_span,
             "min_ms": bench["min_ms"],
             "mean_ms": bench["mean_ms"],
@@ -250,6 +284,9 @@ def summarize(
         "kernel": kernel,
         "api": None,
         "v_layout": None,
+        "causal": data.get("causal"),
+        "sliding_window": data.get("window_left"),
+        "logits_soft_cap": data.get("logits_soft_cap"),
         "min_ms": bench["min_ms"],
         "mean_ms": bench["mean_ms"],
         "output_finite": None,
@@ -263,6 +300,161 @@ def summarize(
 
 def format_optional_float(value: Any) -> str:
     return "-" if value is None else f"{float(value):.6f}"
+
+
+def format_optional_ratio(value: Any) -> str:
+    return "-" if value is None else f"{float(value):.3f}x"
+
+
+def format_optional_percent(value: Any) -> str:
+    return "-" if value is None else f"{float(value):.1f}%"
+
+
+def old_dense_sources(root: Path, head_dim: int) -> list[Path]:
+    reports = root / "reports"
+    candidates = [
+        reports / f"d{head_dim}_focus_baseline_20260430.summary.csv",
+        reports / f"d{head_dim}_hillclimb_postopt_20260429.summary.csv",
+        reports / f"d{head_dim}_hillclimb_180cell_20260430.summary.csv",
+        reports / f"d{head_dim}_group6_hillclimb_20260429.csv",
+        reports / f"d{head_dim}_full_context_sm120_fused_dense.csv",
+    ]
+    return [path for path in candidates if path.exists()]
+
+
+def load_old_dense_ms(root: Path, head_dim: int) -> dict[tuple[int, int, int], float]:
+    old: dict[tuple[int, int, int], float] = {}
+    for path in old_dense_sources(root, head_dim):
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("kernel") not in (None, "", "sm120_fused"):
+                    continue
+                row_head_dim = row.get("d") or row.get("head_dim")
+                if row_head_dim not in (None, "", str(head_dim)):
+                    continue
+                value = row.get("fused_ms") or row.get("min_ms")
+                if not value:
+                    continue
+                q_len = row.get("q") or row.get("q_len")
+                kv_len = row.get("kv") or row.get("kv_len")
+                key = (int(row["group"]), int(q_len), int(kv_len))
+                old.setdefault(key, float(value))
+    return old
+
+
+def old_dense_is_comparable(rows: list[dict[str, Any]]) -> bool:
+    """Old dense reports were causal, no-SWA, no-softcap exploration runs."""
+    fused_rows = [row for row in rows if row.get("kernel") == "sm120_fused"]
+    if not fused_rows:
+        return False
+    for row in fused_rows:
+        causal = row.get("causal")
+        if causal is False:
+            return False
+        sliding_window = row.get("sliding_window")
+        if sliding_window is not None and int(sliding_window) > 0:
+            return False
+        logits_soft_cap = row.get("logits_soft_cap")
+        if logits_soft_cap is not None and abs(float(logits_soft_cap)) > 0.0:
+            return False
+    return True
+
+
+def production_summary_rows(
+    rows: list[dict[str, Any]],
+    *,
+    root: Path,
+) -> list[dict[str, Any]]:
+    ok_rows = [row for row in rows if row.get("status", "ok") == "ok"]
+    if not ok_rows:
+        return []
+    head_dim = int(ok_rows[0]["d"])
+    old_dense = (
+        load_old_dense_ms(root, head_dim)
+        if old_dense_is_comparable(ok_rows)
+        else {}
+    )
+    by_cell: dict[tuple[int, int, int], dict[str, dict[str, Any]]] = {}
+    for row in ok_rows:
+        cell_key = (row["group"], row["q"], row["kv"])
+        if row["kernel"] == "sm120_fused":
+            if row.get("api") == "dense":
+                slot = "dense"
+            elif row.get("api") == "paged" and row.get("v_layout") == "pv":
+                slot = "paged_pv"
+            elif row.get("api") == "paged" and row.get("v_layout") == "linear":
+                slot = "paged_linear"
+            else:
+                slot = f"fused_{row.get('api')}_{row.get('v_layout')}"
+        else:
+            slot = row["kernel"]
+        by_cell.setdefault(cell_key, {})[slot] = row
+
+    summary: list[dict[str, Any]] = []
+    for cell_key in sorted(by_cell):
+        data = by_cell[cell_key]
+        dense_now = data.get("dense", {}).get("min_ms")
+        dense_pre = old_dense.get(cell_key)
+        paged_pv = data.get("paged_pv", {}).get("min_ms")
+        paged_linear = data.get("paged_linear", {}).get("min_ms")
+        nvfp4 = data.get("nvfp4_fa2", {}).get("min_ms")
+        bf16 = data.get("bf16_fa2", {}).get("min_ms")
+        fp8 = data.get("fp8_fa2", {}).get("min_ms")
+        regression = (
+            float(dense_now) / float(dense_pre)
+            if dense_now is not None and dense_pre is not None
+            else None
+        )
+        wrapper_overhead = (
+            float(paged_pv) / float(dense_now)
+            if paged_pv is not None and dense_now is not None
+            else None
+        )
+        reblock_cost = (
+            float(paged_linear) / float(paged_pv)
+            if paged_linear is not None and paged_pv is not None
+            else None
+        )
+        reblock_cost_pct = (
+            (reblock_cost - 1.0) * 100.0 if reblock_cost is not None else None
+        )
+        speedup_vs_nvfp4 = (
+            float(nvfp4) / float(paged_linear)
+            if nvfp4 is not None and paged_linear is not None
+            else None
+        )
+        speedup_vs_bf16 = (
+            float(bf16) / float(paged_linear)
+            if bf16 is not None and paged_linear is not None
+            else None
+        )
+        summary.append(
+            {
+                "group": cell_key[0],
+                "q": cell_key[1],
+                "kv": cell_key[2],
+                "dense_now_ms": dense_now,
+                "dense_pre_ms": dense_pre,
+                "dense_regression": regression,
+                "paged_pv_ms": paged_pv,
+                "paged_linear_ms": paged_linear,
+                "wrapper_overhead_vs_dense": wrapper_overhead,
+                "reblock_cost": reblock_cost,
+                "reblock_cost_pct": reblock_cost_pct,
+                "nvfp4_fa2_ms": nvfp4,
+                "fp8_fa2_ms": fp8,
+                "bf16_fa2_ms": bf16,
+                "paged_linear_speedup_vs_nvfp4": speedup_vs_nvfp4,
+                "paged_linear_speedup_vs_bf16": speedup_vs_bf16,
+                "paged_linear_finite": data.get("paged_linear", {}).get(
+                    "output_finite"
+                ),
+                "paged_pv_finite": data.get("paged_pv", {}).get("output_finite"),
+                "dense_finite": data.get("dense", {}).get("output_finite"),
+            }
+        )
+    return summary
 
 
 def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
@@ -284,6 +476,9 @@ def write_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
         "kernel",
         "api",
         "v_layout",
+        "causal",
+        "sliding_window",
+        "logits_soft_cap",
         "fused_output_group_span",
         "min_ms",
         "mean_ms",
@@ -396,6 +591,9 @@ def row_fieldnames() -> list[str]:
         "kernel",
         "api",
         "v_layout",
+        "causal",
+        "sliding_window",
+        "logits_soft_cap",
         "fused_output_group_span",
         "min_ms",
         "mean_ms",
@@ -441,6 +639,13 @@ def load_jsonl_rows(prefix: Path) -> list[dict[str, Any]]:
 def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
     _, _, summary_path, md_path = report_paths(prefix)
     ok_rows = [row for row in rows if row.get("status", "ok") == "ok"]
+    root = Path(__file__).resolve().parents[1]
+    prod_rows = production_summary_rows(rows, root=root)
+    fused_variants = {
+        (row.get("api"), row.get("v_layout"))
+        for row in ok_rows
+        if row.get("kernel") == "sm120_fused"
+    }
 
     baselines_by_cell: dict[tuple[int, int, int], dict[str, dict[str, Any]]] = {}
     fused_rows: list[dict[str, Any]] = []
@@ -515,7 +720,78 @@ def write_summary_reports(rows: list[dict[str, Any]], *, prefix: Path) -> None:
         writer.writeheader()
         writer.writerows(summary_rows)
 
+    if len(fused_variants) > 1:
+        prod_path = prefix.with_name(prefix.name + ".production.csv")
+        prod_fieldnames = [
+            "group",
+            "q",
+            "kv",
+            "dense_now_ms",
+            "dense_pre_ms",
+            "dense_regression",
+            "paged_pv_ms",
+            "paged_linear_ms",
+            "wrapper_overhead_vs_dense",
+            "reblock_cost",
+            "reblock_cost_pct",
+            "nvfp4_fa2_ms",
+            "fp8_fa2_ms",
+            "bf16_fa2_ms",
+            "paged_linear_speedup_vs_nvfp4",
+            "paged_linear_speedup_vs_bf16",
+            "paged_linear_finite",
+            "paged_pv_finite",
+            "dense_finite",
+        ]
+        with prod_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=prod_fieldnames)
+            writer.writeheader()
+            writer.writerows(prod_rows)
+
     with md_path.open("w") as f:
+        if len(fused_variants) > 1:
+            f.write(
+                "| q | kv | dense (now) | dense (pre) | regression | "
+                "paged-pv | paged-linear | wrapper overhead | reblock cost | "
+                "nvfp4_fa2 | fp8_fa2 | bf16_fa2 | speedup vs nvfp4 | "
+                "speedup vs bf16 |\n"
+            )
+            f.write(
+                "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+                "---:|---:|---:|\n"
+            )
+            for row in prod_rows:
+                f.write(
+                    f"| {row['q']} | {row['kv']} | "
+                    f"{format_optional_float(row['dense_now_ms'])} | "
+                    f"{format_optional_float(row['dense_pre_ms'])} | "
+                    f"{format_optional_ratio(row['dense_regression'])} | "
+                    f"{format_optional_float(row['paged_pv_ms'])} | "
+                    f"{format_optional_float(row['paged_linear_ms'])} | "
+                    f"{format_optional_ratio(row['wrapper_overhead_vs_dense'])} | "
+                    f"{format_optional_ratio(row['reblock_cost'])} "
+                    f"({format_optional_percent(row['reblock_cost_pct'])}) | "
+                    f"{format_optional_float(row['nvfp4_fa2_ms'])} | "
+                    f"{format_optional_float(row['fp8_fa2_ms'])} | "
+                    f"{format_optional_float(row['bf16_fa2_ms'])} | "
+                    f"{format_optional_ratio(row['paged_linear_speedup_vs_nvfp4'])} | "
+                    f"{format_optional_ratio(row['paged_linear_speedup_vs_bf16'])} |\n"
+                )
+
+            failures = [row for row in rows if row.get("status") == "error"]
+            if failures:
+                f.write("\n## Failures\n\n")
+                f.write("| group | q | kv | kernel | api | v_layout | error |\n")
+                f.write("|---:|---:|---:|---|---|---|---|\n")
+                for row in failures:
+                    error = str(row.get("error", "")).splitlines()[0][:180]
+                    f.write(
+                        f"| {row['group']} | {row['q']} | {row['kv']} | "
+                        f"{row['kernel']} | {row.get('api')} | "
+                        f"{row.get('v_layout')} | {error} |\n"
+                    )
+            return
+
         f.write("| group | q | kv | api | v_layout | fused | nvfp4_fa2 | fp8_fa2 | bf16_fa2 | speedup vs nvfp4 | cosine | pass |\n")
         f.write("|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|:---:|\n")
         for row in summary_rows:
@@ -561,6 +837,9 @@ def error_row(
         "kernel": kernel,
         "api": None,
         "v_layout": None,
+        "causal": None,
+        "sliding_window": None,
+        "logits_soft_cap": None,
         "fused_output_group_span": (
             fused_output_group_span if kernel == "sm120_fused" else None
         ),
@@ -635,6 +914,15 @@ def main() -> None:
         type=str,
         default="all",
         help="all or comma-separated GQA group sizes.",
+    )
+    parser.add_argument(
+        "--cells",
+        type=str,
+        default="",
+        help=(
+            "Explicit q:kv cell list, e.g. '1:4096,512:8192'. "
+            "When set, --q-lens and --kv-lens are ignored."
+        ),
     )
     parser.add_argument(
         "--kernels",

@@ -1375,3 +1375,211 @@ Interpretation:
   arbitrary-read cases into Python-side errors.
 - The D512 linear-V cold-compile cliff remains unchanged; this audit targeted
   correctness/perf-silent behavior, not ptxas time.
+
+## 2026-05-03 13:10 CDT - Benchmark Device Semantics and Sweep Sanity Check
+
+Decision:
+
+- Benchmark `--device` means the CUDA logical device ordinal visible inside the
+  process after `CUDA_VISIBLE_DEVICES` filtering.
+- Valid ways to target physical GPU 2:
+  - Unmasked process: `env -u CUDA_VISIBLE_DEVICES ... --device 2`.
+  - Masked process: `CUDA_VISIBLE_DEVICES=2 ... --device 0`.
+- Invalid/confusing pattern: `CUDA_VISIBLE_DEVICES=2 ... --device 2`. With the
+  mask set to one device, logical device 2 does not exist.
+
+Fix:
+
+- Updated the benchmark scripts that take `--device` and use CUDA event timing
+  to call `torch.cuda.set_device(args.device)` before creating tensors, events,
+  or synchronizing:
+  - `bench_gemma4_paged_workload_scenarios.py`
+  - `bench_nvfp4_d512_decode.py`
+  - `bench_nvfp4_d512_prefill.py`
+  - `bench_nvfp4_fmha_v2_gqa_grouped_attention.py`
+  - `bench_nvfp4_gqa_grouped_attention.py`
+  - `bench_nvfp4_gqa_grouped_pv.py`
+  - `bench_nvfp4_native_attention_gemm.py`
+  - `bench_nvfp4_v_cache_reblock.py`
+  - `bench_nvfp4_xqa_gqa_decode.py`
+- `bench_sm120_nvfp4_attention.py` already had this behavior.
+
+Why this mattered:
+
+- The first production matrix sweeps used `--device 2` with no device mask.
+  `bench_sm120_nvfp4_attention.py` set the active device correctly, so the
+  fused rows were timed on GPU 2.
+- `bench_nvfp4_fmha_v2_gqa_grouped_attention.py` allocated tensors on
+  `cuda:2` but timed/synchronized the process current device, typically
+  `cuda:0`. This produced bogus FA2/BF16/FP8 reference timings around
+  0.02-0.03 ms for long-context cells.
+
+Validation:
+
+- Syntax check passed for all patched benchmark scripts.
+- After the fix, every benchmark script with both `--device` and
+  `torch.cuda.Event` also calls `torch.cuda.set_device`.
+- D256 q=512 kv=8192 group=2 NVFP4 FA2 baseline:
+  - Unmasked `--device 2`: min_ms = 0.09344.
+  - Masked `CUDA_VISIBLE_DEVICES=2 --device 0`: min_ms = 0.090944.
+  - These agree within normal run noise and validate the logical-device
+    convention.
+- D256 q=4096 kv=262144 group=16 NVFP4 FA2 baseline:
+  - Patched script with unmasked `--device 2`: min_ms = 134.908.
+  - This matches the earlier synchronized-wall-clock sanity check and replaces
+    the invalid ~0.03 ms timing from the broken-device run.
+
+Sweep status:
+
+- `reports/d256_sm120_nvfp4_attention_paged_linear_qwen_full_grid_20260503`
+  completed 1440/1440 rows; fused rows were timed on the correct device, but
+  reference baseline columns are invalid and must be rerun.
+- `reports/d256_sm120_nvfp4_attention_paged_linear_gemma_sliding_grid_20260503`
+  was interrupted at 1196/1440 rows while diagnosing this issue. Its reference
+  columns are also invalid.
+- Remaining production matrix sweeps should be rerun only after this benchmark
+  device fix is committed, using either the unmasked `--device 2` convention or
+  the masked `CUDA_VISIBLE_DEVICES=2 --device 0` convention consistently.
+
+## 2026-05-03 13:20 CDT - Benchmark Surface Cleanup
+
+Context:
+
+- The SM120 NVFP4 benchmark surface had accumulated one-off scripts from the
+  D512 exploration, raw-GEMM baselines, grouped-GQA comparisons, V-cache reblock
+  debugging, XQA comparison, and Gemma-specific grid wrappers.
+- Those scripts served the hill-climb/debugging phase but duplicated or
+  predated the production wrapper and grid orchestrator.
+
+Decision:
+
+- Keep and ship:
+  - `bench_sm120_nvfp4_attention.py`: production wrapper and dense direct
+    benchmark surface.
+  - `bench_sm120_nvfp4_attention_grid.py`: production matrix orchestrator.
+  - `bench_nvfp4_fmha_v2_gqa_grouped_attention.py`: canonical FA2/BF16/FP8
+    reference comparison harness for the grid.
+- Retire the dev-artifact benchmark scripts:
+  - `bench_nvfp4_d512_decode.py`
+  - `bench_nvfp4_d512_prefill.py`
+  - `bench_nvfp4_native_attention_gemm.py`
+  - `bench_nvfp4_gqa_grouped_attention.py`
+  - `bench_nvfp4_gqa_grouped_pv.py`
+  - `bench_nvfp4_v_cache_reblock.py`
+  - `bench_nvfp4_xqa_gqa_decode.py`
+  - `bench_gemma4_attention_grid.py`
+  - `bench_gemma4_paged_workload_scenarios.py`
+
+Validation:
+
+- Checked for live references to the retired scripts outside worklogs/reports;
+  none remain.
+- Ran Python syntax checks on the kept benchmark surfaces:
+  - `bench_sm120_nvfp4_attention.py`
+  - `bench_sm120_nvfp4_attention_grid.py`
+  - `bench_nvfp4_fmha_v2_gqa_grouped_attention.py`
+
+Interpretation:
+
+- The production benchmark path is now narrower and matches the current
+  integration architecture: one direct/wrapper bench, one grid runner, one
+  reference comparison harness.
+- Historical reports and worklog entries still reference the retired scripts as
+  immutable experiment history; those references are intentionally not edited.
+
+## 2026-05-03 14:18 CDT - Production Focus Benchmark Run
+
+Context:
+
+- After fixing benchmark device semantics, ran the focused production-cell
+  benchmark set for Qwen 3.6 full-attention, Gemma sliding, and Gemma global
+  shapes.
+- The grid reporter was extended as a data-driven writer, not a focused-run
+  special case: it emits the production comparison table whenever the input
+  rows contain multiple SM120 fused variants.
+- Device convention for this run: unmasked process, `--device 2`, where device
+  2 is the RTX PRO 6000 Blackwell SM120 GPU.
+
+Reports:
+
+- `reports/prod_qwen_full_d256_g6_20260503.{jsonl,csv,summary.csv,production.csv,md,run.log}`
+- `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_20260503.{jsonl,csv,summary.csv,production.csv,md,run.log}`
+- `reports/prod_gemma_global_d512_g8_softcap30_20260503.{jsonl,csv,summary.csv,production.csv,md,run.log}`
+
+Smoke / reference findings:
+
+- D256 Qwen and Gemma sliding smokes completed all six requested rows.
+- D512 Gemma global smoke recorded finite SM120 fused, NVFP4 FA2, and FP8 FA2
+  rows, but `bf16_fa2` fails with FlashInfer's existing prefill invalid-config
+  error for this D512 grouped shape.
+- The same D512 `bf16_fa2` failure is present in
+  `reports/d512_hillclimb_180cell_20260430.csv`, so this is not a new SM120
+  kernel regression or a device-selection problem.
+
+Focused run status:
+
+- Qwen full D256 g6: 84 rows total, 80 ok, 4 errors.
+  - Errors are dense direct rows for q=1 decode cells. The dense FFI path
+    requires `q_rows` to be a positive multiple of tile_m=64; paged-wrapper
+    rows for the same q=1 cells are valid.
+- Gemma sliding D256 g2: 48 rows total, 46 ok, 2 errors.
+  - Errors are dense direct rows for q=1 cells for the same tile_m=64 reason.
+- Gemma global D512 g8: 66 rows total, 51 ok, 15 errors.
+  - 4 errors are dense direct q=1 rows; D512 dense requires tile_m=128.
+  - 11 errors are the pre-existing D512 `bf16_fa2` invalid-config failures.
+
+Headline performance:
+
+- Qwen full D256 g6:
+  - Geomean dense = 1.156 ms.
+  - Geomean paged-PV = 318.322 ms.
+  - Geomean paged-linear = 563.814 ms.
+  - Geomean paged-linear / dense = 708.6x.
+  - Geomean paged-linear / paged-PV = 1.77x, so in-kernel linear-V reblock is
+    adding about 77% over the already-slow paged-PV path.
+  - Geomean paged-linear speedup vs NVFP4 FA2 = 0.000885x.
+- Gemma sliding D256 g2:
+  - Geomean dense = 0.148 ms.
+  - Geomean paged-PV = 45.691 ms.
+  - Geomean paged-linear = 78.585 ms.
+  - Geomean paged-linear / dense = 494.0x.
+  - Geomean paged-linear / paged-PV = 1.72x.
+  - Geomean paged-linear speedup vs NVFP4 FA2 = 0.000472x.
+- Gemma global D512 g8:
+  - Geomean dense = 7.798 ms.
+  - Geomean paged-PV = 1374.055 ms.
+  - Geomean paged-linear = 2228.762 ms.
+  - Geomean paged-linear / dense = 363.3x.
+  - Geomean paged-linear / paged-PV = 1.62x.
+  - Geomean paged-linear speedup vs NVFP4 FA2 = 0.00105x.
+
+Interpretation:
+
+- The FA2 reference timings now scale with the chosen device and are no longer
+  the earlier bogus ~0.02 ms flatline for long-context prefill cells.
+- The current production paged path is not performance-usable. It has a large
+  fixed floor even for decode/short-context cells and scales into seconds for
+  long-context cells.
+- Dense direct timings remain in the expected sub-ms to tens-of-ms range on
+  prefill cells, so the regression is localized to the paged production path
+  and wrapper/native-paged execution, not the core dense kernel template.
+- Paged-PV is also hundreds of times slower than dense, so linear-V reblock is
+  not the primary root cause. Linear-V adds another ~1.6-1.8x on top of an
+  already-broken paged path.
+- Dense pre-integration comparison is only meaningful for no-SWA/no-softcap
+  cells with matching old dense rows. In this focused run that mostly applies
+  to the Qwen D256 cells; Gemma sliding/global specs intentionally leave
+  `dense_pre_ms` blank because the old runs did not use those spec configs.
+
+Next diagnostic direction:
+
+- Do not start broad 1080-cell sweeps until the paged production path is
+  diagnosed. The focused run already shows the broad sweep would mostly
+  characterize a broken path.
+- Localize the paged path floor by timing sub-steps inside
+  `BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper.run()` and the paged FFI:
+  BF16-Q quantize, native paged launch, split combine, output copy, and any
+  scratch zero/fill operations.
+- Compare paged-PV vs dense on the same q/kv cells first; because paged-PV
+  bypasses linear-V reblock, it isolates paged scheduling/scratch/combine
+  overhead from V-layout conversion.
