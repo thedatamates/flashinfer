@@ -1695,3 +1695,36 @@ Next target:
   path. The immediate problem is not wrapper launch count or split combine; it
   is per-codepoint block-table/stride/nibble extraction inside the stage
   kernel's load-warp producer.
+
+## 2026-05-03 15:55 CDT - Step 1 Paged K cp.async Port
+
+Change:
+
+- Ported the existing D128 paged K producer cp.async pattern to D256 and D512.
+- D256/D512 K producers now use `sm120_nvfp4_paged_k_word_ptr` plus
+  `cp_async::pred_load_32b` for each 8-nibble / 4-byte partition, followed by
+  `cp_async::commit_group()` and `cp_async::wait_group<0>()`.
+- D128 K producer was not changed.
+
+Validation:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py`: 36 passed.
+- NVFP4 test set:
+  `tests/attention/test_nvfp4_kv_head_dim_512.py`
+  `tests/utils/test_fp4_kv_quantization.py`: 62 passed.
+
+D512 reference cell after Step 1:
+
+- Cell: q=512, kv=65536, group=8, head_dim=512, causal, no sliding window,
+  logits softcap=30, split_kv_len=32768.
+- Paged-PV: 1240.798 ms min, 1242.119 ms mean.
+- Paged-linear: 2385.151 ms min, 2385.644 ms mean.
+
+Interpretation:
+
+- K cp.async removes about 31% from paged-PV at the reference cell
+  (1802.426 ms -> 1240.798 ms), but the path is still two orders of magnitude
+  too slow.
+- Remaining dominant work is in V producer and scale loops; the Step 1 result
+  confirms the scalar K producer was a major component but not the only
+  component of the paged slowdown.

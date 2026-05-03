@@ -23,6 +23,7 @@
 
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_covered_smem.cuh>
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh>
+#include <flashinfer/cp_async.cuh>
 #include <flashinfer/mma.cuh>
 
 namespace flashinfer::attention::blackwell::sm120_nvfp4::d512 {
@@ -787,41 +788,39 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             const int k0 = int(cute::get<1>(coord0));
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
-            // K producer writes each packed word through a 4-byte smem store.
-            if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
+            // K producer requires 4-byte-aligned contiguous dim stride.
+            if (((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) ||
+                ((k0 & 7) != 0) || paged_kv_params.k_stride_dim3 != 1) {
               asm volatile("trap;\n");
             }
-            uint32_t packed_word = 0;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
               auto coord = coord_tensor(i + j);
               auto ref = dst(i + j);
-              auto pair_ref = dst(i + (j ^ 1));
               uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
-              uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
               const int row = int(cute::get<0>(coord));
               const int k = int(cute::get<1>(coord));
-              // K smem layout must colocate each FP4 pair inside the word.
+              // CUTLASS B smem must colocate the 8 logical K nibbles in 4 bytes.
               if (row != row0 || k != k0 + j ||
-                  dst_byte < dst0 || dst_byte >= dst0 + 4 ||
-                  pair_byte != dst_byte) {
+                  dst_byte != dst0 + (j >> 1)) {
                 asm volatile("trap;\n");
               }
-              const int token = kv_tile * kCutlassTileN + row;
-              const int dim = k_outer * kCutlassTileK + k;
-              const uint8_t code =
-                  token < kv_len_tokens
-                      ? sm120_nvfp4_paged_k_code(paged_kv_params, token, dim)
-                      : 0;
-              const int byte_offset = int(dst_byte - dst0);
-              const int nibble_shift = (k & 1) ? 4 : 0;
-              packed_word |= static_cast<uint32_t>(code)
-                             << (8 * byte_offset + nibble_shift);
             }
-            *reinterpret_cast<uint32_t*>(dst0) = packed_word;
+            const int token = kv_tile * kCutlassTileN + row0;
+            const int dim0 = k_outer * kCutlassTileK + k0;
+            const bool in_bounds = token < kv_len_tokens;
+            const uint32_t* src =
+                in_bounds
+                    ? sm120_nvfp4_paged_k_word_ptr(paged_kv_params, token,
+                                                   dim0)
+                    : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
+            cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
+                reinterpret_cast<uint32_t*>(dst0), src, in_bounds);
           }
         });
       }
+
+      cp_async::commit_group();
 
       for (int idx = lane_idx; idx < kCutlassTileN * kCutlassTileK / 2;
            idx += cutlass::NumThreadsPerWarp) {
@@ -836,6 +835,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 : 0x38;
         qk_sSFB(row, k0, write_stage) = make_ue4m3_raw(scale);
       }
+      cp_async::wait_group<0>();
     }
   };
 
