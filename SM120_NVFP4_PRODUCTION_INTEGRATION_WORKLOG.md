@@ -3101,3 +3101,60 @@ Implication:
   memory-bounded split choice per cell. This does not solve the remaining
   structural producer gap, but it prevents the benchmark harness from
   overstating the gap by using stale split geometry.
+
+## 2026-05-04 01:18 CDT - Focused Production Benchmark Run Plan
+
+What I am about to run:
+
+- Three focused production report prefixes using the existing naming convention:
+  `prod_qwen_full_d256_g6_20260504`,
+  `prod_gemma_sliding_d256_g2_swa1024_softcap30_20260504`, and
+  `prod_gemma_global_d512_g8_softcap30_20260504`.
+- Each prefix accumulates `sm120_fused` rows for `api=paged/v_layout=linear`,
+  `api=paged/v_layout=pv`, and `api=dense`, plus reference FA2 rows.
+- The fused rows use `--fused-split-kv-len 0` so every cell gets the new
+  memory-bounded auto split instead of the stale hard-coded split.
+
+Why:
+
+- The previous production reports were generated before the PV/linear producer
+  transpose work, before O-smem coverage was fixed, and with stale split
+  geometry. They are no longer the right benchmark artifact for judging the
+  current code.
+- This is still a measurement pass: no kernel changes during the run.
+
+Device convention:
+
+- Use `CUDA_VISIBLE_DEVICES=2` and pass `--device 0` to benchmark scripts.
+  Inside the process the SM120 GPU is logical device 0; passing `--device 2`
+  under that environment is invalid.
+
+## 2026-05-04 01:42 CDT - Dense Decode Benchmark Padding Fix
+
+Finding:
+
+- The focused Qwen report exposed a dense benchmark harness bug for decode
+  cells (`q=1`): dense mode passed `q_rows=q_len * group`, which is not a
+  multiple of the SM120 dense kernel tile size.
+- The dense FFI already supports padded Q rows (`q_len * group <= q_rows`), but
+  the benchmark did not pad before quantization.
+- `flashinfer.nvfp4_quantize(..., SfLayout.layout_128x4)` can also return
+  scale rows padded to 128 while packed Q rows are only padded to 64, so the
+  benchmark must make the packed Q row count match the scale row count.
+
+Implementation:
+
+- Dense benchmark mode pads BF16 Q rows to the kernel tile size before
+  quantization.
+- If the quantizer pads Q scales beyond packed Q rows, the benchmark pads
+  `q_packed` with zero rows to match `q_scales`.
+- Partial/split/output scratch allocation follows the actual packed row count.
+
+Validation:
+
+- `python -m py_compile benchmarks/bench_sm120_nvfp4_attention.py
+  benchmarks/bench_sm120_nvfp4_attention_grid.py` passed.
+- Dense decode smoke `D256 q=1 kv=4096 group=6` passed with finite output and
+  measured `0.056 ms` mean.
+- The partial Qwen report containing dense decode errors was deleted before
+  rerunning so the report prefix stays clean.

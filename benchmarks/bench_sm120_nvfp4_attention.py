@@ -323,9 +323,26 @@ def main() -> None:
         kv_len=args.kv_len,
         head_dim=args.head_dim,
     )
-    q_packed, q_scales, q_global = quantize_cutlass(
-        q.reshape(q_rows, args.head_dim)
-    )
+    q_dense = q.reshape(q_rows, args.head_dim)
+    q_rows_padded = round_up(q_rows, tile_m_for_head_dim(args.head_dim))
+    if q_rows_padded != q_rows:
+        q_dense_padded = torch.zeros(
+            (q_rows_padded, args.head_dim), dtype=q.dtype, device=device
+        )
+        q_dense_padded[:q_rows, :] = q_dense
+        q_dense = q_dense_padded
+    q_packed, q_scales, q_global = quantize_cutlass(q_dense)
+    if q_scales.size(0) > q_packed.size(0):
+        q_packed_padded = torch.zeros(
+            (q_scales.size(0), q_packed.size(1)),
+            dtype=q_packed.dtype,
+            device=device,
+        )
+        q_packed_padded[: q_packed.size(0), :] = q_packed
+        q_packed = q_packed_padded
+    if q_scales.size(0) != q_packed.size(0):
+        raise RuntimeError("Q packed and scale row counts do not match after padding.")
+    q_rows_packed = int(q_packed.size(0))
     k_packed, k_scales, k_global = quantize_cutlass(k_bf16)
     v_pv_packed, v_pv_scales, v_global = quantize_cutlass(
         v_bf16.T.contiguous()
@@ -336,13 +353,13 @@ def main() -> None:
     num_splits = math.ceil(args.kv_len / split_kv_len)
 
     partial = torch.empty(
-        (num_splits, q_rows, args.head_dim),
+        (num_splits, q_rows_packed, args.head_dim),
         dtype=torch.bfloat16,
         device=device,
     )
-    split_m = torch.empty((num_splits, q_rows), dtype=torch.float32, device=device)
-    split_l = torch.empty((num_splits, q_rows), dtype=torch.float32, device=device)
-    out = torch.empty((q_rows, args.head_dim), dtype=torch.bfloat16, device=device)
+    split_m = torch.empty((num_splits, q_rows_packed), dtype=torch.float32, device=device)
+    split_l = torch.empty((num_splits, q_rows_packed), dtype=torch.float32, device=device)
+    out = torch.empty((q_rows_packed, args.head_dim), dtype=torch.bfloat16, device=device)
     workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=device)
     module = gen_fmha_nvfp4_sm120_module(
         args.head_dim,
@@ -393,7 +410,7 @@ def main() -> None:
         "causal": bool(args.causal),
         "sliding_window": args.sliding_window,
         "logits_soft_cap": args.logits_soft_cap,
-        "output_finite": bool(torch.isfinite(out.float()).all()),
+        "output_finite": bool(torch.isfinite(out[:q_rows].float()).all()),
         BENCHMARK_KEY: event_ms(run, warmup=args.warmup, repeat=args.repeat),
     }
     print(json.dumps(result, sort_keys=True))
