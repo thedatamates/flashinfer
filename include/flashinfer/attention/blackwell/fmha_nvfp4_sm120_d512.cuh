@@ -822,18 +822,31 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 
       cp_async::commit_group();
 
-      for (int idx = lane_idx; idx < kCutlassTileN * kCutlassTileK / 2;
+      constexpr int kKScaleCols = kCutlassTileK / 16;
+      for (int idx = lane_idx; idx < kCutlassTileN * kKScaleCols;
            idx += cutlass::NumThreadsPerWarp) {
-        const int row = idx / (kCutlassTileK / 2);
-        const int packed_k = idx - row * (kCutlassTileK / 2);
-        const int k0 = 2 * packed_k;
+        const int row = idx / kKScaleCols;
+        const int local_scale_col = idx - row * kKScaleCols;
         const int token = kv_tile * kCutlassTileN + row;
-        const int scale_col = (k_outer * kCutlassTileK + k0) >> 4;
-        const uint8_t scale =
-            token < kv_len_tokens
-                ? sm120_nvfp4_paged_k_scale(paged_kv_params, token, scale_col)
-                : 0x38;
-        qk_sSFB(row, k0, write_stage) = make_ue4m3_raw(scale);
+        const int scale_col = k_outer * kKScaleCols + local_scale_col;
+        uint8_t scale = 0x38;
+        if (token < kv_len_tokens) {
+          const int logical_page = token / paged_kv_params.page_size;
+          const int page_offset =
+              token - logical_page * paged_kv_params.page_size;
+          const int physical_page =
+              paged_kv_params.block_table[logical_page];
+          const int64_t scale_page_base =
+              sm120_nvfp4_paged_k_scale_page_base(paged_kv_params,
+                                                   physical_page);
+          scale = sm120_nvfp4_paged_k_scale_from_page_base(
+              paged_kv_params, scale_page_base, page_offset, scale_col);
+        }
+#pragma unroll
+        for (int k_offset = 0; k_offset < 16; k_offset += 2) {
+          qk_sSFB(row, local_scale_col * 16 + k_offset, write_stage) =
+              make_ue4m3_raw(scale);
+        }
       }
       cp_async::wait_group<0>();
     }

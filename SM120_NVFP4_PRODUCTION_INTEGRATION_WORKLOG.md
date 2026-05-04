@@ -2148,3 +2148,88 @@ Decision:
   Any future P1 revisit needs a smaller scoped helper boundary or a per-warp
   scratch design that compiles as a bounded code region instead of inlining the
   whole transpose/reblock loop into the producer body.
+
+## 2026-05-03 19:25 CDT - P2 Scale-Loop Hoist Plan
+
+What I am about to do:
+
+- Rewrite the K-scale producer loop in
+  `fmha_nvfp4_sm120_d{128,256,512}.cuh::stage_paged_k_tile`.
+- Current callsites invoke `sm120_nvfp4_paged_k_scale(...)` for every packed
+  K pair, so one 16-dim scale is reloaded and recomputes page/block-table
+  addressing eight times.
+- New shape: iterate `(row, scale_col)` once, hoist the K scale page base with
+  one block-table lookup, load one scale byte, then write that byte to the
+  eight SFB positions for the 16-dim scale group.
+- Done criteria: D512/full NVFP4 tests pass, and the D512 reference cell is
+  remeasured. This is expected to be smaller than V data work but should reduce
+  scalar page-table traffic without changing public tensors, spec axes, or smem.
+
+Reference code:
+
+```cpp
+// include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:827
+for (int idx = lane_idx; idx < kCutlassTileN * kCutlassTileK / 2;
+     idx += cutlass::NumThreadsPerWarp) {
+  const int row = idx / (kCutlassTileK / 2);
+  const int packed_k = idx - row * (kCutlassTileK / 2);
+  const int k0 = 2 * packed_k;
+  const int token = kv_tile * kCutlassTileN + row;
+  const int scale_col = (k_outer * kCutlassTileK + k0) >> 4;
+  const uint8_t scale =
+      token < kv_len_tokens
+          ? sm120_nvfp4_paged_k_scale(paged_kv_params, token, scale_col)
+          : 0x38;
+  qk_sSFB(row, k0, write_stage) = make_ue4m3_raw(scale);
+}
+```
+
+The existing linear-V scale prepass already uses the target shape: one scale
+computation per `(token_group, col_pair)` followed by repeated SFB writes for
+the covered token group:
+
+```cpp
+// include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:920
+pv_scale_pair_for(token_group_start, dim0, sf0, sf1);
+#pragma unroll
+for (int k_offset = 0; k_offset < 16; k_offset += 2) {
+  pv_sSFB(col0, local_k0 + k_offset, write_stage) = make_ue4m3_raw(sf0);
+  pv_sSFB(col0 + 1, local_k0 + k_offset, write_stage) = make_ue4m3_raw(sf1);
+}
+```
+
+## 2026-05-03 19:57 CDT - P2 Scale-Loop Hoist Result
+
+Implementation:
+
+- Added `sm120_nvfp4_paged_k_scale_page_base` and
+  `sm120_nvfp4_paged_k_scale_from_page_base`.
+- Replaced the D128/D256/D512 K-scale loop from one load per packed K pair to
+  one load per `(row, 16-dim scale group)` followed by eight SFB stores.
+- Existing linear-V scale prepass already had the same scale-group shape after
+  Path A, so no extra V-scale linear changes were needed. PV V-scale remained
+  unchanged.
+
+Correctness:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py -q`: 36 passed.
+- `tests/attention/test_nvfp4_kv_head_dim_512.py tests/utils/test_fp4_kv_quantization.py -q`:
+  62 passed.
+- No tolerance changes.
+
+Reference cell:
+
+`D=512, group=8, q=512, kv=65536, softcap=30, split_kv_len=32768,
+output_group_span=4, device=2`
+
+| state | paged-PV min ms | paged-linear min ms |
+| --- | ---: | ---: |
+| Path A | 899.385 | 1883.437 |
+| P2 K-scale hoist | 819.818 | 1805.615 |
+
+Characterization:
+
+- K-scale hoist is real but small relative to the remaining producer cost:
+  `8.9%` gain on paged-PV and `4.1%` gain on paged-linear at the reference cell.
+- Paged-linear is still `2.20x` paged-PV and `234.9x` dense at this cell, so
+  the dominant cost remains V data/reblock, not scale loops.

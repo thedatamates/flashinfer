@@ -144,6 +144,30 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_k_scale(
   return params.k_scales[src];
 }
 
+__device__ __forceinline__ int64_t sm120_nvfp4_paged_k_scale_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int physical_page) {
+  return params.kv_layout_hnd
+             ? (static_cast<int64_t>(physical_page) * params.k_scale_stride_page +
+                static_cast<int64_t>(params.kv_head) * params.k_scale_stride_dim1)
+             : (static_cast<int64_t>(physical_page) * params.k_scale_stride_page +
+                static_cast<int64_t>(params.kv_head) * params.k_scale_stride_dim2);
+}
+
+__device__ __forceinline__ uint8_t sm120_nvfp4_paged_k_scale_from_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int64_t scale_page_base,
+    int page_offset,
+    int scale_col) {
+  const int64_t src =
+      scale_page_base +
+      static_cast<int64_t>(page_offset) *
+          (params.kv_layout_hnd ? params.k_scale_stride_dim2
+                                : params.k_scale_stride_dim1) +
+      static_cast<int64_t>(scale_col) * params.k_scale_stride_dim3;
+  return params.k_scales[src];
+}
+
 __device__ __forceinline__ int sm120_nvfp4_linear_scale_token(
     int token, int scale_col, int scale_dim, int scale_layout) {
   if (scale_layout == 0) {
