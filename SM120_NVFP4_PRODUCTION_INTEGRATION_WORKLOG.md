@@ -7019,3 +7019,52 @@ Decision:
 - Reverted the diagnostic and did not port it to D128/D512.
 - The compiler appears to already handle enough of these scalar invariants that changing the lambda shape and argument flow does not reduce wall time.
 - Do not revisit score-mask arithmetic without a stronger change than scalar invariant hoisting.
+
+## 2026-05-04 18:47 CDT - Register Page-Cache Diagnostic Target
+
+Finding:
+
+- Post-rescale lineinfo NCU still puts the page-cache barrier at the top:
+  - `d256.cuh:846`, `if (load_thread_idx < kPagesPerKvTile)`: `796,097` samples and `793,019` barrier samples.
+- Two prior page-cache variants are known-bad:
+  - Direct block-table reload at every use site removed the barrier but regressed by adding too many loads.
+  - Schedule-level duplicate-skip left timing neutral because the barrier remained on the first fill for each tile.
+- A middle design is still untested: each load thread builds a register-resident page cache once per KV tile, then all K/V/scale uses read that register array. This removes the shared-cache barrier while bounding block-table traffic to `kPagesPerKvTile` loads per load thread per stage call, not per codepoint/use site.
+
+Implementation target:
+
+- D256 diagnostic only.
+- Replace the shared `storage.physical_page_cache[]` producer with a per-thread `int physical_page_regs[kCutlassTileN / 16]` array in the paged producer scope.
+- Make `cache_paged_physical_pages(kv_tile)` fill all entries of the register array for the calling load thread and remove `load_group_sync()`.
+- Replace D256 uses of `storage.physical_page_cache[local_page]` with `cached_physical_page(local_page)`.
+- Do not change public APIs, tensor layouts, K/V data layout, or launch geometry.
+
+Validation:
+
+- Benchmark D256 Qwen max-KV paged-PV at `q=4096` and `q=16384`.
+- If timing improves, run focused correctness before deciding whether to port.
+- If timing regresses, revert the diagnostic and record the barrier as not profitably removable by register duplication either.
+
+## 2026-05-04 18:51 CDT - Register Page-Cache Diagnostic Result
+
+Implementation:
+
+- Tested a D256-only diagnostic replacing the shared page cache with a per-load-thread register page cache.
+- Each load thread loaded all `kCutlassTileN / 16` physical pages for the current KV tile into registers and all K/V/scale use sites read the register array.
+- Removed the shared-cache `load_group_sync()` in the diagnostic.
+
+Measured result:
+
+| cell | old-scale baseline paged-PV ms | register page-cache paged-PV ms | result |
+|:---|---:|---:|:---|
+| D256 Qwen `q=4096 kv=262144 g=6` | `50.524` | `79.905` | regressed |
+| D256 Qwen `q=16384 kv=262144 g=6` | `200.354` | `302.884` | regressed |
+
+Decision:
+
+- Reverted the diagnostic and did not port it.
+- This closes the obvious page-cache replacement variants tested so far:
+  - direct block-table reload at every use site: regressed.
+  - schedule-level duplicate fill skipping: neutral.
+  - per-load-thread register page cache: regressed.
+- The shared page cache remains the least-bad current design. The NCU barrier samples are real, but removing the barrier by duplicating page-table work costs more than it saves.
