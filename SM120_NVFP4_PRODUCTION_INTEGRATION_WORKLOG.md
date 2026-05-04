@@ -2683,3 +2683,153 @@ Structural conclusion:
   a CTA-distributed producer modeled on `Gmem_tile_paged_kv`, or split a smaller
   CTA-distributed helper out of the current CUTLASS partition code. More scalar
   hoists inside the current one-warp producer are low-yield.
+
+## 2026-05-03 20:45 CDT - Two-Warp Paged V Producer Assist Plan
+
+What I am about to do:
+
+- Try the schedule-compatible multi-warp producer first: let the epilogue warp
+  assist the load warp only for paged V staging, while the eight MMA warps keep
+  their existing consumer role.
+- Change the V producer loops from `lane_idx` / `32` strides to a producer-local
+  thread index over two warps (`64` threads) for paged V only.
+- Add a producer-only named barrier around the V staging work so the load-warp
+  leader does not complete the V pipeline transaction until both producer warps
+  have finished writing the stage.
+- Keep Q/K staging unchanged. Keep dense TMA unchanged. Keep public API and smem
+  layout unchanged.
+
+Why this variant:
+
+- Full CTA-distributed V staging cannot be inserted directly into the current
+  warp-specialized schedule: the MMA warps are concurrently consuming QK/PV
+  stages and cannot safely join a producer-side `__syncthreads()` without a
+  larger scheduler rewrite.
+- The epilogue warp is idle until the final output handoff and can run the same
+  V prefetch schedule before entering `consume_and_store_output_span()`.
+- This tests whether producer issue width is the immediate limiter without
+  changing CUTLASS thread counts or the MMA role geometry.
+
+Done criteria:
+
+- D512 builds and passes `tests/attention/test_nvfp4_kv_head_dim_512.py`.
+- If D512 passes, port the same pattern to D128/D256.
+- Benchmark the D512 reference cell after the port. If the gain is small, record
+  that the one-warp scaffold is not the only limiter and move to the larger
+  scheduler replacement design rather than stacking more local tweaks.
+
+## 2026-05-03 20:55 CDT - Two-Warp Paged V Producer Assist Result
+
+Attempted variants:
+
+- Variant A: epilogue warp participates in paged V staging and is also marked as
+  a `VPipeline::Producer`.
+- Variant B: epilogue warp participates only in paged V staging/named-barrier
+  rendezvous; the load warp remains the sole formal VPipeline producer and
+  committer.
+
+Observed result:
+
+- Both variants built far enough to start the D512 test suite.
+- Both variants emitted 28 passing test dots, then stopped making progress in
+  `tests/attention/test_nvfp4_kv_head_dim_512.py`.
+- Variant B was run under `timeout 180s`; it timed out with exit code `124`.
+- No code from either variant was kept.
+
+Structural conclusion:
+
+- The epilogue warp cannot safely be grafted into the load warp's paged V
+  prefetch timeline in the current warp-specialized schedule. The output
+  pipeline and V prefetch pipeline have incompatible ordering requirements once
+  the epilogue warp is asked to do both jobs.
+- This closes the "just add one more producer warp" option. A real fix needs a
+  scheduler-level rewrite that changes the producer/consumer timeline, not a
+  local assistant warp inside the current branch structure.
+- The next viable implementation direction is a dedicated CTA-distributed paged
+  V kernel structure or a separate stage kernel modeled on fmha_v2's
+  `Gmem_tile_paged_kv`, with the synchronization model designed around all
+  participating producer threads from the start.
+
+## 2026-05-03 21:05 CDT - PV-Layout V Register Transpose Slice Plan
+
+What I am about to do:
+
+- Implement the register-transpose V data path only for `kPvLayoutV=true`,
+  starting in D512.
+- Each 8-lane subgroup loads 8 row-major `uint32_t` words from public PV-layout
+  V gmem: one token row per lane, 8 dim-contiguous FP4 codes per word.
+- The subgroup uses `__shfl_sync` to transpose those row words so each lane owns
+  one output dim across 8 tokens, then writes the resulting 32-bit
+  token-contiguous CUTLASS operand word directly to `pv_sB`.
+- Keep `kPvLayoutV=false` on the existing linear reblock path. That avoids the
+  previous D512 linear compile wall and lets the PV producer issue model be
+  measured independently.
+
+Why this variant:
+
+- PV-layout V does not need fp32 dequant/requant. It is the cleanest test of
+  whether row-major vector loads plus register transpose can collapse the
+  current per-codepoint scalar V path.
+- A vLLM-side PV writer only matters if the PV producer itself gets close to
+  dense. This slice answers that before spending more time on linear reblock.
+
+Done criteria:
+
+- D512 tests pass with no tolerance changes.
+- D512 reference cell paged-PV improves materially from `717.799 ms`.
+- If D512 passes, port the same PV-only path to D128/D256.
+
+## 2026-05-03 21:31 CDT - PV-Layout V Register Transpose Slice Result
+
+Implementation:
+
+- Added `sm120_nvfp4_paged_v_word_from_page_base()` for aligned 32-bit
+  row-major V loads from the public paged V tensor.
+- Replaced the `kPvLayoutV=true` V data producer in D128/D256/D512 with an
+  8-lane register transpose:
+  - each subgroup loads 8 row-major words for 8 token rows,
+  - `__shfl_sync` transposes row-major dim-contiguous codes into
+    token-contiguous CUTLASS operand words,
+  - each lane writes one 32-bit `pv_sB(col, k0, stage)` word after checking the
+    4-byte smem colocation invariant.
+- Left `kPvLayoutV=false` unchanged. Linear-V still uses the existing fp32
+  dequant/requant path.
+
+Validation:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py`
+  `tests/utils/test_fp4_kv_quantization.py` -> `62 passed in 206.46s`.
+- No tolerance changes.
+- All benchmarked outputs reported `output_finite=true`.
+
+Bench deltas:
+
+| cell | before mean ms | after mean ms | delta |
+| --- | ---: | ---: | ---: |
+| D512 g8 q512 kv65536 softcap30 paged-PV | 717.799 | 283.155 | 2.54x faster |
+| D512 g8 q512 kv65536 softcap30 paged-linear | 1740.975 | 1742.628 | unchanged |
+| D256 g6 q512 kv65536 softcap30 paged-PV | 185.656 | 104.127 | 1.78x faster |
+| D256 g2 q512 kv8192 swa1024 softcap30 paged-PV | 62.079 | 25.925 | 2.39x faster |
+| D128 g8 q512 kv8192 paged-PV | n/a | 21.115 | finite smoke/reference |
+
+Characterization:
+
+- This is the first V data structural change with a multi-x payoff. It confirms
+  that the old PV producer was paying heavily for scalar per-codepoint loads and
+  that row-major vector load plus register transpose is the right data movement
+  shape for PV-layout V.
+- The remaining D512 paged-PV gap is still large: `283.155 ms` vs dense
+  `7.682 ms` at the reference cell, roughly `36.9x` slower.
+- Linear-V did not improve because it intentionally stayed on the old branch.
+  The stock-vLLM production path therefore remains blocked on the linear reblock
+  design, not on PV-layout V anymore.
+
+Next structural implication:
+
+- A vLLM-side PV writer is now more valuable than it was before this patch:
+  the future PV path moved from `~93x` dense to `~37x` dense at the D512
+  reference cell. It still does not close the full gap, but it removes the
+  `~6.15x` linear-vs-PV penalty now visible at the same cell
+  (`1742.628 / 283.155`).
+- The linear branch needs a separate register-transpose-plus-requant design with
+  helper boundaries to avoid the previous D512 ptxas wall.

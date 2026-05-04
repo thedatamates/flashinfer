@@ -270,6 +270,19 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code_pair_from_page_base(
   return params.v_pages[src];
 }
 
+__device__ __forceinline__ uint32_t sm120_nvfp4_paged_v_word_from_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int64_t page_base,
+    int page_offset,
+    int packed_col) {
+  const int64_t src =
+      page_base +
+      static_cast<int64_t>(page_offset) *
+          (params.kv_layout_hnd ? params.v_stride_dim2 : params.v_stride_dim1) +
+      static_cast<int64_t>(packed_col) * params.v_stride_dim3;
+  return *reinterpret_cast<const uint32_t*>(params.v_pages + src);
+}
+
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code_from_page_base(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int64_t page_base,
