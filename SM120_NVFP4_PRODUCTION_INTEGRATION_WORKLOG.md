@@ -5748,3 +5748,80 @@ Next profiling target:
 
 - Move back to NCU/NSYS on the current D256 post-cache baseline rather than continuing small cache-local rewrites.
 - The useful question is now where the remaining `~2.46x` D256 linear-vs-dense ratio lives: cache prepass launches, stage-kernel local spills, shared-memory wavefront excess, or scheduler/CTA geometry.
+
+## 2026-05-04 14:49 CDT - D256 Linear Post-Cache NSYS/NCU Result
+
+Finding:
+
+- NCU on the current D256 Qwen paged-linear stage no longer identifies the internal linear data cache as a sector problem.
+- The largest remaining stage-kernel global/shared attribution is the 32-bit K `cp.async` path at `include/flashinfer/cp_async.cuh:242`.
+- Stage-kernel NCU summary:
+  - Duration: `2.62 ms` under NCU.
+  - L2 global excessive sectors: `6,291,456`.
+  - L1 shared excessive wavefronts: `18,974,208`.
+  - Local memory spilling requests: `37,408,368`.
+  - Dominant not-issued stalls: barrier (`60,334`), long scoreboard (`37,461`), sleeping (`37,764`), wait (`17,091`).
+- NSYS on D256 Qwen paged-linear splits the full wrapper work:
+  - Stage kernel: `2` instances, `2.495 ms` average.
+  - Linear scale cache build: `2` instances, `0.286 ms` average.
+  - Linear data cache build: `2` instances, `0.286 ms` average.
+  - Split-K combine: about `0.040 ms`.
+- NSYS on D256 dense at the same cell:
+  - Stage kernel: `2` instances, `1.226 ms` average.
+  - Dense stage grid: `48 x 22`, block `512`, dynamic smem `0.050 MB`.
+  - Paged-linear stage grid: `24 x 22`, block `640`, dynamic smem `0.092 MB`.
+- The remaining D256 gap is not Python/wrapper overhead. It is primarily stage-kernel time, plus about `0.57 ms` per wrapper call in linear cache prepasses.
+
+Decision:
+
+- Do not pursue more local byte/cache load tweaks without a stage-kernel source target.
+- The next linear-specific target is the two-kernel linear cache prepass, because NSYS quantifies it as a bounded `~0.57 ms` component and it is structurally redundant.
+
+Implementation target:
+
+- Add a D256-only fused linear-V cache build path.
+- Current path:
+  - Kernel 1 computes per `(token_group, dim_pair)` PV scales into `v_linear_scale_cache`.
+  - Kernel 2 revisits every `(token, packed_col)`, reloads those scales, and writes `v_linear_data_cache`.
+- Fused path:
+  - One kernel handles one `(token_group, dim_pair)` per thread.
+  - It computes the two output scales, writes the scale cache for the stage producer, then loops the 16 tokens in the group and writes the data cache bytes using the freshly computed scales.
+  - This removes one launch and the data-cache kernel's scale-cache rereads.
+- Scope is D256/coalesced layout first; D128/D512 stay on the existing two-kernel path unless profiled separately.
+
+Validation:
+
+- Focused D256 correctness.
+- D256 Qwen paged-linear benchmark.
+- NSYS recheck if wall time improves to verify scale/data cache build time collapses or moves.
+- Full NVFP4 test file before committing a kept fused path.
+
+Decision criteria:
+
+- Keep if D256 paged-linear improves and correctness stays green.
+- Revert if serializing 16 token writes per thread makes the cache build slower or changes output.
+
+## 2026-05-04 14:56 CDT - D256 Fused Linear Cache Rejected
+
+Finding:
+
+- Implemented the D256 fused linear-V cache prepass as a local experiment:
+  - One kernel computed the two PV scales for each `(token_group, dim_pair)`.
+  - The same thread then wrote the 16 token data-cache bytes using those freshly computed scales.
+  - D128/D512 launch paths were kept semantically unchanged by falling back to the existing two-kernel prepass.
+- Focused correctness passed:
+  - `3 passed in 45.86s`.
+- The D256 Qwen reference cell did not improve:
+  - Baseline after the D256 cache-layout commit: `3.105 ms`.
+  - Fused prepass experiment: `3.126 ms` mean (`3.116 ms` min, `3.143 ms` max).
+- The result is consistent with the design risk: the fused kernel removes one launch and one scale-cache reread, but it also serializes the 16 per-token data-cache writes into the scale-compute thread.
+
+Decision:
+
+- Rejected the fused linear cache prepass and restored the committed two-kernel implementation.
+- This was a bounded NSYS-driven experiment on the measured `~0.57 ms` cache-prepass component; it does not move the dominant stage-kernel gap.
+
+Next profiling target:
+
+- Stop spending effort on low-yield cache prepass launch fusion.
+- Use NCU/NSYS source attribution on the stage kernel itself. The current stage gap is dominated by stage-kernel time, not Python, wrapper orchestration, or linear cache prepass launch count.
