@@ -4331,3 +4331,16 @@ D256 load-warp recheck result:
 - Diagnostic `LOAD_WARPS=9`: paged-PV `3.041 ms`; worse.
 - Diagnostic `LOAD_WARPS=11`: paged-PV `2.863 ms`, paged-linear `3.562 ms`; better on both PV and linear.
 - Decision: keep D256 paged no-SWA `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=11` and validate with the focused NVFP4 suite.
+
+Current reference sanity after D256 load-warp commit:
+- Sequential q=512 kv=65536 softcap=30 paged-wrapper sanity set on GPU 2:
+  - D128 g=4 paged-PV `1.482 ms`, paged-linear `1.840 ms`.
+  - D256 g=6 paged-PV `2.862 ms`, paged-linear `3.557 ms`.
+  - D512 g=8 paged-PV `7.326 ms`, paged-linear `8.185 ms`.
+- All six outputs were finite. This is the current performance baseline before the focused production matrix.
+
+Production grid smoke:
+- Ran `bench_sm120_nvfp4_attention_grid.py` with explicit `--cells 512:4096`, D256 g=6, paged-linear, softcap=30, kernels `sm120_fused,nvfp4_fa2,bf16_fa2`.
+- Report prefix: `reports/prod_smoke_d256_g6_linear_20260504`.
+- Rows completed successfully. The FA2 baselines are no longer the earlier bogus flat `~0.025 ms` readings: at q=512 kv=4096, nvfp4_fa2 min `0.130848 ms`, bf16_fa2 min `0.090112 ms`, sm120_fused paged-linear min `1.020896 ms`.
+- Explicit-cell report plumbing is general (`--cells`), not a focused-only mode; the same writer emits summaries from the rows present.
