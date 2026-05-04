@@ -4849,3 +4849,47 @@ Next profiling target:
 
 - Re-run focused NCU after this commit with source counters and warp-state sampling, using the coalesced build as the new baseline.
 - Attribute the top shared-store excessive wavefront PCs before changing the store layout. Do not add another producer rewrite without a profiler-backed PC/source target.
+
+## 2026-05-04 12:25 CDT - PV B Store-Contiguity Diagnostic Target
+
+Finding:
+
+- After PV V load coalescing, NCU moved the bottleneck from global V data loads to shared stores in the PV V producer.
+- The top shared-store PCs are eight unrolled `ST.E` instructions, each with `658,560` excessive shared wavefronts. Their identical counts match the eight `packed_words[dim_offset]` stores in the new PV V data path.
+- The current lane ownership is load-coalesced but store-strided: lane `l` owns columns `l * 8 + {0..7}`. For each unrolled `dim_offset` store, lanes write columns separated by eight, which is the measured shared-store problem.
+
+Diagnostic target:
+
+- Check whether the CUTLASS PV B smem layout maps the eight column words owned by one lane to contiguous physical shared-memory addresses.
+- If `pv_sB(local_col0 + dim_offset, local_k0, write_stage)` is contiguous at `4 * dim_offset` bytes, a per-lane vectorized store is a viable next experiment.
+- If that contiguity does not hold, vectorizing the lane-local stores is blocked; the next option is a real transpose through a small per-warp staging tile or a register-transpose routine, not another scalar store reorder.
+
+Validation:
+
+- Add the contiguity check as a temporary diagnostic in the D256 PV path only.
+- Run the D256 paged-PV wrapper target once. A trap means the vector-store route is invalid for the current CUTLASS operand layout.
+- Revert the diagnostic immediately after recording the result.
+
+Decision criteria:
+
+- Only implement a vectorized PV B store if the diagnostic proves the physical contiguity invariant.
+- Otherwise leave the committed coalesced-load path intact and move to the next profiler-backed design.
+
+## 2026-05-04 12:27 CDT - PV B Store-Contiguity Diagnostic Result
+
+Finding:
+
+- The temporary D256 PV-path diagnostic trapped on the production reference cell.
+- The checked invariant was: `pv_sB(local_col0 + dim_offset, local_k0, write_stage)` should equal the base pointer plus `4 * dim_offset` bytes for `dim_offset = 1..7`.
+- That invariant is false for the current CUTLASS PV B operand smem layout.
+
+Decision:
+
+- Reverted the temporary trap immediately.
+- Do not pursue a lane-local vectorized store for the committed PV coalesced-load path. The physical layout is not contiguous across the eight column words owned by one lane.
+- The remaining shared-store wavefront excess cannot be fixed by changing scalar stores into a per-lane vector store.
+
+Next profiling target:
+
+- Any store-side fix now needs a real transpose of ownership before the store, or a small staging layout that makes the final store lane-contiguous in the CUTLASS operand.
+- The next experiment should be scoped to D256 first and should be measured against both correctness and NCU shared-wavefront counters before propagation.
