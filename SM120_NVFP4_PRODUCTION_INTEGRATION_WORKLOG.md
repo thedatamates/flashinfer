@@ -2372,3 +2372,33 @@ Characterization:
 - After P4, paged-PV is still `93.4x` dense and paged-linear is still
   `2.43x` paged-PV. Further large wins require a new V data structural design,
   not more scalar scale hoists.
+
+## 2026-05-03 19:25 CDT - P5 Production Matrix Plan
+
+What I am running:
+
+- Use `benchmarks/bench_sm120_nvfp4_attention_grid.py` with the existing
+  `--cells`/grid support and the general report writer.
+- One report prefix per production spec; run three sequential fused variants
+  into the same prefix: `paged`+`linear`, `paged`+`pv`, and `dense`.
+- Baseline per cell is `nvfp4_fa2`; the first variant records it and later
+  variants skip existing baseline rows through the grid driver's resume key.
+- Device numbering is unmasked production numbering: `--device 2` with no
+  `CUDA_VISIBLE_DEVICES`, matching the benchmark/device fix.
+- Done criteria: all three spec prefixes have `.jsonl`, `.csv`,
+  `.summary.csv`, `.production.csv`, and `.md` reports.
+
+Report prefixes:
+
+- `reports/prod_qwen_full_d256_g6_p4_20260503`
+- `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_p4_20260503`
+- `reports/prod_gemma_global_d512_g8_softcap30_p4_20260503`
+
+Cell sets:
+
+- Qwen full: `D=256`, `group=6`, `q={1,128,512,2048}`,
+  `kv={4096,16384,65536,262144}`, causal, no sliding window, softcap `30`.
+- Gemma sliding: `D=256`, `group=2`, `q={128,512,1024,2048}`,
+  `kv={1024,8192}`, causal, sliding window `1024`, softcap `30`.
+- Gemma global: `D=512`, `group=8`, `q={1,128,512,2048}`,
+  `kv={4096,16384,65536,262144}`, causal, no sliding window, softcap `30`.
