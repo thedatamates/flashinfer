@@ -6438,3 +6438,68 @@ Decision:
 
 - Keep the bypass because it is a small decode improvement, reduces decode workspace pressure, and does not regress the measured prefill sanity cells.
 - Do not treat it as the structural linear-V solution. The remaining decode gap requires avoiding full-cache linear reblock for q1 entirely, or changing the production writer/layout so the kernel consumes PV-layout V.
+
+## 2026-05-04 17:02 CDT - Extended-Q Production Matrix Target
+
+Finding:
+
+- The focused production matrix so far covered:
+  - Qwen full D256: `q={1,128,512,2048}`, `kv={4096,16384,65536,262144}`.
+  - Gemma sliding D256: `q={128,512,1024,2048}`, `kv={1024,8192}`.
+  - Gemma global D512: `q={1,128,512,2048}`, `kv={4096,16384,65536,262144}`.
+- The next requested extension is to add long-prefill Q lengths: `q={4096,8192,16384}`.
+- These are high-volume cells where split selection and partial-buffer pressure matter more than the short-prefill and decode rows.
+
+Implementation target:
+
+- Run only the added Q rows under new report prefixes so existing 40-cell reports remain unchanged.
+- Keep the same production spec definitions:
+  - Qwen full: D256, group 6, causal, no sliding window, `softcap=0`.
+  - Gemma sliding: D256, group 2, causal, `sliding_window=1024`, `softcap=30`.
+  - Gemma global: D512, group 8, causal, no sliding window, `softcap=30`.
+- Record `sm120_fused` paged-linear, paged-PV, dense, and `nvfp4_fa2` for each added cell.
+- Use one bench process at a time on GPU 2.
+
+Validation:
+
+- All `sm120_fused` rows must report `output_finite=true`.
+- Parse each report for wrapper overhead, reblock cost, speedup vs `nvfp4_fa2`, and the worst cells.
+- Use the new worst cell, if any, as the next NCU/NSYS target.
+
+## 2026-05-04 17:11 CDT - Extended-Q Production Matrix Result
+
+Reports:
+
+- `reports/prod_qwen_full_d256_g6_extended_q_20260504`
+- `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_extended_q_20260504`
+- `reports/prod_gemma_global_d512_g8_softcap30_extended_q_20260504`
+
+Validation:
+
+- All generated `sm120_fused` rows completed with `status=ok`.
+- All generated `sm120_fused` rows reported `output_finite=True`.
+- The added Q rows were `q={4096,8192,16384}`.
+
+Finding:
+
+- Qwen D256 full-attention is the priority large-Q/max-KV target. At `q=16384 kv=262144`, dense is `145.721 ms`, paged-PV is `242.682 ms`, paged-linear is `239.359 ms`, and `nvfp4_fa2` is `203.224 ms`.
+- For Qwen D256, paged-linear and paged-PV are effectively identical at large Q: geomean `linear/PV = 1.004x`. The remaining large-Q gap is not linear-V reblock specific.
+- Qwen D256 geomean over the extended-Q cells: paged-linear/dense `1.880x`, paged-PV/dense `1.873x`, paged-linear speedup vs `nvfp4_fa2` `0.655x`.
+- Gemma D512 global is still above dense but is already competitive at long KV. At `q=16384 kv=262144`, dense is `706.142 ms`, paged-PV is `879.168 ms`, paged-linear is `892.559 ms`, and `nvfp4_fa2` is `1184.983 ms`.
+- Gemma D512 geomean over the extended-Q cells: paged-linear/dense `1.292x`, paged-PV/dense `1.234x`, paged-linear speedup vs `nvfp4_fa2` `1.148x`.
+- Gemma sliding D256 remains poor vs `nvfp4_fa2`, but its KV is window-bounded to `1024/8192`, so it is not the first target for the requested large-KV pass.
+
+Worst cells:
+
+| spec | cell | dense ms | paged-PV ms | paged-linear ms | nvfp4 ms | linear/dense | linear speedup vs nvfp4 |
+|:---|:---|---:|---:|---:|---:|---:|---:|
+| Qwen D256 | q=4096 kv=16384 | 2.350 | 5.166 | 5.534 | 3.496 | 2.355x | 0.632x |
+| Qwen D256 | q=16384 kv=262144 | 145.721 | 242.682 | 239.359 | 203.224 | 1.643x | 0.849x |
+| Gemma sliding D256 | q=16384 kv=8192 | 1.645 | 5.159 | 5.110 | 1.329 | 3.107x | 0.260x |
+| Gemma D512 | q=16384 kv=262144 | 706.142 | 879.168 | 892.559 | 1184.983 | 1.264x | 1.328x |
+
+Decision:
+
+- Profile Qwen D256 `q=16384 kv=262144 g=6` next. It is the strongest overlap of the new target criteria: large Q, max KV, production full-attention configuration, and still slower than `nvfp4_fa2`.
+- Start with NSYS paged-PV vs dense to separate stage, combine, and any auxiliary kernels before using NCU source attribution.
+- Use paged-PV for the first profile because linear and PV are equivalent at this scale; PV removes linear-V cache/reblock noise and isolates the paged mainloop overhead.
