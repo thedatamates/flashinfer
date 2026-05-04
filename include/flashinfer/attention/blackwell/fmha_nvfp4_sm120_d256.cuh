@@ -1041,68 +1041,76 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         constexpr int kTransposeDims = 8;
         constexpr int kTokenGroups = kCutlassTileN / kTransposeTokens;
         constexpr int kDimGroups = kOutputTileN / kTransposeDims;
+        constexpr int kCoalescedDimGroups = 8;
+        static_assert(kDimGroups % kCoalescedDimGroups == 0);
+        constexpr int kDimBlocks = kDimGroups / kCoalescedDimGroups;
         constexpr int kWarpTransposeGroups = kSm120Nvfp4FmhaLoadThreadCount / 8;
         const int load_subgroup = load_thread_idx >> 3;
-        const int subgroup = lane_idx >> 3;
         const int subgroup_lane = lane_idx & 7;
-        const int subgroup_base_lane = lane_idx & ~7;
-        const unsigned subgroup_mask =
-            static_cast<unsigned>(0xffu << (subgroup * 8));
-        for (int tile = load_subgroup; tile < kTokenGroups * kDimGroups;
+        for (int tile = load_subgroup; tile < kTokenGroups * kDimBlocks;
              tile += kWarpTransposeGroups) {
           const int token_group = tile % kTokenGroups;
-          const int dim_group = tile / kTokenGroups;
+          const int dim_block = tile / kTokenGroups;
           const int local_k0 = token_group * kTransposeTokens;
-          const int local_dim0 = dim_group * kTransposeDims;
-          const int token =
-              kv_tile * kCutlassTileN + local_k0 + subgroup_lane;
+          const int local_dim0 =
+              dim_block * kCoalescedDimGroups * kTransposeDims +
+              subgroup_lane * kTransposeDims;
           const int dim_base =
               effective_out_group_idx * kOutputTileN + local_dim0;
-          uint32_t row_word = 0;
-          if (token < kv_len_tokens) {
-            const int local_token = local_k0 + subgroup_lane;
-            const int local_page = local_token >> 4;
-            const int page_offset = local_token & 15;
-            const int physical_page = storage.physical_page_cache[local_page];
-            const int64_t data_page_base =
-                sm120_nvfp4_paged_v_data_page_base(
-                    paged_kv_params, effective_kv_head, physical_page);
-            row_word = sm120_nvfp4_paged_v_word_from_page_base(
-                paged_kv_params, data_page_base, page_offset, dim_base >> 1);
-          }
-
-          uint32_t packed_word = 0;
+          uint32_t packed_words[kTransposeDims] = {};
 #pragma unroll
-          for (int src_lane = 0; src_lane < 8; ++src_lane) {
-            const uint32_t peer_word =
-                __shfl_sync(subgroup_mask, row_word,
-                            subgroup_base_lane + src_lane);
-            const uint8_t code = static_cast<uint8_t>(
-                (peer_word >> (4 * subgroup_lane)) & 0x0f);
-            packed_word |= static_cast<uint32_t>(code) << (4 * src_lane);
-          }
-
-          const int local_col = local_dim0 + subgroup_lane;
-          auto ref0 = pv_sB(local_col, local_k0, write_stage);
-          uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
-#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
-          if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
-            SM120_NVFP4_DEBUG_TRAP();
-          }
+          for (int token_offset = 0; token_offset < kTransposeTokens;
+               ++token_offset) {
+            const int local_token = local_k0 + token_offset;
+            const int token = kv_tile * kCutlassTileN + local_token;
+            uint32_t row_word = 0;
+            if (token < kv_len_tokens) {
+              const int local_page = local_token >> 4;
+              const int page_offset = local_token & 15;
+              const int physical_page = storage.physical_page_cache[local_page];
+              const int64_t data_page_base =
+                  sm120_nvfp4_paged_v_data_page_base(
+                      paged_kv_params, effective_kv_head, physical_page);
+              row_word = sm120_nvfp4_paged_v_word_from_page_base(
+                  paged_kv_params, data_page_base, page_offset,
+                  dim_base >> 1);
+            }
 #pragma unroll
-          for (int j = 0; j < 8; ++j) {
-            auto ref = pv_sB(local_col, local_k0 + j, write_stage);
-            auto pair_ref =
-                pv_sB(local_col, local_k0 + (j ^ 1), write_stage);
-            uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
-            uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
-            if (dst_byte < dst0 || dst_byte >= dst0 + 4 ||
-                pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
-                SM120_NVFP4_DEBUG_TRAP();
+            for (int dim_offset = 0; dim_offset < kTransposeDims;
+                 ++dim_offset) {
+              const uint8_t code = static_cast<uint8_t>(
+                  (row_word >> (4 * dim_offset)) & 0x0f);
+              packed_words[dim_offset] |=
+                  static_cast<uint32_t>(code) << (4 * token_offset);
             }
           }
+
+          const int local_col0 = local_dim0;
+#pragma unroll
+          for (int dim_offset = 0; dim_offset < kTransposeDims;
+               ++dim_offset) {
+            const int local_col = local_col0 + dim_offset;
+            auto ref0 = pv_sB(local_col, local_k0, write_stage);
+            uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
+            if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
+              SM120_NVFP4_DEBUG_TRAP();
+            }
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              auto ref = pv_sB(local_col, local_k0 + j, write_stage);
+              auto pair_ref =
+                  pv_sB(local_col, local_k0 + (j ^ 1), write_stage);
+              uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
+              uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
+              if (dst_byte < dst0 || dst_byte >= dst0 + 4 ||
+                  pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
+                SM120_NVFP4_DEBUG_TRAP();
+              }
+            }
 #endif
-          *reinterpret_cast<uint32_t*>(dst0) = packed_word;
+            *reinterpret_cast<uint32_t*>(dst0) = packed_words[dim_offset];
+          }
         }
       } else {
 #if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS

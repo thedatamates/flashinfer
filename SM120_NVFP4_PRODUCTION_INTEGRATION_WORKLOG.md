@@ -4796,3 +4796,56 @@ Next profiling target:
 
 - Use NCU source/SASS attribution or narrower metrics to locate where `Stall Barrier` and `Stall Long Scoreboard` are charged.
 - Do not remove more barriers by inspection. The next barrier change must identify the specific stall location first.
+
+## 2026-05-04 12:06 CDT - PV V Producer Coalescing Target
+
+Finding:
+
+- NCU source/SASS attribution on D256 Qwen paged-PV has no CUDA lineinfo, but the SASS counters identify the hot PC class.
+- NCU reports an estimated `73.93%` speedup opportunity from uncoalesced global accesses: `50,331,648` excessive sectors out of `65,666,496` total sectors.
+- The top two excessive-sector PCs are `LDG.E` 32-bit global V data loads, each with `21,073,920` excessive sectors and `24,084,480` total sectors.
+- Those loads are immediately followed by `SHFL.IDX` instructions; the hottest long-scoreboard PC is the first shuffle after the V data load.
+- This matches the current PV V producer lane mapping: each 8-lane subgroup loads one dim-contiguous word for a different token at the same dim group, so the warp issues strided token-row loads instead of coalesced dim-row loads.
+
+Implementation target:
+
+- Rewrite the PV-layout V data producer so an 8-lane subgroup handles one `8 token x 64 dim` tile.
+- For each token in the 8-token group, lanes load adjacent 32-bit dim words for that token. This makes the global load coalesced across lanes.
+- Each lane accumulates eight packed output words in registers, one for each dim in its 8-dim word, then writes those packed token-contiguous words to the existing CUTLASS operand smem layout.
+- Do this for PV-layout V first, because the NCU evidence was collected on paged-PV and the PV path has no linear dequant/requant complication.
+
+Validation:
+
+- Run focused NVFP4 correctness after the PV path change.
+- Benchmark D256 Qwen and D512 Gemma paged-PV reference cells.
+- Re-run NCU on D256 Qwen paged-PV if timing improves and confirm the top excessive-sector V load PCs drop.
+
+Decision criteria:
+
+- Keep if correctness passes and paged-PV timing improves materially.
+- If timing regresses, revert the PV coalescing change and keep the source-attribution finding.
+
+## 2026-05-04 12:22 CDT - PV V Producer Coalescing Result
+
+Finding:
+
+- The PV-layout V producer rewrite is correctness-safe across the focused NVFP4 suite: `36 passed in 200.79s`.
+- The NCU hypothesis was directionally correct. D256 Qwen paged-PV global-sector waste dropped from `50,331,648` excessive sectors out of `65,666,496` total sectors to `6,291,456` excessive sectors out of `21,626,304` total sectors.
+- The previous top PV V data PCs were two 32-bit `LDG.E` loads with `21,073,920` excessive sectors each. After the rewrite, those PCs no longer appear as the dominant excessive-sector source.
+- The remaining profiler issue moved: NCU now reports `35,489,280` excessive shared wavefronts out of `96,675,456` total wavefronts. The top shared-excess PCs are shared stores in the producer path.
+
+Measured delta:
+
+- D128 paged-PV `q=512 kv=65536 g=4 split=3072`: `1.114 ms` mean, down from the page-cache baseline around `1.229 ms`.
+- D256 paged-PV `q=512 kv=65536 g=6 split=3072`: `2.271 ms` mean, down from the page-cache baseline around `2.403 ms`.
+- D512 paged-PV `q=512 kv=65536 g=8 softcap=30 split=3072`: `6.721 ms` mean, down from the page-cache baseline around `6.98 ms`.
+
+Decision:
+
+- Keep the PV-layout coalesced global-load mapping. It removes the NCU-identified uncoalesced global-load class and improves all three head dimensions.
+- This does not close the dense-vs-paged gap. The next target should come from the new NCU state, not from source inspection: shared-memory store wavefront excess and the remaining barrier/reconvergence samples are now the measured bottlenecks.
+
+Next profiling target:
+
+- Re-run focused NCU after this commit with source counters and warp-state sampling, using the coalesced build as the new baseline.
+- Attribute the top shared-store excessive wavefront PCs before changing the store layout. Do not add another producer rewrite without a profiler-backed PC/source target.
