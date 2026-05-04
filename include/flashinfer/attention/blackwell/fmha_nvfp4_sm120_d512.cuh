@@ -1126,6 +1126,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           }
 #pragma unroll
           for (int k_offset = 0; k_offset < 16; k_offset += 2) {
+            // The PV scale reader consumes the group scale at k0 only.
+            if (k_offset != 0) {
+              continue;
+            }
             const uint8_t store_scale =
                 token + k_offset < kv_len_tokens ? scale : 0x38;
             pv_sSFB(col, k0 + k_offset, write_stage) =

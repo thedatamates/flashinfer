@@ -4182,3 +4182,30 @@ Direct-index K producer result:
   - D256 q=512 kv=65536 g=6 paged-PV `3.088 ms`, paged-linear `3.659 ms`.
   - D512 q=512 kv=65536 g=8 paged-PV `7.651 ms`, paged-linear `8.149 ms`.
 - Previous same-session references before direct-index K were roughly D128 PV `1.931 ms`, D256 PV `3.651 ms`, D512 PV `9.025 ms`; this is a broad K producer win across all head dims.
+
+## 2026-05-04 09:10 CDT - Post-Direct-K Re-Localization Plan
+
+What I am about to do:
+- Direct-index K cut D256 paged-PV from `3.65 ms` to `3.09 ms`, D512 PV from `9.03 ms` to `7.65 ms`, and D128 PV from `1.93 ms` to `1.57 ms`.
+- The largest stale component is now unknown because K data moved substantially. I will repeat D256 K-disabled and V-disabled timing-only diagnostics at q=512 kv=65536 g=6 paged-PV.
+- Decision criterion: if V is now dominant, target V direct-index/store path; if K is still dominant, target K scale/pipeline; if both are small, move to common softmax/PV/epilogue schedule.
+
+Post-direct-K localization result:
+- D256 q=512 kv=65536 g=6 paged-PV baseline after direct-index K: `3.078 ms`.
+- V producer disabled: `2.553 ms`; V total is about `0.52 ms`.
+- K producer disabled: `2.627 ms`; K total is about `0.45 ms`.
+- PV V-scale loop skipped: `2.825 ms`; PV V scales are about `0.25 ms`, leaving V data/transpose around `0.27 ms`.
+- Conclusion: the single large K hot-path issue is gone. The residual is now distributed across K data/scale/pipeline, V data/scale, and common paged-stage scheduling; further wins need smaller targeted changes or schedule restructuring rather than another obvious 200x-class fix.
+
+PV V-scale store reduction result:
+- The PV V-scale producer was writing the same 16-token group scale to every even `k_offset` in the group. The downstream PV scale reader consumes the scale at the group base (`k0`) only, so the duplicate writes were producer-only overhead.
+- Reduced the PV-layout V-scale store in D128/D256/D512 to write only `k_offset == 0`. This does not affect the linear-V path.
+- Reference PV cells after the change:
+  - D128 q=512 kv=65536 g=4 paged-PV `1.484 ms` (previous `1.566 ms`).
+  - D256 q=512 kv=65536 g=6 paged-PV `2.958 ms` (previous `3.088 ms`).
+  - D512 q=512 kv=65536 g=8 paged-PV `7.324 ms` (previous `7.651 ms`).
+- Linear cross-checks stayed flat within noise:
+  - D128 paged-linear `1.835 ms` (previous `1.833 ms`).
+  - D256 paged-linear `3.658 ms` (previous `3.659 ms`).
+  - D512 paged-linear `8.169 ms` (previous `8.149 ms`).
+- Test status: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed, `36 passed in 199.68s`.
