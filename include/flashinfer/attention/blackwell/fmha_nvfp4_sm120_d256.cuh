@@ -917,11 +917,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           scale = sm120_nvfp4_paged_k_scale_from_page_base(
               paged_kv_params, scale_page_base, page_offset, scale_col);
         }
-#pragma unroll
-        for (int k_offset = 0; k_offset < 16; k_offset += 2) {
-          qk_sSFB(row, local_scale_col * 16 + k_offset, write_stage) =
-              make_ue4m3_raw(scale);
-        }
+        qk_sSFB(row, local_scale_col * 16, write_stage) =
+            make_ue4m3_raw(scale);
       }
       cp_async::wait_group<0>();
     }
@@ -1020,13 +1017,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           uint8_t sf0 = 0x38;
           uint8_t sf1 = 0x38;
           pv_scale_pair_for(token_group_start, dim0, sf0, sf1);
-#pragma unroll
-          for (int k_offset = 0; k_offset < 16; k_offset += 2) {
-            pv_sSFB(col0, local_k0 + k_offset, write_stage) =
-                make_ue4m3_raw(sf0);
-            pv_sSFB(col0 + 1, local_k0 + k_offset, write_stage) =
-                make_ue4m3_raw(sf1);
-          }
+          pv_sSFB(col0, local_k0, write_stage) = make_ue4m3_raw(sf0);
+          pv_sSFB(col0 + 1, local_k0, write_stage) = make_ue4m3_raw(sf1);
         }
         load_group_sync();
       }
@@ -1227,17 +1219,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page(
                 paged_kv_params, effective_kv_head, physical_page, dim);
           }
-#pragma unroll
-          for (int k_offset = 0; k_offset < 16; k_offset += 2) {
-            // The PV scale reader consumes the group scale at k0 only.
-            if (k_offset != 0) {
-              continue;
-            }
-            const uint8_t store_scale =
-                token + k_offset < kv_len_tokens ? scale : 0x38;
-            pv_sSFB(col, k0 + k_offset, write_stage) =
-                make_ue4m3_raw(store_scale);
-          }
+          const uint8_t store_scale = token < kv_len_tokens ? scale : 0x38;
+          pv_sSFB(col, k0, write_stage) = make_ue4m3_raw(store_scale);
         }
       }
     }
@@ -1350,11 +1333,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const int k0 = local_scale_col * 16;
         const int scale_col = (k_outer * kCutlassTileK + k0) >> 4;
         const uint8_t scale = q_scale_byte(q_row_base(row), scale_col);
-#pragma unroll
-        for (int k_offset = 0; k_offset < 16; k_offset += 2) {
-          qk_sSFA_m(row, k0 + k_offset, write_stage) =
-              make_ue4m3_raw(scale);
-        }
+        qk_sSFA_m(row, k0, write_stage) = make_ue4m3_raw(scale);
       }
     }
   };

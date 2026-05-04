@@ -5105,3 +5105,206 @@ Next profiling target:
 - Stop spending effort on page-cache branch shape unless a different cell shows it as a wall-time limiter.
 - The remaining wall-time gap is more likely in the larger shared-store/MMA/softmax pipeline balance than in page-cache fill overhead.
 - Use NCU/NSYS next to choose between two architectural targets: reducing shared-store wavefront excess in V/K scale staging, or changing split/tile scheduling to reduce total stage work.
+
+## 2026-05-04 13:00 CDT - Occupancy Ruled Out / PV B Store Address Target
+
+Finding:
+
+- NCU LaunchStats/Occupancy on D256 Qwen `q=512 kv=65536 g=6` rules out low occupancy as the primary paged-vs-dense gap.
+- Paged-PV launch:
+  - Block size: `640`, grid size: `528`.
+  - Registers/thread: `96`.
+  - Dynamic shared memory/block: `92.16 KiB`.
+  - Waves/SM: `2.81`.
+  - Theoretical occupancy: `41.67%`; achieved occupancy: `40.50%`.
+  - Achieved active warps/SM: `19.44`.
+- Dense launch at the same logical cell:
+  - Block size: `512`, grid size: `1056`.
+  - Registers/thread: `128`.
+  - Dynamic shared memory/block: `50.18 KiB`.
+  - Waves/SM: `5.62`.
+  - Theoretical occupancy: `33.33%`; achieved occupancy: `20.91%`.
+  - Achieved active warps/SM: `10.04`.
+- Paged has fewer grid waves and larger smem, but it is not starved for resident warps relative to dense. The gap is therefore per-CTA instruction/shared-memory work, not lack of occupancy.
+
+NCU source target:
+
+- The lineinfo paged-minus-dense comparison still points at the PV V operand store path:
+  - `d256.cuh:1112` has the largest paged-only shared excessive-wavefront delta.
+  - `cute/container/array_subbyte.hpp:263` and related CUTE layout/subbyte address helpers have large paged-only instruction deltas.
+  - The current producer repeatedly computes `pv_sB(local_col, local_k0, write_stage)` and then stores one `uint32_t` per output word.
+
+Implementation target:
+
+- Treat high-risk producer surgery as in scope, but only when it removes a profiler-attributed cost.
+- First target D256 PV-layout V only, because the lineinfo and full NCU reports were collected on D256 paged-PV and isolate the data path without linear dequant/requant.
+- Replace repeated CUTE per-word PV B store address calculation with a layout-specific direct-address path if the CUTLASS `SmemLayoutB` mapping can be proven for the producer's `(local_col, local_k0, stage)` iteration space.
+- The replacement must keep the existing public API and operand layout. It may use compile-time layout algebra, a small generated delta table, or a checked direct pointer formula. It must not silently fall back to the old path.
+
+Validation:
+
+- Before keeping any direct-address path, prove address equivalence against the current `pv_sB(...)` mapping for the full D256 PV producer coordinate space.
+- Run the focused D256 NVFP4 correctness subset.
+- Benchmark D256 Qwen paged-PV reference cell.
+- If timing improves, re-run NCU and confirm the `d256.cuh:1112` shared excessive-wavefront and CUTE address-instruction counters drop.
+- If timing is neutral/regressive or address equivalence cannot be proven cleanly, revert and keep this as a negative diagnostic.
+
+## 2026-05-04 13:08 CDT - PV B Store Direct-Address Result
+
+Finding:
+
+- Probed the D256 PV B operand layout in a standalone compile:
+  - `SmemLayoutB = Sw<2,4,3> o smem_ptr[4b](unset) o ((_8,_16),(_128,_1),(_1,_2)):((_128,_1024),(_1,_0),(_0,_16384))`.
+  - `cosize = 32768` four-bit elements.
+  - The producer's `k` run is contiguous for the 8-token packed word, so replacing the subbyte tensor reference with `layout(coord) >> 1` byte addressing is address-equivalent for the target store.
+- Implemented D256 PV-layout V only:
+  - Used `pv_sB.layout()(local_col, local_k0, write_stage)` to compute the nibble offset.
+  - Used `cute::recast_ptr<uint8_t>(pv_sB_ptr) + (dst_nibble >> 1)` as the byte destination.
+  - Kept debug equivalence checks against `pv_sB(...)` under `FLASHINFER_SM120_NVFP4_DEBUG_TRAPS`.
+- Focused D256 correctness passed: `3 passed in 44.43s`.
+- D256 Qwen paged-PV timing was neutral:
+  - Run 1: `2.262 ms` mean.
+  - Run 2: `2.268 ms` mean.
+  - Committed baseline: `2.271 ms` mean.
+
+Decision:
+
+- Reverted the direct-address code.
+- Do not pursue CUTE subbyte-reference removal as a wall-time target by itself. It can reduce source-attributed helper instructions, but those instructions are not load-bearing at the reference cell.
+
+Next profiling target:
+
+- Move from source-line micro-optimizations to schedule-level evidence.
+- Use NSYS/NCU to separate stage kernel time from combine/kernel-launch overhead and sweep `split_kv_len` at the D256 Qwen and D512 Gemma reference cells.
+- If a scheduling parameter changes wall time materially, then optimize the schedule. If not, return to producer-body SASS attribution with sampling rather than helper-line deltas.
+
+## 2026-05-04 13:13 CDT - SFB Scale Store Aliasing Target
+
+Finding:
+
+- NSYS on D256 Qwen paged-PV confirms the wrapper gap is inside the stage kernel:
+  - SM120 stage kernel: `8.86 ms` total across 4 instances, `90.3%` of GPU kernel time.
+  - Q quantization: `0.24 ms` total, `2.4%`.
+  - split-KV combine: `0.16 ms` total, `1.6%`.
+- Split scheduling is not the architectural gap:
+  - D256 paged-PV split sweep: `3072` is the local optimum (`2.278 ms`), with larger splits degrading sharply.
+  - D512 paged-PV split sweep: `4096` is slightly better than `3072` (`6.519 ms` vs `6.699 ms`), but the gain is only about `2.7%`.
+- The next source target is therefore the producer body.
+- The D256 SFB layout probe shows the scale tensor aliases the eight logical `k_offset` positions in each 16-token scale group to one physical byte:
+  - Layout: `(((_32,_4),_1),((_16,_4),_1,_2),_2):(((_16,_4),_512),((_0,_1),_4,_512),_1024)`.
+  - Example row 0, stage 0: logical `k=0,2,4,6,8,10,12,14` all map to physical offset `0`.
+  - `k=16..30` all map to physical offset `1`, and so on.
+- Current paged K-scale and V-scale producers still loop over `k_offset += 2` and write the same physical scale byte eight times.
+- This exactly matches NCU source attribution:
+  - `d256.cuh:922 qk_sSFB(...) = make_ue4m3_raw(scale)` is the largest paged-only source line.
+  - The same pattern exists in the PV scale stores.
+
+Implementation target:
+
+- Remove the redundant per-`k_offset` scale stores.
+- For each loaded scale byte, write the representative logical coordinate once:
+  - K scale: `qk_sSFB(row, local_scale_col * 16, write_stage)`.
+  - PV V scale: `pv_sSFB(col, local_k0, write_stage)` for the two columns in the pair.
+- Start D256-only because the NCU/source evidence and layout probe are D256. If correctness and timing move, propagate to D128/D512 after probing or asserting the same SFB alias invariant.
+
+Validation:
+
+- Focused D256 correctness subset.
+- D256 Qwen paged-PV reference timing.
+- If kept, re-run NCU source counters and confirm the SFB store instruction/shared-wavefront attribution drops.
+- If D256 moves materially, repeat the layout probe on D128/D512, apply the same one-write scale producer, and run the full NVFP4 test file.
+
+## 2026-05-04 13:28 CDT - Paged Page-Base Cache Target
+
+Finding:
+
+- The one-write scale-store change is correctness-clean:
+  - Full NVFP4 attention test file: `36 passed in 288.11s`.
+- Reference timing moved in the right direction but only modestly:
+  - D128 paged-PV: `1.084 ms`.
+  - D256 paged-PV: `2.235 ms` representative mean after one-write scales.
+  - D512 paged-PV: `6.673 ms` at split `3072`; `6.486 ms` at split `4096`.
+- The lineinfo NCU follow-up confirms the intended source counter dropped:
+  - Old D256 `qk_sSFB(row, local_scale_col * 16 + k_offset, ...)`: about `511M` source-attributed instructions.
+  - New D256 `qk_sSFB(row, local_scale_col * 16, ...)`: about `2.1M`.
+  - `cute::numeric::divmod` attribution dropped from about `107M` to about `43M`.
+- The new top paged-only source line is page-base address math:
+  - `paged_kv.cuh:548`, the NHD K-scale page-base term `kv_head * k_scale_stride_dim2`, is about `185M` source-attributed instructions.
+  - V-scale page-base math and K/V data page-base math remain visible lower in the list.
+- Current producers recompute page-base expressions inside per-row/per-scale/per-word loops even though the physical page is already cached once per 16-token logical page.
+
+Implementation target:
+
+- Extend the per-tile page cache from physical page ids to page bases:
+  - `k_data_page_base_cache[local_page]`.
+  - `k_scale_page_base_cache[local_page]`.
+  - `v_data_page_base_cache[local_page]`.
+  - `v_scale_page_base_cache[local_page]`, using the PV-scale base formula when `kPvLayoutV=true` and the linear-scale base formula otherwise.
+- Replace producer-inner helper calls that recompute `physical_page * stride_page + kv_head * head_stride` with cached page bases.
+- Keep page-offset and dim/scale-col address math in the inner loops; only hoist page-invariant terms.
+- Apply across D128/D256/D512 after D256 compiles because the cache shape is identical (`kCutlassTileN / 16` pages per KV tile).
+
+Validation:
+
+- Full NVFP4 attention test file.
+- D256 Qwen paged-PV reference timing.
+- D512 Gemma paged-PV reference timing.
+- NCU source follow-up if timing moves materially, checking that `paged_kv.cuh:548` and related page-base source lines drop.
+
+## 2026-05-04 13:36 CDT - Paged Page-Base Cache Result
+
+Finding:
+
+- Implemented D256 page-base caching for K data, K scale, V data, and V scale.
+- The first focused D256 multi-KV correctness run failed just above the existing tolerance:
+  - Greatest absolute difference: `0.0010986328125` with tolerance `0.001`.
+- Narrowed the failure by disabling cached V-scale base usage. The single multi-KV test then passed once, but the full focused subset failed the same multi-KV test on a later run:
+  - Greatest absolute difference: `0.001129150390625` with tolerance `0.001`.
+- The failure pattern is tolerance-edge and intermittent, but this optimization changes shared-memory state and page-base scheduling enough that it cannot be treated as correctness-neutral.
+
+Decision:
+
+- Reverted the page-base cache code and the PV-scale page-base helper.
+- Do not keep page-base caching without a stronger byte-level diagnostic that proves the drift source is unrelated.
+- The one-write scale-store change remains in place; it passed the full NVFP4 test file before the page-base experiment and has direct layout proof.
+
+Next profiling target:
+
+- Keep the SFB/SFA one-write change.
+- Do not chase `paged_kv.cuh:548` by caching page bases until the multi-KV tolerance-edge behavior is understood.
+- Next high-risk target should be selected from a fresh NCU report after the scale-store change, not from the pre-scale source ranking.
+
+## 2026-05-04 13:43 CDT - One-Write Scale Store Final Result
+
+Finding:
+
+- Verified the SFA/SFB alias invariant across all three head dimensions:
+  - D128 QK SFB: `alias=1`; D128 PV SFB: `alias=1`; D128 QK SFA: `alias=1`.
+  - D256 QK SFB: `alias=1`; D256 PV SFB: `alias=1`; D256 QK SFA: `alias=1`.
+  - D512 QK SFB: `alias=1`; D512 PV SFB: `alias=1`; D512 QK SFA: `alias=1`.
+- Applied one-write scale staging across D128/D256/D512:
+  - K SFB writes one representative coordinate per 16-token scale group.
+  - PV V SFB writes one representative coordinate per 16-token scale group.
+  - BF16-Q fused-quantize SFA writes one representative coordinate per 16-dim scale group.
+- Full NVFP4 attention test file passes after reverting the page-base-cache experiment:
+  - `36 passed in 291.75s`.
+
+Reference timings:
+
+- D128 paged-PV `q=512 kv=65536 g=4 split=3072`: `1.084 ms`.
+- D256 paged-PV `q=512 kv=65536 g=6 split=3072`: `2.235 ms` representative mean.
+- D512 paged-PV `q=512 kv=65536 g=8 softcap=30 split=3072`: `6.673 ms`.
+- D512 paged-PV `q=512 kv=65536 g=8 softcap=30 split=4096`: `6.486 ms`.
+
+NCU validation:
+
+- D256 Qwen paged-PV lineinfo NCU after one-write scales:
+  - Old `qk_sSFB(row, local_scale_col * 16 + k_offset, ...)`: about `511M` source-attributed instructions.
+  - New `qk_sSFB(row, local_scale_col * 16, ...)`: about `2.1M`.
+  - `cute::numeric::divmod` attribution dropped from about `107M` to about `43M`.
+- Wall-time gain is modest, so SFB duplication was a real waste but not the main architectural gap.
+
+Decision:
+
+- Keep and commit the one-write scale-store change.
+- Do not treat this as the performance pass endpoint. The next pass needs a fresh post-change NCU report and should target the new top wall-time source, not the eliminated SFB store line.
