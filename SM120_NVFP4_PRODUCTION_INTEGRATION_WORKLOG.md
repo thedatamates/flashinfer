@@ -4692,3 +4692,59 @@ Paged page-cache barrier refinement result:
   - D512 Gemma global q=512 kv=65536 g=8 paged-PV split `3072`: `7.007 ms` mean, `6.956 ms` min.
   - D256 Gemma sliding q=512 kv=1024 g=2 paged-PV split `1024`: `0.162 ms` mean, `0.158 ms` min.
 - Decision: do not keep the refinement. It was neutral to slightly worse on mean and only matched the prior page-cache result on min. Restored the safer in-helper cache fill plus barrier before committing the page-cache optimization.
+
+K-scale single-slot diagnostic plan:
+- V PV scale staging writes only `k_offset == 0` because the PV scale reader consumes the group scale at the start of each 16-token group.
+- K scale staging still writes the same byte to every even offset in each 16-wide K scale group: `qk_sSFB(row, local_scale_col * 16 + k_offset, write_stage)` for `k_offset = 0, 2, ..., 14`.
+- What I am about to test: apply the same single-slot write shape to D256 K scales first. If focused correctness passes, benchmark the D256 Qwen paged-PV reference. If it fails, revert the diagnostic without propagating it.
+
+Profiling-driven hypothesis discipline:
+- User directive: future performance hypotheses must be driven by Nsight Systems and NCU, not source-level symmetry alone.
+- `nsys` is available at `/usr/local/bin/nsys`; `ncu` is available at `/usr/local/cuda-13.2/bin/ncu`.
+- The in-flight K-scale single-slot diagnostic is therefore treated as speculative until validated by stage-kernel attribution/counters. If counters do not support it, revert the code and keep only this worklog record.
+
+## 2026-05-04 11:47 CDT - Profiling-Gated K-Scale Diagnostic
+
+Finding:
+
+- The D256 K-scale single-slot change passed the focused D512 NVFP4 correctness test: `36 passed in 290.05s`.
+- That test result only proves the D256 diagnostic did not break the focused suite. It does not prove the change addresses the dense-vs-paged performance gap.
+- The user directive is to drive future hypotheses from Nsight Systems and NCU evidence, not from source-level symmetry alone.
+
+Implementation target:
+
+- Treat the current D256 K-scale single-slot edit as a diagnostic, not a keeper.
+- First measure the D256 Qwen paged-PV reference cell with Nsight Systems to see whether the stage kernel moves relative to the committed page-cache baseline.
+- If Nsight Systems shows material stage-kernel improvement, collect NCU counters on the stage kernel before deciding whether to keep and propagate the pattern.
+- If profiling does not support the change, revert the diagnostic and keep the result as a negative finding.
+
+Validation:
+
+- Correctness: focused D512 NVFP4 suite passed at current tolerances.
+- Profiling target: `D=256 g=6 q=512 kv=65536 paged-PV causal no-SWA no-softcap split_kv_len=3072`.
+- Baseline from committed page-cache code: stage kernel approximately `2.335 ms`, total bench approximately `2.403 ms`.
+
+Decision criteria:
+
+- Keep only if profiling shows the stage kernel improves enough to matter and counters support reduced producer-side work.
+- Do not commit the diagnostic from correctness alone.
+
+## 2026-05-04 11:49 CDT - K-Scale Diagnostic Result
+
+Finding:
+
+- The D256 K-scale single-slot diagnostic was correctness-safe in the focused suite but did not produce a material performance result.
+- Direct benchmark at `D=256 g=6 q=512 kv=65536 paged-PV split=3072` measured `2.369 ms` mean and `2.328 ms` min.
+- Nsight Systems attributed the run to the stage kernel as expected: stage kernel `2.268 ms` average across five launches, split-combine `0.0397 ms`, Q quantize `0.0038 ms`.
+- The committed page-cache baseline for the same cell was approximately `2.403 ms` total and `2.335 ms` stage. The diagnostic movement is small enough to be noise-level or low-yield.
+
+Decision:
+
+- Reverted the D256 K-scale single-slot code change.
+- Kept the worklog record because it closes the source-symmetry hypothesis with profiling evidence.
+- Did not run NCU for this diagnostic because the Nsight Systems result did not meet the material-improvement gate.
+
+Next profiling target:
+
+- Use NCU on the committed stage kernel to classify the remaining gap before making another producer change.
+- The next decision should be based on stage-kernel counters: memory/LSU stalls, barrier stalls, shared-memory conflicts, issue eligibility, and executed instruction mix.
