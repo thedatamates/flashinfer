@@ -4458,3 +4458,14 @@ Qwen decode post-split production subset:
   - kv=4096 `0.510 ms` versus `0.0260 ms`.
   - kv=262144 `0.602 ms` versus `0.0850 ms`.
 - Decision: do not spend more producer-tuning time on Qwen decode in this prefill kernel. The remaining gap is fixed floor/kernel-shape, not block-table or V reblock. The next structural options are a decode-specialized SM120 path or route q=1/window-small cells to existing FA2/XQA backends.
+
+Qwen D256 PV prefill split sensitivity:
+- q=512:
+  - kv=16384 dense `0.418 ms`; paged auto split `3072`, `0.889 ms`. Tested splits showed `3072` best (`0.883 ms`), so auto is correct.
+  - kv=65536 dense `1.215 ms`; paged auto split `3072`, `2.552 ms`. Tested splits showed `3072` best/tied (`2.556 ms`), so auto is correct.
+  - kv=262144 dense `4.393 ms`; paged auto split `3072`, `9.657 ms`. Tested `12288` was slightly faster (`9.796` in one run versus auto `9.657` in another run), within noise; no clear split fix.
+- q=2048:
+  - kv=16384 dense `1.550 ms`; paged auto split `12288`, `3.290 ms`. Split `3072` was faster at `2.567 ms`.
+  - kv=65536 dense `4.541 ms`; paged auto split `12288`, `9.656 ms`. Split `3072` was slightly faster at `9.482 ms`.
+  - kv=262144 dense `17.183 ms`; paged auto split `12288`, `36.458 ms`. Auto `12288` remained best/tied; split `3072` was slower at `37.926 ms`.
+- Decision: do not change the broad prefill split heuristic from this data. There is a short/medium-kv q=2048 opportunity for a workload-specific split override, but a global change would regress the longest-context production cell where the current heuristic is best.
