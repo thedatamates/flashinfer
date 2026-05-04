@@ -6158,3 +6158,182 @@ Decision:
 
 - If a report shows a large paged-linear or paged-PV outlier versus dense, profile that exact cell with NCU before changing code.
 - If the matrix is broadly in line, move to cleanup/tolerance work instead of speculative producer rewrites.
+
+## 2026-05-04 16:01 CDT - Focused Production Matrix Result
+
+Finding:
+
+- Completed the post-no-shuffle focused production matrix with fresh report prefixes:
+  - `reports/prod_qwen_full_d256_g6_post_noshfl_20260504`
+  - `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_post_noshfl_20260504`
+  - `reports/prod_gemma_global_d512_g8_softcap30_post_noshfl_20260504`
+- Qwen D256 g6 full-attention cells:
+  - Geomean paged-linear / dense: `1.96x`.
+  - Geomean paged-linear / paged-PV reblock cost: `1.41x`.
+  - Geomean paged-linear speedup vs `nvfp4_fa2`: `0.249x`.
+  - Worst wrapper overhead cell is `q=512 kv=4096`: dense `0.282 ms`, paged-PV `0.708 ms`, paged-linear `0.753 ms`, paged-linear/dense `2.51x`.
+- Gemma sliding D256 g2 SWA1024 softcap30 cells:
+  - Geomean paged-linear / dense: `1.37x`.
+  - Geomean paged-linear / paged-PV reblock cost: `1.21x`.
+  - Geomean paged-linear speedup vs `nvfp4_fa2`: `0.163x`.
+  - The absolute times are sub-millisecond; the largest wrapper overhead cell is `q=512 kv=8192`: dense `0.170 ms`, paged-PV `0.261 ms`, paged-linear `0.330 ms`, paged-linear/dense `1.53x`.
+- Gemma global D512 g8 softcap30 cells:
+  - Geomean paged-linear / dense: `1.44x`.
+  - Geomean paged-linear / paged-PV reblock cost: `1.46x`.
+  - Geomean paged-linear speedup vs `nvfp4_fa2`: `0.393x`.
+  - `bf16_fa2` failed all D512 global cells with existing FlashInfer prefill configuration errors; this is a reference-backend issue, not an SM120 fused correctness failure.
+  - The main production prefill outlier is `q=512 kv=16384`: dense `1.479 ms`, paged-PV `4.668 ms`, paged-linear `5.446 ms`, paged-PV/dense `3.16x`, linear/PV `1.17x`, paged-linear speedup vs `nvfp4_fa2` `0.443x`.
+
+Decision:
+
+- Do not resume broad producer rewrites from stale 100x-era numbers; the current focused matrix shows the worst remaining prefill issue is narrower.
+- Do not chase linear-V first on the D512 `q=512 kv=16384` outlier. Linear reblock adds only `16.7%` over paged-PV on that cell, while paged-PV itself is `3.16x` over dense.
+- The next high-risk architectural change must be driven by profiler evidence on the D512 Gemma global `q=512 kv=16384` paged-PV stage compared directly with dense at the same cell.
+
+Next profiling target:
+
+- Profile D512 Gemma global `q=512 kv=16384 g=8 softcap=30`, dense vs paged-PV.
+- Collect NCU source counters, memory workload, and warp-state sampling for the stage kernel.
+- If NCU attributes the paged-PV gap to the CUTLASS operand producer or smem layout contract, a non-local/high-risk path is on the table. If it attributes the gap to launch/split geometry or fixed overhead, use NSYS to separate stage kernel, cache/prepass, and combine costs before changing code.
+
+## 2026-05-04 16:18 CDT - D512 Paged Page-Cache Redundancy Target
+
+Finding:
+
+- NCU source/memory/warp-state comparison on D512 Gemma global `q=512 kv=16384 g=8 softcap=30` shows the outlier is inside the paged stage kernel, not Python:
+  - Paged-PV profiled stage duration: `5.20 ms`, `525,339,762` instructions, `11,842,543` elapsed cycles.
+  - Dense profiled stage duration: `1.48 ms`, `261,570,437` instructions, `3,249,149` elapsed cycles.
+  - Paged-PV has `4,194,304` L2 global excessive sectors; dense has `0`.
+  - Paged-PV has `16,857,088` shared excessive wavefronts; dense has `8,351,744`.
+  - Paged-PV barrier not-issued samples are `20,820`; dense barrier not-issued samples are `3,093`.
+- The largest paged not-issued source maps to `fmha_nvfp4_sm120_d512.cuh:775`, inside `cache_paged_physical_pages`.
+- Source inspection shows page-cache work is duplicated for the same `kv_tile`:
+  - `stage_paged_k_tile` calls `cache_paged_physical_pages(kv_tile)`.
+  - `stage_paged_v_tile` also calls `cache_paged_physical_pages(kv_tile)`.
+  - D512 has `qk_head_chunks > 1` and `kOutputGroupSpan == 4`, so the same `kv_tile` page list can be reloaded/synchronized up to six times: two K chunks plus four V groups.
+- The page list is independent of K chunk and V output group. It only depends on `kv_tile`, batch, and block table.
+
+Implementation target:
+
+- Test D512 first, because the profiler evidence came from the D512 production outlier.
+- Add a shared `physical_page_cache_kv_tile` tag next to `physical_page_cache`.
+- Initialize it to `-1` once for the load group at kernel entry.
+- Make `cache_paged_physical_pages(kv_tile)` skip the block-table reload and named-barrier synchronization when the requested tile is already cached.
+- Keep all public API, FFI, tensor layout, and test contracts unchanged.
+
+Validation:
+
+- Focused D512 correctness first.
+- Benchmark the D512 outlier cell:
+  - dense reference context: `q=512 kv=16384 g=8 softcap=30`.
+  - paged-PV target: current matrix value `4.668 ms`.
+  - paged-linear sanity: current matrix value `5.446 ms`.
+- If timing improves, rerun NCU on paged-PV and verify the `cache_paged_physical_pages` stall attribution drops.
+
+Decision:
+
+- Keep if correctness passes and paged-PV wall time improves materially.
+- Revert if the tag adds smem pressure, breaks pipeline ordering, or merely shifts stalls without reducing wall time.
+
+## 2026-05-04 16:27 CDT - D512 Split Heuristic Target
+
+Finding:
+
+- The D512 page-cache tag experiment compiled and passed correctness:
+  - `tests/attention/test_nvfp4_kv_head_dim_512.py`: `36 passed in 112.23s`.
+- It did not materially improve the target cell:
+  - Paged-PV before: matrix mean `4.693 ms`, min `4.668 ms`.
+  - Paged-PV with page-cache tag: `4.652 ms` mean.
+  - Paged-linear before: matrix mean `5.455 ms`, min `5.446 ms`.
+  - Paged-linear with page-cache tag: `5.463 ms` mean.
+- The page-cache tag was reverted because the wall-time delta was below the keep bar.
+- The same NCU comparison exposed a larger structural difference:
+  - Paged-PV stage launch geometry: grid `(32, 1, 2)`, auto `split_kv_len=12288`.
+  - Dense stage launch geometry: grid `(32, 1, 4)`, auto `split_kv_len=4096`.
+  - Paged therefore processes up to `3x` more KV tiles per CTA on the `q=512 kv=16384` outlier.
+- Direct split override confirms this is the outlier mechanism:
+  - D512 q512 kv16384 paged-PV: auto `12288` -> `4.693 ms`; forced `4096` -> `1.801 ms`.
+  - D512 q512 kv16384 paged-linear: auto `12288` -> `5.455 ms`; forced `4096` -> `2.251 ms`.
+  - D512 q128 kv4096 paged-PV: auto `3072` -> `1.281 ms`; forced `1024` -> `0.514 ms`.
+  - D512 q128 kv16384 paged-PV: auto `3072` -> `1.279 ms`; forced `1024` -> `0.587 ms`.
+- The bad split comes from the D512 paged auto heuristic:
+  - `flashinfer/fmha_nvfp4_sm120.py::_auto_split_kv_len` multiplies `q_tiles` by `3` when `head_dim == 512`.
+  - `benchmarks/bench_sm120_nvfp4_attention.py::auto_split_kv_len` mirrors the same D512 paged multiplier.
+
+Implementation target:
+
+- Remove the D512 paged `q_tiles *= 3` multiplier from the wrapper and production bench.
+- Keep the scratch-budget while-loop unchanged so memory pressure can still force larger split lengths when needed.
+- This is not a public API change; it only changes auto-selection when callers pass `split_kv_len=0`.
+
+Validation:
+
+- Run focused D512 correctness.
+- Re-benchmark D512 q512 kv16384 paged-PV and paged-linear with `split_kv_len=0`; expected resolved split is `4096`.
+- Re-benchmark D512 q128 kv4096 and q128 kv16384 paged-PV with `split_kv_len=0`; expected resolved split is `1024`.
+- If the targeted cells reproduce the forced-split timings, keep and rerun the D512 Gemma global focused report.
+
+Decision:
+
+- Keep if auto split now resolves to the faster dense-like split lengths and correctness passes.
+- If some long-context D512 cells regress from smaller splits, tune the heuristic from measured cell data rather than restoring the blanket `3x` multiplier.
+
+## 2026-05-04 16:36 CDT - D512 Split Heuristic Refinement Target
+
+Finding:
+
+- The blanket removal of the D512 paged `q_tiles *= 3` multiplier fixed the main `q=512 kv=16384` outlier and the short `q=128` cells.
+- It regressed long-context `q=128` D512 cells:
+  - `q=128 kv=65536`: paged-PV `1.705 ms` -> `1.926 ms`, paged-linear `3.095 ms` -> `3.294 ms`.
+  - `q=128 kv=262144`: paged-PV `6.694 ms` -> `7.379 ms`, paged-linear `12.468 ms` -> `13.037 ms`.
+- The measured split behavior points to a conditional rule, not a blanket rule:
+  - `q_tiles == 8` with `kv <= 16384` benefits from the smaller `1024` split.
+  - `q_tiles == 8` with `kv > 16384` benefits from the old `3072` split.
+  - `q_tiles == 32` keeps the improved `4096` split for the production outlier; restoring the blanket multiplier would reintroduce the `12288` split and the 3x slowdown.
+
+Implementation target:
+
+- Refine the wrapper and production bench auto-split heuristic to restore the D512 `3x` multiplier only for `q_tiles == 8` and `kv > 16384`.
+- Keep the smaller split for `q=512` and short `q=128` D512 cells.
+- Keep public API and explicit `split_kv_len` behavior unchanged; this only affects auto-selection when `split_kv_len=0`.
+
+Validation:
+
+- Run focused D512 correctness after the heuristic change.
+- Benchmark D512 q128 `kv={4096,16384,65536,262144}` for paged-PV and paged-linear.
+- Benchmark D512 q512 `kv=16384` for paged-PV and paged-linear.
+- Keep if short cells remain improved, long q128 cells recover, and q512 outlier stays fixed.
+
+## 2026-05-04 16:36 CDT - D512 Split Heuristic Refinement Result
+
+Implementation:
+
+- Updated `flashinfer/fmha_nvfp4_sm120.py::_auto_split_kv_len` to receive `max_kv_len` and apply the D512 `3x` multiplier only when `q_tiles == 8 && max_kv_len > 16384`.
+- Updated `benchmarks/bench_sm120_nvfp4_attention.py::auto_split_kv_len` with the same conditional for production-bench auto mode.
+- Explicit `split_kv_len` values remain unchanged; the new rule only affects `split_kv_len=0`.
+
+Correctness:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py`: `36 passed in 0.99s`.
+- All targeted benchmark rows reported `output_finite=true`.
+
+Measured result:
+
+| q | kv | v_layout | auto split | mean ms | min ms |
+|---:|---:|:---|---:|---:|---:|
+| 128 | 4096 | pv | 1024 | 0.513 | 0.508 |
+| 128 | 4096 | linear | 1024 | 0.642 | 0.635 |
+| 128 | 16384 | pv | 1024 | 0.573 | 0.567 |
+| 128 | 16384 | linear | 1024 | 0.955 | 0.950 |
+| 128 | 65536 | pv | 3072 | 1.694 | 1.685 |
+| 128 | 65536 | linear | 3072 | 3.081 | 3.076 |
+| 128 | 262144 | pv | 3072 | 6.660 | 6.653 |
+| 128 | 262144 | linear | 3072 | 12.427 | 12.412 |
+| 512 | 16384 | pv | 4096 | 1.807 | 1.801 |
+| 512 | 16384 | linear | 4096 | 2.251 | 2.246 |
+
+Decision:
+
+- Keep the conditional heuristic.
+- It preserves the major q512 outlier fix (`paged-PV 4.668 ms -> 1.807 ms`, `paged-linear 5.446 ms -> 2.251 ms`) while recovering the long q128 cells to the old faster split.
+- The remaining D512 overhead is now dominated by normal producer/layout costs again, not the auto-split geometry bug.

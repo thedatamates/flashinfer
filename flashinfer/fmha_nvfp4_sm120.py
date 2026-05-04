@@ -63,6 +63,7 @@ def _auto_split_kv_len(
     *,
     head_dim: int,
     max_q_len: int,
+    max_kv_len: int,
     group_size: int,
     window_left: int,
 ) -> int:
@@ -72,7 +73,7 @@ def _auto_split_kv_len(
     q_tiles = max(1, _round_up(max_q_len * group_size, tile_m) // tile_m)
     if q_tiles == 1:
         return 2048
-    if head_dim == 512:
+    if head_dim == 512 and q_tiles == 8 and max_kv_len > 16384:
         q_tiles *= 3
     split_tiles = min(max(q_tiles, 8), 96)
     return split_tiles * 128
@@ -305,6 +306,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             _auto_split_kv_len(
                 head_dim=head_dim,
                 max_q_len=self._max_q_len,
+                max_kv_len=self._max_kv_len,
                 group_size=self._group_size,
                 window_left=self._window_left,
             )

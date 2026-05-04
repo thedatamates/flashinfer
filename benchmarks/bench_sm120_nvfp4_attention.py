@@ -70,7 +70,12 @@ def auto_split_kv_len(
         if q_tiles == 1:
             split_kv_len = 4096 if api == "dense" and head_dim == 256 else 2048
         else:
-            if api == "paged-wrapper" and head_dim == 512:
+            if (
+                api == "paged-wrapper"
+                and head_dim == 512
+                and q_tiles == 8
+                and kv_len > 16384
+            ):
                 q_tiles *= 3
             split_kv_len = min(max(q_tiles, 8), 96) * 128
     padded_rows = num_kv_heads * round_up(q_len * group, tile_m)
