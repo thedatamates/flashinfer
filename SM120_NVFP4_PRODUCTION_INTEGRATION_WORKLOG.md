@@ -4443,3 +4443,18 @@ Decode split scheduling change result:
   - D512 q=1 kv=262144 paged-PV auto: split `2048`, `1.242 ms` versus previous auto `~1.45 ms`.
 - Test status: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 1.05s`).
 - Conclusion: the split heuristic was leaving 15-18% decode performance on the table. The remaining decode gap is still architectural: the fused kernel remains a prefill-shaped template and is slower than nvfp4_fa2 even on dense decode.
+
+Qwen decode post-split production subset:
+- Linear report prefix: `reports/prod_qwen_decode_d256_g6_linear_postsplit_20260504`.
+- PV report prefix: `reports/prod_qwen_decode_d256_g6_pv_postsplit_20260504`.
+- Ran q=1 kv=4096/16384/65536/262144 with kernels `sm120_fused,nvfp4_fa2`; all sm120 rows were finite.
+- Linear q=1 sm120 times after split change:
+  - kv=4096 `0.570 ms`; kv=16384 `0.717 ms`; kv=65536 `1.243 ms`; kv=262144 `3.319 ms`.
+  - Previous full-report linear kv=262144 was `3.439 ms`, so the split change helps only modestly on stock linear-V because reblock dominates.
+- PV q=1 sm120 times after split change:
+  - kv=4096 `0.510 ms`; kv=16384 `0.524 ms`; kv=65536 `0.536 ms`; kv=262144 `0.602 ms`.
+  - Previous full-report PV kv=262144 was `0.710 ms`, matching the standalone split diagnostic. This is a real scheduling improvement.
+- Even after the split fix, PV decode remains slower than nvfp4_fa2:
+  - kv=4096 `0.510 ms` versus `0.0260 ms`.
+  - kv=262144 `0.602 ms` versus `0.0850 ms`.
+- Decision: do not spend more producer-tuning time on Qwen decode in this prefill kernel. The remaining gap is fixed floor/kernel-shape, not block-table or V reblock. The next structural options are a decode-specialized SM120 path or route q=1/window-small cells to existing FA2/XQA backends.
