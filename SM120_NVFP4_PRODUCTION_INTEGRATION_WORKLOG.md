@@ -4615,3 +4615,16 @@ Single-split direct-output result:
   - D256 q=1 kv=262144 g=6 paged-PV split `2048`: `0.606 ms`, unchanged because padded rows still require row compaction.
   - D256 q=512 kv=65536 g=6 paged-PV split `3072`: `2.557 ms`, unchanged because split-KV combine is still required.
 - Decision: keep the change. It is not the structural gap, but it removes an unnecessary launch in safe single-split/no-padding cells.
+
+D256 small-q tile-M diagnostic plan:
+- D256 no-SWA paged defaults to `TILE_M=128`. That is best for the q=512 long-prefill reference, but q=1 decode has only 6 live Q rows and still pays a full 128-row tile.
+- The now-working macro override can compile a real no-SWA `TILE_M=64` module. This halves padded-row work for q=1 and q=128-ish cases, but already measured slower on q=512 long prefill.
+- What I am about to test: D256 paged-PV `TILE_M=64` versus default `TILE_M=128` on q=1 kv=262144, q=128 kv=32768, and q=512 kv=65536.
+- Decision criterion: no default change unless the small-q win is large enough to justify the known long-prefill regression. If the win is large but incompatible with a single default, record this as evidence for a workload-shape dispatch/specialization gap.
+
+D256 small-q tile-M diagnostic result:
+- D256 paged-PV no-SWA, fixed splits, isolated JIT roots.
+- q=1 kv=262144 g=6 split `2048`: default `TILE_M=128` mean `0.607 ms`; `TILE_M=64` mean `0.739 ms`.
+- q=128 kv=32768 g=6 split `1024`: default `TILE_M=128` mean `0.638 ms`; `TILE_M=64` mean `0.585 ms`.
+- q=512 kv=65536 g=6 split `3072`: default `TILE_M=128` mean `2.562 ms`; `TILE_M=64` mean `3.082 ms`.
+- Decision: no D256 no-SWA default change. `TILE_M=64` helps one short-prefill cell but regresses decode and long prefill. The q=1 floor is not caused by 128-row tile padding.
