@@ -1,6 +1,7 @@
 #pragma once
 
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_quantization.cuh>
+#include <flashinfer/mma.cuh>
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -308,13 +309,8 @@ static __device__ __noinline__ uint32_t sm120_nvfp4_linear_v_requant_transposed_
         e4m3_byte_to_fp32(static_cast<uint8_t>(peer_scale_byte)) *
         inv_output_scale;
   }
-  return static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[0], vals[1])) |
-         (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[2], vals[3]))
-          << 8) |
-         (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[4], vals[5]))
-          << 16) |
-         (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[6], vals[7]))
-          << 24);
+  return flashinfer::mma::float8_to_e2m1x8(vals[0], vals[1], vals[2], vals[3],
+                                           vals[4], vals[5], vals[6], vals[7]);
 }
 
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code_from_page_base(

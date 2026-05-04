@@ -3323,3 +3323,114 @@ Remaining cost:
 - D256 remains on the known-correct one-load-warp producer. Its broad gap is
   still open and should be attacked as a D256-specific scheduling/reblock issue,
   not by reapplying the D512 load-warpgroup patch unchanged.
+## 2026-05-04 00:15 CDT - D512 Linear-V Reblock Pack Primitive
+
+What I am about to do and why:
+- The current D512 paged-linear reference remains much slower than paged-PV:
+  `43.212 ms` vs `15.851 ms` at `q=512 kv=65536 g=8 softcap=30`.
+- The hot helper is
+  `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:
+  sm120_nvfp4_linear_v_requant_transposed_word`, which shuffles 8 rows and then
+  packs with four pairwise E2M1 conversions.
+- The in-tree fmha_v2 pattern uses an 8-wide E2M1 pack primitive:
+  `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1770` calls
+  `fmha::float8_to_e2m1x8(vals[0], ..., vals[7])`.
+- FlashInfer already exposes the same shared primitive at
+  `include/flashinfer/mma.cuh:109`, so this change adopts the existing
+  repository primitive instead of composing four pair conversions locally.
+
+Reference audit:
+- `include/flashinfer/mma.cuh:109-126`:
+  `__device__ __forceinline__ uint32_t float8_to_e2m1x8(float x0, float x1,
+  float x2, float x3, float x4, float x5, float x6, float x7)` and four
+  `cvt.rn.satfinite.e2m1x2.f32` instructions followed by `mov.b32`.
+- `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1770-1771`:
+  `packed[reg] = fmha::float8_to_e2m1x8(vals[0], vals[1], vals[2], vals[3],
+  vals[4], vals[5], vals[6], vals[7]);`
+
+Decision criteria:
+- This is a narrow pack-primitive cleanup, not expected to close the full
+  linear-V gap by itself. It is kept only if D512 correctness stays green and
+  the reference linear cell is not slower.
+
+Result:
+- `tests/attention/test_nvfp4_kv_head_dim_512.py -q`: `36 passed in
+  299.78s`.
+- D512 Gemma-global linear reference `q=512 kv=65536 g=8 softcap=30`:
+  `43.095 ms` min, finite output.
+- Previous value was `43.212 ms`; this is effectively flat. The remaining
+  linear-V gap is not caused by the pair-pack primitive.
+
+## 2026-05-04 00:25 CDT - Benchmark Split Policy Alignment
+
+Finding:
+- `benchmarks/bench_sm120_nvfp4_attention.py` defaulted `--split-kv-len` to
+  `0`, which auto-selected a split length from the partial-scratch budget.
+- The production wrapper default in `flashinfer/fmha_nvfp4_sm120.py` is
+  `split_kv_len=8192`.
+- At the D512 Gemma-global reference cell, auto selected `split_kv_len=384`;
+  explicit production split selected `8192`.
+
+Measurement with explicit production split:
+- D512 `q=512 kv=65536 g=8 softcap=30`:
+  - paged-PV: `15.288 ms`
+  - paged-linear: `48.315 ms`
+  - dense: `5.993 ms`
+
+Conclusion:
+- Split policy mismatch was a benchmark validity issue, not the main PV gap.
+  Paged-PV remains about `2.6x` dense at this cell with production split.
+- Updated the SM120 benchmark scripts so omitted split flags use production
+  `8192`; explicit `0` still means auto-split for experiments.
+
+## 2026-05-04 00:27 CDT - D256 Current Gap After D128/D512 Widening
+
+Reference measurement with production split:
+- D256 Qwen-full cell `q=512 kv=65536 g=6 causal split_kv_len=8192`:
+  - dense: `1.308 ms`
+  - paged-PV: `77.162 ms`
+  - paged-linear: `150.667 ms`
+
+Conclusion:
+- D256 remains the major paged producer outlier. The D128/D512 widened producer
+  did not land on D256 because the mechanical port introduced PV multi-KV drift
+  and scratch-poison sensitivity. The next D256 work must isolate the
+  synchronization/schedule issue rather than reapply the reverted patch
+  unchanged.
+
+## 2026-05-04 00:35 CDT - D256 Four-Load-Warp Producer
+
+What changed:
+- Retried D256 widening with `kSm120Nvfp4FmhaNumWarpsLoad = 4`, not the prior
+  full 8-load-warp mechanical port.
+- Added the load-leader/load-group synchronization structure used by the D128
+  and D512 widened producers, but with a smaller load group.
+- Restricted CUTLASS `load_tail` calls to the first load warp and distributed
+  Q/K/V producer loops over `kSm120Nvfp4FmhaLoadThreadCount`.
+
+Validation:
+- D256 regression subset:
+  `test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x`,
+  `test_sm120_nvfp4_wrapper_scratch_poison_does_not_affect_output_sm12x`,
+  and `test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x`
+  filtered for D256: `2 passed, 34 deselected`.
+- Full `tests/attention/test_nvfp4_kv_head_dim_512.py -q`:
+  `36 passed in 48.51s`.
+
+D256 Qwen-full reference `q=512 kv=65536 g=6 causal split_kv_len=8192`:
+- Before this patch:
+  - dense: `1.308 ms`
+  - paged-PV: `77.162 ms`
+  - paged-linear: `150.667 ms`
+- After this patch:
+  - dense: `1.589 ms`
+  - paged-PV: `14.139 ms`
+  - paged-linear: `31.610 ms`
+
+Conclusion:
+- The D256 broad gap was the one-load-warp paged producer schedule. Four load
+  warps recover most of the missing throughput while avoiding the previously
+  observed eight-load-warp correctness failures.
+- D256 is still not dense-like: paged-PV remains about `8.9x` dense at this
+  cell. The next bottleneck is likely split/combine and per-tile fixed work,
+  not the catastrophic scalar producer serialization.

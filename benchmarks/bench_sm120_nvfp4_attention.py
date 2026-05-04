@@ -125,10 +125,11 @@ def main() -> None:
     parser.add_argument(
         "--split-kv-len",
         type=int,
-        default=0,
+        default=8192,
         help=(
-            "Split length in tokens. 0 auto-selects the smallest split that "
-            "keeps partial/split scratch under --max-partial-bytes."
+            "Split length in tokens. Defaults to the production wrapper "
+            "default. Use 0 to auto-select the smallest split that keeps "
+            "partial/split scratch under --max-partial-bytes."
         ),
     )
     parser.add_argument(
