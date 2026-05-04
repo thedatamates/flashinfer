@@ -4600,3 +4600,18 @@ Workspace clear-size diagnostic result:
 - Cap 1 MiB: decode `0.584 ms`, Gemma sliding `0.238 ms`, Qwen prefill `2.550 ms`.
 - One attempted cap-1MiB run failed before kernel build because the macro value was passed with shell parentheses; reran with numeric `1048576`, so the numbers above are valid.
 - Decision: do not reduce the production default from this data. The clear cap contributes only a small fixed cost and is not the structural gap. Keeping the override macro is useful for future diagnostics; the safe default remains 32 MiB.
+
+Single-split direct-output plan:
+- In `RunPagedBatchImpl`, even `max_splits == 1` currently launches the stage kernel into `out_scratch`, then launches `CopyPaddedBatchOutKernel` to move rows into the user output.
+- For single-split cells with no row padding and no multi-KV-head row-order remap, the stage output layout is already the final flattened output layout.
+- What I am about to change: when `max_splits == 1`, `out.size(0) == q_packed_scratch.size(0)`, and `(!all_kv_heads || num_kv_heads == 1)`, pass the final `out` tensor directly to the stage kernel and skip the copy kernel.
+- Decision criterion: keep the change if the focused NVFP4 test passes and Gemma sliding q=512 kv=1024 improves without regressing padded decode or long-prefill cells.
+
+Single-split direct-output result:
+- Changed `RunPagedBatchImpl` to pass final `out` directly to the stage kernel when the single-split output layout is already final: `max_splits == 1`, `out.size(0) == q_packed_scratch.size(0)`, and no multi-KV-head row-order remap.
+- Test status: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 300.05s`).
+- Bench guard cells:
+  - D256 Gemma sliding q=512 kv=1024 g=2 paged-PV split `1024`: `0.238 ms` versus prior `~0.240 ms`.
+  - D256 q=1 kv=262144 g=6 paged-PV split `2048`: `0.606 ms`, unchanged because padded rows still require row compaction.
+  - D256 q=512 kv=65536 g=6 paged-PV split `3072`: `2.557 ms`, unchanged because split-KV combine is still required.
+- Decision: keep the change. It is not the structural gap, but it removes an unnecessary launch in safe single-split/no-padding cells.

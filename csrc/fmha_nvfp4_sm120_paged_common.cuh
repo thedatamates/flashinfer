@@ -683,13 +683,20 @@ static void RunPagedBatchImpl(
   paged_params.q_stride_dim = q_stride_dim;
   paged_params.q_stride_row = q_stride_row;
 
+  const bool direct_single_split_to_out =
+      max_splits == 1 && out.size(0) == q_packed_scratch.size(0) &&
+      (!all_kv_heads || num_kv_heads == 1);
+  auto* stage_out_ptr =
+      direct_single_split_to_out ? static_cast<__nv_bfloat16*>(out.data_ptr())
+                                 : out_scratch_ptr;
+
   status = kernel.run(
       q_scratch_ptr, q_sf_scratch_ptr,
       static_cast<uint8_t*>(k_pages.data_ptr()),
       static_cast<uint8_t*>(k_sf_pages.data_ptr()),
       static_cast<uint8_t*>(v_pages_pv.data_ptr()),
       static_cast<uint8_t*>(v_sf_pages_pv.data_ptr()), partial_ptr,
-      split_m_ptr, split_l_ptr, out_scratch_ptr, workspace_ptr,
+      split_m_ptr, split_l_ptr, stage_out_ptr, workspace_ptr,
       workspace_bytes, static_cast<float>(qk_alpha),
       static_cast<float>(pv_alpha), static_cast<int>(split_kv_tiles), 0,
       static_cast<int>(group_size), 0, causal,
@@ -703,6 +710,9 @@ static void RunPagedBatchImpl(
       << "SM120 NVFP4 FMHA batch failed: " << cudaGetErrorString(status);
 
   if (max_splits == 1) {
+    if (direct_single_split_to_out) {
+      return;
+    }
     CopyPaddedBatchOutKernel<<<static_cast<unsigned>(total_padded_q_rows), 256,
                                0, stream>>>(
         out_scratch_ptr, static_cast<__nv_bfloat16*>(out.data_ptr()),
