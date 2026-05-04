@@ -2463,3 +2463,29 @@ Characterization:
   page traversal. The D512 q=2048 kv=262144 stock-vLLM production cell is
   `10290.048 ms` paged-linear vs `4403.373 ms` paged-PV vs `53.862 ms` dense vs
   `188.973 ms` NVFP4 FA2.
+
+## 2026-05-03 20:13 CDT - P6 Graveyard Cleanup Audit Result
+
+Audit commands:
+
+- `rg -n "debug|Debug|smem_fp4_debug_code|cutlass_smem_atom_gemm_tile_body|debug_producer_smem|debug_stage_run|StageDebug" include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d{128,256,512}.cuh csrc/fmha_nvfp4_sm120_* benchmarks`
+- `rg -n "smem_fp4|gemm_tile_body|producer_smem|stage_run|StageDebug|data_debug_mode|scale_debug_mode|probe|Probe|TVM_FFI_DLL_EXPORT_TYPED_FUNC" include/flashinfer/attention/blackwell csrc/fmha_nvfp4_sm120*.cu csrc/fmha_nvfp4_sm120*.cuh`
+- `git ls-files benchmarks`
+
+Result:
+
+- No remaining `smem_fp4_debug_code`,
+  `cutlass_smem_atom_gemm_tile_body_impl`, `debug_producer_smem`,
+  `debug_stage_run`, `StageDebug`, `data_debug_mode`, or `scale_debug_mode`
+  symbols are present in the current tree.
+- The only SM120 NVFP4 FFI exports now present are production exports:
+  `paged_run`, `paged_run_bf16_q`, `dense_run`, and `quantize_q`.
+- The stale SM120/NVFP4 dev bench scripts from the integration phase are already
+  absent. The remaining relevant files are:
+  `bench_sm120_nvfp4_attention.py`,
+  `bench_sm120_nvfp4_attention_grid.py`, and
+  `bench_nvfp4_fmha_v2_gqa_grouped_attention.py`.
+- `bench_nvfp4_quantize_backend_comparison.py` and `bench_trtllm_fmha.py` are
+  not SM120-owned cleanup targets and were left untouched.
+
+No code changes were needed for P6.
