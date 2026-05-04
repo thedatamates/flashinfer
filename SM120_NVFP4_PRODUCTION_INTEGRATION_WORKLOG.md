@@ -2634,3 +2634,52 @@ What unlocks further wins:
 - A schedule restructure for paged split-KV / page traversal so the paged path
   stops launching/executing work at two orders of magnitude above the dense
   kernel for the same logical attention cell.
+
+## 2026-05-03 20:36 CDT - Paged V Producer Structural Comparison
+
+Reference files checked:
+
+- `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h`
+- `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh`
+- `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh`
+
+fmha_v2 structure:
+
+- `Gmem_tile_paged_kv` assigns work across `Cta_tile::THREADS_PER_CTA` via
+  `THREADS_PER_ROW`, `ROWS_PER_LDG`, and `LDGS`.
+- The generic paged path builds `ptrs[LDGS]` once per participating thread and
+  issues `Ldgsts_helper<USE_LDGSTS>::load(...)`, so page/block-table resolution
+  and vector loads are distributed across the CTA.
+- PV-layout V uses `load_pv_layout_v()`, vector-stages scale data where possible,
+  then calls `load_nvfp4_row_major_data()`. That data path uses 16-byte row-major
+  loads when the row/column window is fully in bounds.
+- Linear/reblocked V uses a two-pass structure: distributed scale-pair
+  recompute across all CTA threads, `__syncthreads()`, then bounded per-thread
+  register reblock with `float8_to_e2m1x8`.
+
+SM120 current structure:
+
+- The paged path is bolted into the existing TMA-style load role. Only the load
+  warp runs `stage_paged_v_tile()`.
+- Inside that one load warp, each lane loops over
+  `copy_thread = lane_idx; copy_thread < ...::ThreadCount; copy_thread += 32`,
+  effectively emulating the CUTLASS copy-thread partition from one physical
+  warp instead of distributing it across the CTA.
+- Paged-PV still computes one destination packed word at a time and fills it
+  through eight scalar code loads before a 32-bit smem store.
+- Paged-linear does the same packed-word loop plus per-codepoint
+  dequant/requant. The reblock arithmetic is real, but the current scaffold
+  also serializes the memory work through one load warp.
+
+Structural conclusion:
+
+- The remaining `90x-153x` paged-PV-vs-dense gap is not fixed by a vLLM PV
+  writer. A PV writer removes the `linear` reblock tax (`~2.4x-2.5x`), but
+  paged-PV is already catastrophically slower than dense.
+- The load-bearing issue is the producer execution model: SM120 paged V is using
+  a one-load-warp TMA scaffold for work that fmha_v2 distributes across the CTA
+  with vectorized loads and explicit staging/reblock phases.
+- The next real design should either replace the paged V producer scaffold with
+  a CTA-distributed producer modeled on `Gmem_tile_paged_kv`, or split a smaller
+  CTA-distributed helper out of the current CUTLASS partition code. More scalar
+  hoists inside the current one-warp producer are low-yield.
