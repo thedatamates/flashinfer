@@ -4534,3 +4534,18 @@ PV B-fragment direct-fill feasibility result:
 - Implementation detail found during the probe: 64-bit cp.async into compact smem works when the destination address is computed from the raw shared-memory base. Taking the destination through a CUTE `uint8_t` smem tensor reference caused an illegal memory access. The failure was address plumbing, not gmem stride alignment.
 - Diagnosis: the narrow CUTE-fragment route removes the producer shfl transpose, but it also replaces CUTLASS's optimized smem-to-register copy/`ldmatrix` path with scalar smem reads to assemble each packed B register. That scalar reconstruction cost is larger than the producer-side savings.
 - Decision: reverted the experiment. Do not propagate the direct CUTE fill or compact-smem scalar reconstruction to D128/D512. Closing the remaining gap to FA2 requires preserving FA2's second half too: a custom smem layout plus an efficient ldmatrix/fragment-construction path, or a lower-level FA2-like MMA path. A producer-only rewrite inside the current `cute::gemm` consumer is not enough.
+
+D256 load-warp geometry tuning plan:
+- D512 paged-PV is already near dense at long prefill cells, while D256 paged-PV still carries about a 2x dense gap on Qwen prefill. That points at a D256-specific fixed producer/schedule floor rather than the shared kernel template body.
+- D256 exposes `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS` as a compile-time knob. Current default is `7` load warps, with `8` MMA warps and `1` epilogue warp.
+- What I am about to test: build isolated JIT caches with `FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_d256_loadwarps_${N}` and `FLASHINFER_EXTRA_CUDAFLAGS=-DFLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=${N}`, then benchmark D256 q=512 kv=65536 g=6 paged-PV with the Qwen full spec.
+- Decision criterion: keep a source default change only if one load-warp count materially improves the production cell without obviously regressing the small q=128 kv=4096 smoke cell. If the curve is flat or worse, leave the default at `7`.
+
+D256 load-warp / tile-M geometry tuning result:
+- Reference cell: D256 q=512 kv=65536 g=6 paged-PV, Qwen full spec, split `3072`.
+- `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=3`: mean `2.562 ms`.
+- `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=5`: mean `2.563 ms`.
+- Default `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=7`: prior mean around `2.55 ms`.
+- `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=9`: mean `2.566 ms`.
+- `FLASHINFER_SM120_NVFP4_D256_TILE_M=128` with default load warps: mean `2.563 ms`.
+- Decision: no source change. The D256 paged-PV gap is flat across these geometry knobs, so it is not caused by an obviously wrong load-warp count or CTA M tile. The remaining fixed floor is inside the paged data path / consumer construction, not top-level warp allocation.
