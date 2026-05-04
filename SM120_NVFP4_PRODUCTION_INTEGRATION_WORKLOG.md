@@ -4968,3 +4968,87 @@ Next profiling target:
 - Keep the global-load-coalesced PV producer from `f7ac8e9`.
 - The next high-risk path should change the producer/store architecture more substantially than an intra-subgroup register transpose, or attack the remaining `1.044B` instruction count and reconvergence samples directly.
 - Continue using NCU as the gate: each candidate needs a named counter/PC target before code and a measured counter/timing result after code.
+
+## 2026-05-04 12:41 CDT - Lineinfo-Gated High-Risk Producer Target
+
+Finding:
+
+- High-risk producer/layout changes are in scope. The gating constraint is profiler evidence, not implementation risk.
+- The last high-risk D256 store-side register transpose was the right kind of experiment: it targeted the measured shared-store wavefront PCs, passed correctness, failed timing, and was reverted.
+- The remaining D256 paged-PV gap is still visible in NCU: paged executes about `1.044B` instructions versus dense around `0.576B`, with elevated reconvergence/barrier samples and a paged-specific SASS block around the top dynamic-instruction PCs.
+- Current NCU reports lack usable CUDA line attribution for those PCs, so another architectural rewrite would still be partly SASS-pattern inference.
+
+Implementation target:
+
+- Build the D256 paged-PV reference spec in an isolated JIT workspace with CUDA lineinfo enabled.
+- Re-run NCU SourceCounters and warp-state sampling against the same reference cell.
+- Map the top paged-specific dynamic-instruction, reconvergence, and remaining global/shared-wavefront PCs back to source lines before choosing the next code change.
+
+Validation:
+
+- The diagnostic build must use the same source HEAD and same benchmark cell as the committed coalesced-load baseline: D256 Qwen paged-PV `q=512 kv=65536 g=6 split=3072`.
+- If lineinfo changes timing materially, treat the profile as attribution-only and benchmark final candidates in the normal non-lineinfo cache before keeping them.
+- Do not commit diagnostic cache or flag changes; only append the resulting attribution and any code changes that pass correctness and timing.
+
+Decision criteria:
+
+- Proceed to a high-risk producer change only when NCU identifies the specific source block responsible for a large paged-only counter.
+- If lineinfo still cannot attribute the PCs, fall back to a controlled instrumentation strategy that isolates whole producer sub-blocks, not another guessed rewrite.
+
+## 2026-05-04 12:47 CDT - PV Scale Producer Coalescing Target
+
+Finding:
+
+- The isolated lineinfo build completed at the same source HEAD and measured `2.295 ms` outside NCU and `2.559 ms` under NCU for D256 Qwen paged-PV. Treat it as source attribution only.
+- Dense lineinfo on the same cell measured `1.409 ms` under NCU. Comparing line-level counters rules out the largest `score_is_valid()` division site as paged-specific: `global_q_row / group_size` is common to dense and paged.
+- The largest paged-only instruction/counter block is PV scale staging:
+  - `d256.cuh:1216` PV scale producer loop: `23,206,224` paged-only instructions.
+  - `paged_kv.cuh:807` runtime `dim / params.scale_dim`: `20,319,216` paged-only instructions.
+  - `paged_kv.cuh:814` `params.v_scales[src]`: `5,505,024` paged-only excessive global sectors.
+- The current PV scale loop maps consecutive lanes over token groups first, then columns. For PV scale memory, columns are the contiguous dimension, so this is the same lane-ordering mistake the V data path had before coalescing.
+
+Implementation target:
+
+- Add a PV-scale helper with compile-time scale dimension (`kHeadDim / 16`) so D128/D256/D512 avoid runtime division by `params.scale_dim` in the hot PV scale path.
+- Reorder the PV scale producer loop so consecutive load lanes cover consecutive columns for one token group before moving to the next token group.
+- Apply the same source-level change to D128/D256/D512; no public shape, layout, or FFI changes.
+
+Validation:
+
+- Run the focused D256 correctness subset first.
+- Benchmark D256 Qwen paged-PV `q=512 kv=65536 g=6 split=3072`.
+- If timing improves, run NCU on D256 Qwen paged-PV and compare `paged_kv.cuh:814` excessive global sectors, `d256.cuh:1216` instructions, and total stage duration against the coalesced-load baseline.
+- If D256 passes, run D128/D512 focused benchmarks and the full NVFP4 test file.
+
+Decision criteria:
+
+- Keep if D256 correctness passes and either timing or the targeted NCU counters improve.
+- Revert if the reordering only shifts overhead or regresses timing.
+
+## 2026-05-04 12:51 CDT - PV Scale Producer Coalescing Result
+
+Finding:
+
+- Implemented the PV scale producer experiment across D128/D256/D512:
+  - Added a compile-time-scale-dim PV scale helper for `kHeadDim / 16`.
+  - Reordered the PV scale producer loop so load lanes iterate columns first for a token group.
+- Focused D256 correctness passed: `3 passed in 44.32s`.
+- D256 Qwen paged-PV reference timing regressed/no-improved:
+  - Run 1: `2.302 ms` mean.
+  - Run 2: `2.307 ms` mean.
+  - Committed coalesced-load baseline: `2.271 ms` mean.
+
+Decision:
+
+- Reverted the PV scale producer code.
+- Do not propagate this lane-ordering/static-helper shape.
+- The NCU line attribution remains useful, but this particular fix does not move wall time. The likely reason is that the reduced division/coalescing opportunity is offset by worse smem-scale store/address behavior or compiler scheduling in the producer loop.
+
+Next profiling target:
+
+- Keep using the lineinfo reports for source-ranked deltas.
+- The highest-value paged-only counters still are:
+  - PV V data store shared-wavefront excess at `d256.cuh:1112`.
+  - K scale shared-wavefront excess at `d256.cuh:922`.
+  - Paged producer reconvergence around cache/page setup at `d256.cuh:843`.
+- The next change should either remove one of those stores entirely from the hot loop or change the staging architecture; simple lane reorders are now suspect unless NCU shows the target counter dominates and timing moves with it.
