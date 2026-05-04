@@ -7,8 +7,12 @@
 #include "fmha_nvfp4_sm120_config.inc"
 
 #if !SM120_NVFP4_USE_SLIDING_WINDOW_PREPROC
+#ifndef FLASHINFER_SM120_NVFP4_D256_TILE_M
 #define FLASHINFER_SM120_NVFP4_D256_TILE_M 128
+#endif
+#ifndef FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS
 #define FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS 11
+#endif
 #endif
 
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh>

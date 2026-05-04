@@ -4549,3 +4549,26 @@ D256 load-warp / tile-M geometry tuning result:
 - `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=9`: mean `2.566 ms`.
 - `FLASHINFER_SM120_NVFP4_D256_TILE_M=128` with default load warps: mean `2.563 ms`.
 - Decision: no source change. The D256 paged-PV gap is flat across these geometry knobs, so it is not caused by an obviously wrong load-warp count or CTA M tile. The remaining fixed floor is inside the paged data path / consumer construction, not top-level warp allocation.
+
+D256 output-group span diagnostic plan:
+- D256 defaults to `output_group_span=2`, so one CTA computes two 128-wide output groups through the D256 pair path. Span 1 doubles output-group CTAs but uses the simpler single-group PV path.
+- Prior pair-path diagnostic only forced span-2 through the generic per-group helper; it did not measure real span 1 as a wrapper-level scheduling choice.
+- What I am about to test: benchmark D256 paged-PV at span 1 versus span 2 on the Qwen long-prefill cell (`q=512 kv=65536 g=6`) and the Gemma sliding fixed-floor cell (`q=512 kv=1024 g=2`).
+- Decision criterion: change the default only if span 1 materially improves the production cells despite the larger grid. If the curve is flat or worse, leave span 2 and move to deeper kernel-shape work.
+
+D256 output-group span diagnostic result:
+- Runtime span 1 cannot be measured through the current production module. The FFI rejects it before launch with `output_group_span == kernel.output_group_span (1 vs. 2)`, because D256 paged is generated with span 2 baked into `PagedKernelConfig`.
+- No performance conclusion was drawn from that failed invocation. Measuring span 1 would require generating a separate D256 paged module configured for span 1, which is a compile-time variant rather than the runtime wrapper knob the benchmark exposes.
+- Decision: do not change output-group span from this attempt. Continue with launch/kernel-shape analysis using the compiled production span 2 module.
+
+D256 geometry diagnostic invalidation:
+- While reading the D256 paged launcher, I found that `csrc/fmha_nvfp4_sm120_d256_paged.cu` unconditionally defines `FLASHINFER_SM120_NVFP4_D256_TILE_M 128` and `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS 11` for the no-SWA module before including `fmha_nvfp4_sm120_d256.cuh`.
+- Consequence: experiments that used `FLASHINFER_EXTRA_CUDAFLAGS=-DFLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=...` or `-DFLASHINFER_SM120_NVFP4_D256_TILE_M=...` were overwritten by the source file. The measured flat curve only proved that isolated cache roots worked; it did not prove that load-warp/tile-M geometry is flat.
+- What I am about to change: make those no-SWA D256 defaults overrideable with `#ifndef`, preserving the production defaults (`TILE_M=128`, `LOAD_WARPS=11`) while enabling real compile-time diagnostics.
+- Decision criterion: keep the overrideability patch if the focused NVFP4 test still passes with default settings, then rerun the D256 geometry sweep with isolated JIT cache roots and actual macro values.
+
+D256 geometry overrideability result:
+- Changed `csrc/fmha_nvfp4_sm120_d256_paged.cu` so the no-SWA defaults remain `FLASHINFER_SM120_NVFP4_D256_TILE_M=128` and `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=11`, but only define them when the macro is not already provided.
+- This is intended as a diagnostic-enabling patch with no default production behavior change.
+- Test status: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 358.46s`).
+- Next: rerun the D256 geometry sweep with isolated JIT roots now that the macro values actually reach the header.
