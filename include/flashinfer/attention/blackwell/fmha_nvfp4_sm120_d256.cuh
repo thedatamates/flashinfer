@@ -932,6 +932,18 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         float max_abs0 = 0.0f;
         float max_abs1 = 0.0f;
         if constexpr (!kPvLayoutV) {
+          if (paged_kv_params.v_linear_scale_cache != nullptr) {
+            const int token_group = token_group_start >> 4;
+            if (token_group < paged_kv_params.v_linear_scale_cache_groups) {
+              sf0 = sm120_nvfp4_linear_v_scale_cache_load(
+                  paged_kv_params, batch_idx, paged_kv_params.kv_head, dim0,
+                  token_group);
+              sf1 = sm120_nvfp4_linear_v_scale_cache_load(
+                  paged_kv_params, batch_idx, paged_kv_params.kv_head,
+                  dim0 + 1, token_group);
+              return;
+            }
+          }
           if (token_group_start < kv_len_tokens) {
             const int logical_page =
                 token_group_start / paged_kv_params.page_size;
@@ -2279,11 +2291,21 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
       kCutlassTileM, head_dim, kv_len, 1);
   const size_t pv_workspace_size =
       CutlassGemmKernelK128Stage2::get_workspace_size(pv_args);
-  if (workspace_bytes < qk_workspace_alloc + pv_workspace_size) {
+  char* pv_workspace = workspace_base + qk_workspace_alloc;
+  const size_t base_required_workspace_bytes =
+      qk_workspace_alloc + pv_workspace_size;
+  const size_t linear_scale_cache_offset =
+      align_workspace(base_required_workspace_bytes);
+  const size_t linear_scale_cache_bytes =
+      (kUsePagedKv && !kPvLayoutV)
+          ? sm120_nvfp4_linear_v_scale_cache_bytes(batch_size, num_kv_heads,
+                                                   head_dim, kv_len)
+          : 0;
+  const size_t required_workspace_bytes =
+      linear_scale_cache_offset + linear_scale_cache_bytes;
+  if (workspace_bytes < required_workspace_bytes) {
     return cudaErrorInvalidValue;
   }
-  char* pv_workspace = workspace_base + qk_workspace_alloc;
-  const size_t required_workspace_bytes = qk_workspace_alloc + pv_workspace_size;
   constexpr size_t kWorkspaceClearBytes = 32 * 1024 * 1024;
   const size_t workspace_clear_bytes =
       workspace_bytes < kWorkspaceClearBytes ? workspace_bytes
@@ -2313,6 +2335,17 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
   }
   auto pv_params = CutlassGemmKernelK128Stage2::to_underlying_arguments(
       pv_args, pv_workspace);
+
+  if constexpr (kUsePagedKv && !kPvLayoutV) {
+    uint8_t* linear_scale_cache = reinterpret_cast<uint8_t*>(
+        workspace_base + linear_scale_cache_offset);
+    auto scale_cache_status = sm120_nvfp4_prepare_linear_v_scale_cache(
+        paged_kv_params, linear_scale_cache, kv_lens, batch_size,
+        num_kv_heads, head_dim, kv_len, stream);
+    if (scale_cache_status != cudaSuccess) {
+      return scale_cache_status;
+    }
+  }
 
   constexpr int kSmemBytes =
       static_cast<int>(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage));

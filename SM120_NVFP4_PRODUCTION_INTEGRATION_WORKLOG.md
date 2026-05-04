@@ -3480,3 +3480,88 @@ Conclusion:
   Gating them is both upstream-style cleanup and a real performance fix.
 - Linear-V remains dominated by the reblock path; trap gating does not change
   that bottleneck materially.
+
+## 2026-05-04 01:02 CDT - Linear-V Scale-Shuffle Narrow Test
+
+What was tested:
+- Changed the linear-V transpose helper to convert the source lane's UE4M3
+  scale byte to float once, shuffle that float, and reuse it in the 8-wide
+  packed-word requantization.
+- This removes per-peer `e4m3_byte_to_fp32(...)` conversions inside
+  `sm120_nvfp4_linear_v_requant_transposed_word`.
+
+Validation:
+- Full `tests/attention/test_nvfp4_kv_head_dim_512.py -q`:
+  `36 passed in 319.67s`.
+
+D512 Gemma-global reference `q=512 kv=65536 g=8 softcap=30 split_kv_len=8192`:
+- Before this test: paged-linear `47.738 ms`.
+- With the float-scale shuffle: paged-linear `48.822 ms`.
+
+Conclusion:
+- This is not a useful optimization. It slightly regressed the reference cell
+  and does not address the structural linear-V gap.
+- The change was reverted. The remaining work stays in the producer schedule
+  and linear-V reblock structure, not scalar conversion micro-tweaks.
+
+## 2026-05-04 01:21 CDT - Linear-V Reblock Cost Localization
+
+Checks:
+- D512 Gemma-global `kv=65536 g=8 softcap=30 split_kv_len=8192` q-scaling:
+  - PV: `q=128 5.329 ms`, `q=512 11.742 ms`, `q=2048 37.236 ms`.
+  - linear: `q=128 19.430 ms`, `q=512 48.153 ms`,
+    `q=2048 165.503 ms`.
+- Temporary D512 diagnostic forced linear-V output reblock scales to unit
+  (`0x38`) and skipped the 16-token max-abs scale recompute. It was reverted
+  immediately after measurement.
+
+Diagnostic result:
+- D512 linear reference `q=512 kv=65536`: `48.153 ms` -> `26.819 ms` with
+  unit reblock scales.
+
+Conclusions:
+- Linear-V is paying reblock work per Q tile. The same V tile/scales are
+  recomputed once for every Q CTA, which is architecturally wrong for a
+  production paged cache path.
+- At this cell, roughly `21 ms` is the repeated output-scale recompute and the
+  remaining `~15 ms` over PV is the data dequant/requant path.
+- The next structural fix is to move or cache linear-V output-scale generation
+  at the KV-split/output-group scope so Q tiles reuse it, instead of running
+  the 16-token max-abs scan inside every Q CTA.
+
+## 2026-05-04 01:43 CDT - Private Linear-V Reblock Scale Cache
+
+What changed:
+- Added an internal linear-V output-scale cache in
+  `Sm120Nvfp4PagedKvLoadParams`.
+- The paged launcher carves the cache from the existing `workspace` after the
+  CUTLASS QK/PV workspaces. No public tensor shape, layout name, FFI argument,
+  or Python wrapper API changed.
+- For `kPvLayoutV=false`, a preparatory CUDA kernel computes the 16-token
+  linear-V reblock scales once per `(batch, kv_head, dim, token_group)`.
+- The stage kernel now loads those cached scale bytes into `pv_sSFB` instead
+  of running the max-abs scan inside every Q CTA. If the cache pointer is null,
+  the old in-CTA recompute path remains as a dense/test fallback.
+
+Validation:
+- Full `tests/attention/test_nvfp4_kv_head_dim_512.py -q`:
+  `36 passed in 320.81s`.
+
+Reference cells, production split `8192`:
+- D512 Gemma-global `q=512 kv=65536 g=8 softcap=30`:
+  - PV: `11.669 ms` (unchanged from `11.682 ms`).
+  - linear: `47.738 ms` -> `28.552 ms`.
+- D256 Qwen-full `q=512 kv=65536 g=6`:
+  - PV: `8.843 ms` (unchanged from `8.831 ms`).
+  - linear: `31.610 ms` -> `17.140 ms`.
+- D128 baseline `q=512 kv=65536 g=8`:
+  - PV: `3.793 ms`.
+  - linear: `10.346 ms`.
+
+Conclusion:
+- The repeated scale scan was the largest linear-V-specific architectural
+  waste. It is now paid once per paged call/KV cache scope instead of once per
+  Q tile.
+- Remaining linear-V overhead is the data dequant/requant path. At D512
+  reference, linear is still `2.45x` PV, so further work needs to attack data
+  requant reuse or reduce the per-Q-tile data conversion itself.
