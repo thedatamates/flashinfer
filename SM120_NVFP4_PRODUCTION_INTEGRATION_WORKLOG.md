@@ -5308,3 +5308,164 @@ Decision:
 
 - Keep and commit the one-write scale-store change.
 - Do not treat this as the performance pass endpoint. The next pass needs a fresh post-change NCU report and should target the new top wall-time source, not the eliminated SFB store line.
+
+## 2026-05-04 13:48 CDT - Q-Row Position Cache Target
+
+Finding:
+
+- Rebuilt the D256 Qwen paged-PV JIT module with `FLASHINFER_JIT_LINEINFO=1` after moving only the no-lineinfo cache directory aside.
+- Fresh post-scale-store NCU source attribution on `q=512 kv=65536 g=6 split=3072` reports `2.54 ms` under profiler and identifies the current instruction hotspot.
+- Top source by instructions is `fmha_nvfp4_sm120_d256.cuh:1905`, `const int q_token = global_q_row / group_size;`, with about `157M` instructions and `5.0B` thread instructions.
+- The same line is also the top short-scoreboard and wait-stall source; the score predicate is recomputing a row-invariant division for every score element.
+- This is not a paged producer memory issue; it is a per-score predicate structure issue surfaced after the scale-store cleanup removed the previous redundant scale writes.
+
+Implementation target:
+
+- Add a per-row shared-memory cache of `q_pos`, using `-1` for invalid Q rows.
+- Populate it once during the existing CTA initialization loop that already writes `global_m`, `global_l`, and `old_scale_stage` before the block-wide `__syncthreads()`.
+- Replace `score_is_valid`'s per-score `global_q_row / group_size` with a shared read of the cached `q_pos`.
+- Apply the same pattern to D128/D256/D512 because all three files have the same `score_is_valid` structure and the row invariant is identical.
+
+Validation:
+
+- Focused D256 correctness first.
+- D256 Qwen paged-PV benchmark before broader propagation if compile succeeds.
+- Full NVFP4 attention test file after all D-size propagation.
+- Re-run D256 Qwen NCU source counters if timing moves materially, verifying line `q_token = global_q_row / group_size` drops out of the top source list.
+
+Decision criteria:
+
+- Keep if correctness passes and the D256 reference cell improves or is neutral without increasing shared-memory budget past the existing static asserts.
+- Revert if shared-memory traffic from the cache replaces the division cost and timing regresses.
+
+## 2026-05-04 13:54 CDT - Q-Row Position Cache Result
+
+Finding:
+
+- Implemented the per-row `q_pos` cache across D128/D256/D512 and compiled through the focused D256 tests.
+- Focused D256 correctness failed immediately:
+  - Multi-KV vs single-KV: greatest absolute difference `0.0029296875` with `0.001` tolerance.
+  - Scratch poison determinism: `158867 / 688128` elements mismatched, greatest absolute difference `0.00390625`.
+  - Standard wrapper vs direct wrapper: greatest absolute difference `0.0040283203125` with `0.002` tolerance.
+- The failure shape is not a tolerance-edge speed-only tradeoff; scratch poison divergence means the shared cache placement or lifetime perturbed state in a way that is not correctness-neutral.
+
+Decision:
+
+- Reverted the q-position cache code in D128/D256/D512.
+- Keep the NCU finding: per-score `q_token = global_q_row / group_size` is real overhead, but the simple shared-cache implementation is unsafe in the current aliased shared-memory layout.
+- Do not revisit this with another shared-storage field unless the storage/lifetime interaction is diagnosed first.
+
+Next profiling target:
+
+- Continue from the same lineinfo NCU report.
+- The remaining high-impact targets are the PV V operand store shared-memory wavefront excess at `fmha_nvfp4_sm120_d256.cuh:1104` and global excessive sectors from `v_scales` at `paged_kv.cuh:814`.
+- Because the direct-address PV store experiment was timing-neutral, the next structural attempt should target data/layout movement rather than a syntactic address computation rewrite.
+
+## 2026-05-04 13:55 CDT - PV V Scale Lane-Mapping Target
+
+Finding:
+
+- The lineinfo NCU report after one-write scale stores shows the largest global excessive-sector source is `fmha_nvfp4_sm120_paged_kv.cuh:814`, `return params.v_scales[src];`.
+- The D256 PV V scale staging loop currently maps consecutive load threads across `token_group` first and `col` second:
+  - `col = idx / kTokenScaleGroups`.
+  - `token_group = idx - col * kTokenScaleGroups`.
+- For PV scale layout, `sm120_nvfp4_paged_v_pv_scale_from_physical_page` indexes by physical page and dim. Consecutive token groups are different pages, so adjacent lanes load far-apart scale addresses for the same column.
+- This explains the NCU excessive global sectors: the warp is de-coalescing the scale loads by page before it walks contiguous columns.
+
+Implementation target:
+
+- Reorder only the PV V scale staging loop so `token_group` is the outer/coarse index and `col` is the fast lane-varying index:
+  - `token_group = idx / kOutputTileN`.
+  - `col = idx - token_group * kOutputTileN`.
+- This keeps the public PV scale layout and the CUTLASS SFB destination layout unchanged.
+- Apply to D128/D256/D512 because all three files have the same PV scale loop and NCU identified the same helper as the global-sector source.
+
+Validation:
+
+- Focused D256 correctness first.
+- D256 Qwen paged-PV benchmark at the same reference cell.
+- If timing improves, run NCU source counters again and confirm `v_scales[src]` excessive sectors drop.
+
+Decision criteria:
+
+- Keep if correctness passes and D256 timing improves or stays neutral while reducing NCU global excessive sectors.
+- Revert if the lane remap causes correctness drift or worsens timing; the next target would then be a wider/vectorized scale load rather than loop-ordering.
+
+## 2026-05-04 13:58 CDT - PV V Scale Lane-Mapping Result
+
+Finding:
+
+- Reordered the PV V scale loop across D128/D256/D512 so lanes load contiguous columns within one token group/page.
+- Focused D256 correctness passed:
+  - `3 passed in 44.20s`.
+- First timing used a lineinfo JIT cache and was not comparable, so restored the no-lineinfo D256 PV cache path and let ninja rebuild from current source.
+- Apples-to-apples D256 Qwen paged-PV benchmark regressed:
+  - Post-scale baseline: about `2.235 ms` representative mean.
+  - PV scale lane remap: `2.314 ms` mean (`min 2.306`, `max 2.322`).
+
+Decision:
+
+- Reverted the PV scale lane remap in D128/D256/D512.
+- The NCU global excessive-sector finding is real, but this loop-order change trades it for worse wall time, likely through destination SFB/shared-memory access order or worse scheduling of the scale producer.
+- Do not treat global-sector coalescing alone as sufficient; future scale work needs to include the shared destination pattern and wall-time validation.
+
+Next profiling target:
+
+- Return to the fresh NCU source report and target the highest wall-time-relevant remaining source with a structural change, not a source-only coalescing rewrite.
+- The leading unresolved class remains V operand staging/store shared-memory wavefront excess around the PV B store path.
+
+## 2026-05-04 14:00 CDT - PV B Store Register-Transpose Target
+
+Finding:
+
+- Fresh lineinfo NCU after the one-write scale cleanup reports the largest shared-memory excessive-wavefront source at `fmha_nvfp4_sm120_d256.cuh:1104`, the `pv_sB` 32-bit packed-word store.
+- The current PV V producer intentionally coalesces global loads by assigning each 8-lane subgroup one `8 token x 64 dim` block:
+  - lane 0 owns dims `0..7`, lane 1 owns dims `8..15`, etc.
+  - this makes the per-token gmem loads contiguous across lanes.
+- The store side then issues one store per `dim_offset`; for a fixed store instruction, lanes write columns `0, 8, 16, ...`, not contiguous columns.
+- That lane-to-column stride matches the NCU shared-memory wavefront excess at the `pv_sB` store.
+
+Implementation target:
+
+- Test D256 first.
+- Keep the current global-load mapping so V data loads stay coalesced.
+- After each lane builds its eight `packed_words`, add an 8-lane register transpose at store time:
+  - each lane selects `packed_words[subgroup_lane]`.
+  - `__shfl_sync` broadcasts that selected word from each source lane.
+  - for each source lane, the subgroup stores contiguous columns `base + source_lane * 8 + subgroup_lane`.
+- This trades eight subgroup shuffles per producer tile for contiguous shared-memory stores.
+
+Validation:
+
+- Focused D256 correctness.
+- D256 Qwen paged-PV benchmark at the reference cell.
+- If timing improves, run lineinfo NCU again and verify the `pv_sB` shared excessive wavefront count drops.
+- If D256 improves, propagate to D128/D512; otherwise revert D256 and keep the finding.
+
+Decision criteria:
+
+- Keep only if correctness passes and wall time improves. NCU shared-wavefront reduction alone is insufficient.
+- Revert if ptxas spills or wall time regresses; the next structural option is a non-CUTLASS V smem path rather than more local lane remapping.
+
+## 2026-05-04 14:04 CDT - PV B Store Register-Transpose Result
+
+Finding:
+
+- Implemented the D256 PV B store register-transpose experiment.
+- Correctness passed the focused D256 subset:
+  - `3 passed in 44.39s`.
+- D256 Qwen paged-PV reference timing regressed:
+  - Post-scale baseline: about `2.235 ms` representative mean.
+  - Register-transposed PV B store: `2.354 ms` mean (`min 2.314`, `max 2.479`).
+- The result indicates the NCU shared-wavefront excess at the store is not cheap enough to fix with subgroup shuffles; the added shuffle/register pressure costs more than the shared-store coalescing recovers.
+
+Decision:
+
+- Reverted the D256 register-transposed PV B store experiment.
+- Do not propagate this shape to D128/D512.
+- Keep the conclusion: the CUTLASS V operand smem layout imposes a store-pattern cost, but local lane remapping inside the current producer is not the right way to recover it.
+
+Next profiling target:
+
+- Local producer tweaks are now producing small or negative deltas while the remaining gap is architectural.
+- The next NCU-driven high-risk direction should compare the current CUTLASS-operand V path against a non-CUTLASS V staging/fragment-construction path, because both failed store-local attempts point at the smem layout contract rather than address arithmetic.
