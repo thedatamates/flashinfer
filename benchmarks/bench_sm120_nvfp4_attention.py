@@ -15,10 +15,14 @@ from flashinfer.jit import gen_fmha_nvfp4_sm120_module
 BENCHMARK_KEY = "sm120_nvfp4_attention"
 
 
-def default_output_group_span(head_dim: int) -> int:
+def default_output_group_span(
+    head_dim: int, *, api: str = "paged-wrapper", sliding_window: int = -1
+) -> int:
     if head_dim == 128:
         return 1
     if head_dim == 256:
+        if api == "paged-wrapper" and sliding_window > 0:
+            return 1
         return 2
     if head_dim == 512:
         return 4
@@ -203,7 +207,9 @@ def main() -> None:
         raise ValueError("--q-len * --group must be positive")
 
     output_group_span = (
-        default_output_group_span(args.head_dim)
+        default_output_group_span(
+            args.head_dim, api=args.mode, sliding_window=args.sliding_window
+        )
         if args.output_group_span == 0
         else args.output_group_span
     )

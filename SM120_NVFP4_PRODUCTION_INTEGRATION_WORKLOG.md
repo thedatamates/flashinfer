@@ -4639,3 +4639,26 @@ D256 output-span overrideability result:
 - Added `FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN` to `csrc/fmha_nvfp4_sm120_d256_paged.cu`; default remains span 2.
 - Test status with default span 2: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 90.85s`).
 - Next: benchmark span 1 as a real compile-time variant with isolated JIT roots.
+
+D256 output-span diagnostic result:
+- D256 paged-PV span 1, isolated JIT roots:
+  - Qwen q=512 kv=65536 g=6 no-SWA split `3072`: span 1 mean `4.124 ms` versus span 2 `~2.56 ms`.
+  - Qwen q=128 kv=32768 g=6 no-SWA split `1024`: span 1 mean `0.782 ms` versus span 2 `~0.638 ms`.
+  - Gemma sliding q=512 kv=1024 g=2 SWA=1024 softcap=30 split `1024`: span 1 mean `0.187 ms` versus span 2 `~0.238 ms`.
+- Decision: span 1 is wrong for D256 no-SWA but right for D256 sliding-window fixed-floor cells. Since sliding and no-SWA are already separate JIT specs, make the D256 paged default span conditional: no-SWA stays span 2, sliding-window uses span 1. This is not a new spec axis; it follows an existing spec axis.
+
+D256 sliding output-span change plan:
+- Change `csrc/fmha_nvfp4_sm120_d256_paged.cu` so the default `FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN` is `1` when `SM120_NVFP4_USE_SLIDING_WINDOW_PREPROC` is true and `2` otherwise.
+- Update the paged wrapper default selection so D256 sliding plans pass output span 1. Keep dense benchmark defaults at span 2 because D256 dense is still compiled with span 2.
+- Update the benchmark/grid default span logic for `fused-api=paged` D256 sliding so reports use the production wrapper default.
+- Decision criterion: keep the change if the focused NVFP4 test passes and Gemma sliding focused bench improves without changing Qwen no-SWA results.
+
+D256 sliding output-span change result:
+- Implemented the conditional D256 paged default: sliding-window specs compile with `FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN=1`; no-SWA specs remain span 2.
+- Wrapper and benchmark defaults now mirror the generated module: D256 paged sliding defaults to span 1, while D256 dense and D256 paged no-SWA default to span 2.
+- Test status: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 88.65s`).
+- Bench guards:
+  - D256 Gemma sliding q=512 kv=1024 g=2 paged-PV split `1024`: `0.186 ms`, `output_group_span=1`.
+  - D256 Qwen no-SWA q=512 kv=65536 g=6 paged-PV split `3072`: `2.550 ms`, `output_group_span=2`.
+  - D256 dense sliding q=512 kv=1024 g=2: `0.103 ms`, `output_group_span=2`.
+- Decision: keep the conditional default. It captures the Gemma sliding fixed-floor win while preserving the no-SWA Qwen path and the dense benchmark ABI.

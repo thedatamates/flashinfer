@@ -61,10 +61,14 @@ def parse_cells(value: str) -> tuple[tuple[int, int], ...]:
     return tuple(cells)
 
 
-def default_output_group_span(head_dim: int) -> int:
+def default_output_group_span(
+    head_dim: int, *, api: str = "paged", sliding_window: int = -1
+) -> int:
     if head_dim == 128:
         return 1
     if head_dim == 256:
+        if api == "paged" and sliding_window > 0:
+            return 1
         return 2
     if head_dim == 512:
         return 4
@@ -73,7 +77,11 @@ def default_output_group_span(head_dim: int) -> int:
 
 def fused_output_group_span(args: argparse.Namespace) -> int:
     if args.fused_output_group_span == 0:
-        return default_output_group_span(args.head_dim)
+        return default_output_group_span(
+            args.head_dim,
+            api=args.fused_api,
+            sliding_window=args.sliding_window,
+        )
     if args.fused_output_group_span not in (1, 2, 4):
         raise ValueError("--fused-output-group-span must be 0, 1, 2, or 4")
     return int(args.fused_output_group_span)

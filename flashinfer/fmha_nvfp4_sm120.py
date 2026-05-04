@@ -41,10 +41,14 @@ def _paged_tile_m_for_config(head_dim: int, use_sliding_window: bool) -> int:
     return _tile_m_for_head_dim(head_dim)
 
 
-def _default_output_group_span(head_dim: int) -> int:
+def _default_output_group_span(
+    head_dim: int, use_sliding_window: bool = False
+) -> int:
     if head_dim == 128:
         return 1
     if head_dim == 256:
+        if use_sliding_window:
+            return 1
         return 2
     if head_dim == 512:
         return 4
@@ -202,7 +206,9 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
                 "window_left must be -1 to disable SWA or a positive window size."
             )
         if output_group_span is None:
-            output_group_span = _default_output_group_span(head_dim)
+            output_group_span = _default_output_group_span(
+                head_dim, window_left > 0
+            )
         if output_group_span not in (1, 2, 4):
             raise ValueError("output_group_span must be 1, 2, or 4.")
         if head_dim == 128 and output_group_span != 1:

@@ -15,7 +15,11 @@
 #endif
 #endif
 #ifndef FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN
+#if SM120_NVFP4_USE_SLIDING_WINDOW_PREPROC
+#define FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN 1
+#else
 #define FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN 2
+#endif
 #endif
 
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh>
