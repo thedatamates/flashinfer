@@ -80,6 +80,39 @@ __device__ __forceinline__ float sm120_nvfp4_paged_q_bf16_value(
   return __bfloat162float(params.q_bf16[src]);
 }
 
+__device__ __forceinline__ int64_t sm120_nvfp4_paged_q_bf16_row_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int q_begin,
+    int local_row,
+    int group_size,
+    int num_kv_heads,
+    bool all_kv_heads) {
+  const int token_offset = local_row / group_size;
+  const int group_offset = local_row - token_offset * group_size;
+  if (params.q_is_3d) {
+    const int head =
+        (all_kv_heads ? params.kv_head * group_size : 0) + group_offset;
+    const int token = q_begin + token_offset;
+    return static_cast<int64_t>(token) * params.q_stride_token +
+           static_cast<int64_t>(head) * params.q_stride_head;
+  }
+  const int row =
+      all_kv_heads
+          ? (q_begin + token_offset) * (num_kv_heads * group_size) +
+                params.kv_head * group_size + group_offset
+          : q_begin * group_size + local_row;
+  return static_cast<int64_t>(row) * params.q_stride_row;
+}
+
+__device__ __forceinline__ float sm120_nvfp4_paged_q_bf16_value_from_row_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int64_t row_base,
+    int dim) {
+  const int64_t src =
+      row_base + static_cast<int64_t>(dim) * params.q_stride_dim;
+  return __bfloat162float(params.q_bf16[src]);
+}
+
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_k_code(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int logical_token,

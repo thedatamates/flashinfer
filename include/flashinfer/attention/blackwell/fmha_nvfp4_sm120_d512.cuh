@@ -1101,27 +1101,34 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 
   auto stage_bf16_q_tile = [&](int k_outer, int write_stage) {
     if constexpr (kUsePagedKv) {
-      auto q_value = [&](int row, int dim) {
+      auto q_row_base = [&](int row) {
         const int local_row = local_q_tile * kCutlassTileM + row;
         if (local_row >= q_len * group_size) {
+          return int64_t{-1};
+        }
+        return sm120_nvfp4_paged_q_bf16_row_base(
+            paged_kv_params, effective_q_begin, local_row, group_size,
+            num_kv_heads, all_kv_heads);
+      };
+      auto q_value_from_row = [&](int64_t row_base, int dim) {
+        if (row_base < 0) {
           return 0.0f;
         }
-        return sm120_nvfp4_paged_q_bf16_value(
-            paged_kv_params, effective_q_begin, local_row, group_size,
-            num_kv_heads, all_kv_heads, dim);
+        return sm120_nvfp4_paged_q_bf16_value_from_row_base(
+            paged_kv_params, row_base, dim);
       };
-      auto q_scale_byte = [&](int row, int scale_col) {
+      auto q_scale_byte = [&](int64_t row_base, int scale_col) {
         float max_abs = 0.0f;
 #pragma unroll
         for (int i = 0; i < 16; ++i) {
           const int dim = scale_col * 16 + i;
-          max_abs = fmaxf(max_abs, fabsf(q_value(row, dim)));
+          max_abs = fmaxf(max_abs, fabsf(q_value_from_row(row_base, dim)));
         }
         return fp32_to_e4m3_byte(fmaxf(max_abs / 6.0f, 1.0e-8f));
       };
-      auto q_code = [&](int row, int dim, uint8_t scale_byte) {
+      auto q_code = [&](int64_t row_base, int dim, uint8_t scale_byte) {
         const float scale = fmaxf(e4m3_byte_to_fp32(scale_byte), 1.0e-8f);
-        return fp32_to_e2m1_code_hw(q_value(row, dim) / scale);
+        return fp32_to_e2m1_code_hw(q_value_from_row(row_base, dim) / scale);
       };
 
       auto smem_tiled_copy_A = cute::make_tiled_copy_A(
@@ -1152,9 +1159,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
             // Q producer writes each packed word through a 4-byte smem store.
-            if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
+            if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u ||
+                ((k0 & 7) != 0)) {
               asm volatile("trap;\n");
             }
+            const int64_t row_base0 = q_row_base(row0);
+            const int dim0 = k_outer * kCutlassTileK + k0;
+            const uint8_t word_scale = q_scale_byte(row_base0, dim0 >> 4);
             uint32_t packed_word = 0;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -1171,8 +1182,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 asm volatile("trap;\n");
               }
               const int dim = k_outer * kCutlassTileK + k;
-              const uint8_t scale = q_scale_byte(row, dim >> 4);
-              const uint8_t code = q_code(row, dim, scale);
+              const uint8_t code = q_code(row_base0, dim, word_scale);
               const int byte_offset = int(dst_byte - dst0);
               const int nibble_shift = (k & 1) ? 4 : 0;
               packed_word |= static_cast<uint32_t>(code)
@@ -1183,14 +1193,17 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         });
       }
 
-      for (int idx = lane_idx; idx < kCutlassTileM * kCutlassTileK / 2;
+      for (int idx = lane_idx; idx < kCutlassTileM * kCutlassTileK / 16;
            idx += cutlass::NumThreadsPerWarp) {
-        const int row = idx / (kCutlassTileK / 2);
-        const int packed_k = idx - row * (kCutlassTileK / 2);
-        const int k0 = 2 * packed_k;
+        const int row = idx / (kCutlassTileK / 16);
+        const int local_scale_col = idx - row * (kCutlassTileK / 16);
+        const int k0 = local_scale_col * 16;
         const int scale_col = (k_outer * kCutlassTileK + k0) >> 4;
-        qk_sSFA(row, k0, write_stage) =
-            make_ue4m3_raw(q_scale_byte(row, scale_col));
+        const uint8_t scale = q_scale_byte(q_row_base(row), scale_col);
+#pragma unroll
+        for (int k_offset = 0; k_offset < 16; k_offset += 2) {
+          qk_sSFA(row, k0 + k_offset, write_stage) = make_ue4m3_raw(scale);
+        }
       }
     }
   };

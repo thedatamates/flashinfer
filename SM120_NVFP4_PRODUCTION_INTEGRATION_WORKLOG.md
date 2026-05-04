@@ -2233,3 +2233,74 @@ Characterization:
   `8.9%` gain on paged-PV and `4.1%` gain on paged-linear at the reference cell.
 - Paged-linear is still `2.20x` paged-PV and `234.9x` dense at this cell, so
   the dominant cost remains V data/reblock, not scale loops.
+
+## 2026-05-03 19:25 CDT - P3 Q-Quantize Hoist Plan
+
+What I am changing:
+
+- Rewrite `stage_bf16_q_tile` in `fmha_nvfp4_sm120_d{128,256,512}.cuh`.
+- Current data path computes `q_scale_byte(row, dim >> 4)` for every FP4
+  codepoint in an 8-code packed word, even though the word is 8 contiguous dims
+  inside one 16-dim NVFP4 scale group.
+- Current SFA path also computes the same 16-dim scale once per packed FP4 pair
+  and stores duplicate scale values across the group.
+- New shape: hoist Q row addressing once per packed word or scale group, compute
+  one scale byte per 16-dim group, reuse it for the eight codepoints in each
+  packed word, and write the SFA scale group with one scale computation followed
+  by repeated stores.
+- Done criteria: D512/full NVFP4 tests pass and the D512 reference cell is
+  remeasured. This is expected to be smaller than P2 because Q volume is dense
+  `q_len * head_dim` while the remaining bottleneck walks paged V over
+  `kv_len * head_dim`, but the redundant Q scalar walk is still removable.
+
+Reference code:
+
+```cpp
+// include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:1174
+const uint8_t scale = q_scale_byte(row, dim >> 4);
+const uint8_t code = q_code(row, dim, scale);
+```
+
+```cpp
+// include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:1193
+qk_sSFA(row, k0, write_stage) =
+    make_ue4m3_raw(q_scale_byte(row, scale_col));
+```
+
+## 2026-05-03 19:25 CDT - P3 Q-Quantize Hoist Result
+
+Implementation:
+
+- Added Q row-base helpers in `fmha_nvfp4_sm120_paged_kv.cuh` so the BF16-Q
+  producer can hoist token/head/row address math out of per-codepoint reads.
+- Rewrote D128/D256/D512 `stage_bf16_q_tile` data loops to compute one Q scale
+  byte per 8-code packed word and reuse it for all codepoints in that word.
+- Rewrote the D128/D256/D512 SFA loops to compute one Q scale byte per 16-dim
+  scale group and store that value across the eight FP4-pair scale positions.
+- Added the same 8-code alignment trap already used by the K/V packed-word
+  producers to the Q packed-word producer.
+
+Correctness:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py -q`: 36 passed.
+- `tests/attention/test_nvfp4_kv_head_dim_512.py tests/utils/test_fp4_kv_quantization.py -q`:
+  62 passed.
+- No tolerance changes.
+
+Reference cell:
+
+`D=512, group=8, q=512, kv=65536, softcap=30, split_kv_len=32768,
+output_group_span=4, device=2`
+
+| state | dense min ms | paged-PV min ms | paged-linear min ms |
+| --- | ---: | ---: | ---: |
+| P2 K-scale hoist | 7.688 | 819.818 | 1805.615 |
+| P3 Q-quantize hoist | 7.682 | 816.084 | 1741.079 |
+
+Characterization:
+
+- P3 recovered `3.6%` on paged-linear and `0.5%` on paged-PV at the reference
+  cell. This is a real cleanup of redundant scalar Q work, but not a structural
+  answer to the 100x-plus paged gap.
+- Remaining cost is still V-data/reblock dominated. Paged-linear remains
+  `2.13x` paged-PV and `226.7x` dense at this cell.
