@@ -4209,3 +4209,93 @@ PV V-scale store reduction result:
   - D256 paged-linear `3.658 ms` (previous `3.659 ms`).
   - D512 paged-linear `8.169 ms` (previous `8.149 ms`).
 - Test status: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed, `36 passed in 199.68s`.
+
+## 2026-05-04 09:35 CDT - Load-Group Barrier Diagnostic Plan
+
+What I am about to do:
+- The D256 paged path now has no single 200x-class producer bug; the remaining cost is split between K, V, and common stage scheduling.
+- The paged Q/K/V producers each run `load_group_sync()` before staging, after staging, and again after the load leader completes the transaction barrier. The first sync broadcasts the acquired stage index; the second ensures all producer writes are visible before completion. The third looks redundant because the next chunk's first sync re-converges the load group before any non-leader can use the next stage.
+- I will remove only that trailing post-complete load-group sync in D256 as a timing diagnostic, benchmark q=512 kv=65536 g=6 PV/linear, and run the focused suite if the timing improves. If it is correct and useful, I will apply the same cleanup to D128/D512.
+
+Load-group barrier diagnostic result:
+- D256 q=512 kv=65536 g=6 paged-PV with the trailing post-complete load-group sync removed: `2.947 ms` versus `2.958 ms` baseline.
+- D256 paged-linear with the same diagnostic: `3.660 ms` versus `3.658 ms` baseline.
+- The change is effectively neutral. I reverted it rather than carrying a subtle synchronization delta for a ~0.01 ms PV-only gain.
+
+## 2026-05-04 09:50 CDT - D256 Paged Tile Shape Recheck Plan
+
+What I found:
+- Current D256 q=512 kv=65536 g=6 dense is `1.328 ms`, while paged-PV is `2.958 ms`.
+- The dense TU includes `d256.cuh` with the default `kCutlassTileM=64` and `LOAD_WARPS=7`.
+- The paged no-SWA TU defines `FLASHINFER_SM120_NVFP4_D256_TILE_M=128` and `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=10` before including `d256.cuh`.
+
+What I am about to do:
+- Re-test the D256 paged no-SWA tile shape after direct-index K, because the earlier tileM=64 diagnostic was from a materially slower producer state.
+- I will temporarily remove the paged-only `TILE_M=128` override, benchmark D256 q=512 kv=65536 g=6 paged-PV/linear, then either keep it if it closes the dense gap or revert it if it remains worse.
+
+D256 paged tile shape recheck result:
+- D256 q=512 kv=65536 g=6 paged-PV with paged no-SWA `TILE_M=64` and `LOAD_WARPS=10`: `3.433 ms`.
+- Current paged no-SWA `TILE_M=128` and `LOAD_WARPS=10`: `2.958 ms`.
+- The previous conclusion still holds after direct-index K: paged D256 should keep tileM=128. I reverted the diagnostic.
+
+D256 spec-axis cross-check:
+- D256 q=512 kv=65536 g=6 no-softcap paged-PV: `2.656 ms`.
+- D256 same cell no-softcap dense: `1.223 ms`.
+- D256 same cell softcap=30 paged-PV: `2.958 ms`; dense: `1.328 ms`.
+- The paged/dense ratio is about `2.17x` no-softcap and `2.23x` softcap, so the remaining D256 gap is generic paged-stage overhead rather than the softcap branch.
+
+## 2026-05-04 10:05 CDT - D256 Post-Stage Combine Diagnostic Plan
+
+What I found:
+- `RunPagedBatchImpl` launches `kernel.run(...)`, then always launches either `CopyPaddedBatchOutKernel` for one split or `Sm120Nvfp4SplitKvCombineBatchKernel` for multiple splits.
+- The D256 reference uses paged split length `3072` tokens (`24` tiles, `22` splits at kv=65536), while the dense reference uses `6144` tokens (`11` splits). Even if split scheduling is optimal for stage time, combine cost may still be a material part of the paged/dense ratio.
+
+What I am about to do:
+- Temporarily return from `RunPagedBatchImpl` immediately after the paged stage kernel succeeds, before launching combine/copy.
+- Benchmark D256 q=512 kv=65536 g=6 PV and linear to measure the stage-side cost without post-stage combine. Then revert the diagnostic.
+
+D256 post-stage combine diagnostic result:
+- D256 q=512 kv=65536 g=6 paged-PV with combine/copy skipped after the stage kernel: `2.947 ms` versus `2.958 ms` baseline.
+- D256 paged-linear with combine/copy skipped: `3.611 ms` versus `3.658 ms` baseline.
+- Post-stage combine/copy is not the residual paged/dense gap. The cost is inside the stage kernel and BF16-Q quantize path, not the wrapper combine kernel. I reverted the diagnostic.
+
+## 2026-05-04 10:20 CDT - D256 BF16-Q Quantize Diagnostic Plan
+
+What I found:
+- The production wrapper calls `paged_run_bf16_q`, which launches `QuantizeQToPaddedBatchKernel` before the paged stage.
+- The module also exports `paged_run`, which consumes prequantized Q and only performs a padded Q copy before the same paged stage.
+- For the D256 reference cell, q rows are already tile-aligned (`512 * 6 = 3072`, multiple of paged tileM 128), so the prequantized-Q path uses the same scratch extent without introducing ragged padding differences.
+
+What I am about to do:
+- Run a one-off Python diagnostic that builds the same wrapper/module state and times `paged_run_bf16_q` versus `paged_run` directly, without the Python wrapper's final `out.copy_`.
+- Decision criterion: if `paged_run` is materially faster, Q quantize is a real residual target; if not, the remaining gap is stage-kernel scheduling/producers.
+
+D256 BF16-Q quantize diagnostic result:
+- D256 q=512 kv=65536 g=6 paged-PV direct FFI `paged_run_bf16_q` without Python final copy: `2.948 ms`.
+- Same cell direct FFI `paged_run` with prequantized Q and no Python final copy: `2.925 ms`.
+- BF16-Q quantize plus padded-Q preparation saves only about `0.023 ms` when bypassed. It is not the D256 paged/dense residual. The remaining cost is inside the stage kernel.
+
+## 2026-05-04 10:35 CDT - D256 Split-Length Recheck Plan
+
+What I found:
+- D256 paged-PV remains about `2.97 ms` after the direct K and PV-scale-store reductions. Dense at the same cell is about `1.33 ms`.
+- The paged auto split is `3072` tokens, producing `22` split CTAs at kv=65536. Dense auto split is `6144`, producing `11` splits.
+- Earlier split sweeps were taken before the current producer state, so split length should be rechecked with the now-fast K/V path before assuming `3072` remains optimal.
+
+What I am about to do:
+- Run one Python diagnostic process that constructs the D256 q=512 kv=65536 g=6 PV cell once and replans the wrapper across split lengths.
+- Decision criterion: if a larger split closes the gap without hurting output finiteness, update the benchmark/wrapper split heuristic; otherwise leave split scheduling alone and continue stage-kernel work.
+
+D256 split-length recheck result:
+- D256 q=512 kv=65536 g=6 softcap=30 paged-PV split sweep:
+  - split 1536 (`43` splits): `3.092 ms`.
+  - split 2048 (`32` splits): `3.296 ms`.
+  - split 3072 (`22` splits): `2.952 ms`.
+  - split 4096 (`16` splits): `3.752 ms`.
+  - split 6144 (`11` splits): `3.759 ms`.
+  - split 8192 (`8` splits): `4.859 ms`.
+  - split 12288 (`6` splits): `3.828 ms`.
+  - split 16384 (`4` splits): `5.047 ms`.
+  - split 32768 (`2` splits): `9.942 ms`.
+  - split 65536 (`1` split): `20.014 ms`.
+- All outputs were finite. The current auto split `3072` remains the best tested split after direct-index K and PV-scale-store reduction. Split scheduling is not the remaining gap.
