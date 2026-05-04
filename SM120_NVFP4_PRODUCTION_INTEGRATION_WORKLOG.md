@@ -6688,6 +6688,54 @@ Validation:
 - Benchmark D256 Qwen `q=4096 kv=262144` and `q=16384 kv=262144`, paged-PV.
 - Run the focused NVFP4 correctness selection, then the full NVFP4 test file if timing is positive or neutral.
 
+## 2026-05-04 18:09 CDT - Per-KV-Tile Page-Cache Reuse Target
+
+Finding:
+
+- Fresh NCU after FastDivmod puts the page-cache barrier back at the top:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh:846`: `918,435` samples, `915,456` barrier samples.
+- The previous direct-page diagnostic removed the barrier but regressed because it reloaded block-table entries at every use site.
+- The current D256 load schedule redundantly fills the same `physical_page_cache` for the same `kv_tile`:
+  - K chunk 0 calls `stage_paged_k_tile()` and fills the cache.
+  - K chunk 1 calls `stage_paged_k_tile()` for the same `kv_tile` and fills it again.
+  - Each V output group calls `stage_paged_v_tile()` for the same `kv_tile` and fills it again.
+- For Qwen D256 with `qk_head_chunks=2` and `output_group_span=2`, that can be four page-cache barriers per KV tile even though the cache contents are identical.
+
+Implementation target:
+
+- D256 first.
+- Move page-cache ownership from the low-level K/V stage functions to the load-thread schedule.
+- Track the last cached `kv_tile` in a load-thread local variable.
+- Call `cache_paged_physical_pages(kv_tile)` only when the requested tile differs from the cached tile.
+- Keep the shared page cache itself; do not revert to direct block-table reloads.
+
+Validation:
+
+- Benchmark D256 Qwen `q=4096 kv=262144` and `q=16384 kv=262144`, paged-PV.
+- Run the focused correctness selection if timing improves.
+- If D256 is positive and correct, port the same schedule-level cache reuse to D128/D512.
+
+## 2026-05-04 18:11 CDT - Per-KV-Tile Page-Cache Reuse Result
+
+Implementation:
+
+- Tested a D256-only diagnostic that tracked the last cached `kv_tile` in load-thread local state.
+- Moved page-cache fill calls from the low-level K/V stage functions into the load schedule and skipped duplicate fills for the same tile.
+- Kept the shared page cache; did not use direct block-table reloads.
+
+Measured result:
+
+| cell | FastDivmod baseline paged-PV ms | page-cache reuse paged-PV ms | result |
+|:---|---:|---:|:---|
+| D256 Qwen `q=4096 kv=262144 g=6` | `52.510` | `52.794` | neutral/slower |
+| D256 Qwen `q=16384 kv=262144 g=6` | `204.991` | `204.534` | neutral |
+
+Decision:
+
+- Reverted the diagnostic. The timing delta is within noise and does not justify extra load-schedule state.
+- The page-cache barrier remains visible in NCU, but simply skipping duplicate fills at the schedule level does not produce a material wall-time gain.
+- Do not port this variant to D128/D512.
+
 ## 2026-05-04 18:06 CDT - Score-Mask FastDivmod Result
 
 Implementation:
