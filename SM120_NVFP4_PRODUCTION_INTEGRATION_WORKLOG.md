@@ -4592,3 +4592,11 @@ Workspace clear-size overrideability result:
 - Added `FLASHINFER_SM120_NVFP4_WORKSPACE_CLEAR_BYTES` to D128/D256/D512 raw launchers. The default remains `(32 * 1024 * 1024)` bytes.
 - Test status with default settings: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 297.69s`).
 - Next: run isolated JIT diagnostics with smaller clear caps on D256 q=1, D256 Gemma sliding, and D256 Qwen long-prefill.
+
+Workspace clear-size diagnostic result:
+- Cells: D256 q=1 kv=262144 g=6 paged-PV split `2048`; D256 Gemma sliding q=512 kv=1024 g=2 paged-PV split `1024`; D256 Qwen prefill q=512 kv=65536 g=6 paged-PV split `3072`.
+- Default 32 MiB cap: decode `0.604 ms`, Gemma sliding `0.240 ms`, Qwen prefill `2.553 ms`.
+- Cap 0, which still clears at least the CUTLASS required workspace prefix: decode `0.585 ms`, Gemma sliding `0.237 ms`, Qwen prefill `2.540 ms`.
+- Cap 1 MiB: decode `0.584 ms`, Gemma sliding `0.238 ms`, Qwen prefill `2.550 ms`.
+- One attempted cap-1MiB run failed before kernel build because the macro value was passed with shell parentheses; reran with numeric `1048576`, so the numbers above are valid.
+- Decision: do not reduce the production default from this data. The clear cap contributes only a small fixed cost and is not the structural gap. Keeping the override macro is useful for future diagnostics; the safe default remains 32 MiB.
