@@ -4344,3 +4344,19 @@ Production grid smoke:
 - Report prefix: `reports/prod_smoke_d256_g6_linear_20260504`.
 - Rows completed successfully. The FA2 baselines are no longer the earlier bogus flat `~0.025 ms` readings: at q=512 kv=4096, nvfp4_fa2 min `0.130848 ms`, bf16_fa2 min `0.090112 ms`, sm120_fused paged-linear min `1.020896 ms`.
 - Explicit-cell report plumbing is general (`--cells`), not a focused-only mode; the same writer emits summaries from the rows present.
+
+Qwen full D256 g=6 stock-vLLM linear-V focused report:
+- Report prefix: `reports/prod_qwen_full_d256_g6_linear_20260504`.
+- Ran 14 production cells with kernels `sm120_fused,nvfp4_fa2,bf16_fa2`; all sm120 rows were finite and all rows completed.
+- Geomean sm120 paged-linear speedup versus nvfp4_fa2: `0.220x`; versus bf16_fa2: `0.160x`.
+- Best sm120/nvfp4 cell in this report was still slightly slower (`0.963x` speedup). Worst was decode q=1 kv=262144: sm120 `3.439 ms` versus nvfp4_fa2 `0.0856 ms` (`40.2x` slower).
+- The focused report confirms the current kernel is prefill-shaped and not viable for decode cells. The next measurement is the same Qwen cell set with paged-PV to separate linear-V reblock cost from the generic paged stage cost.
+
+Qwen full D256 g=6 patched-vLLM PV focused report:
+- Report prefix: `reports/prod_qwen_full_d256_g6_pv_20260504`.
+- Ran the same 14 production cells with kernels `sm120_fused,nvfp4_fa2,bf16_fa2`; all sm120 rows were finite and all rows completed.
+- Geomean sm120 paged-PV speedup versus nvfp4_fa2: `0.321x`; versus bf16_fa2: `0.233x`.
+- Paged-PV is close to nvfp4_fa2 on the large-prefill cells and wins one long-context cell: q=2048 kv=65536 was sm120 `9.646 ms` versus nvfp4_fa2 `9.442 ms` (`0.979x`), and q=2048 kv=262144 was sm120 `36.441 ms` versus nvfp4_fa2 `37.670 ms` (`1.034x`).
+- Decode remains structurally bad even without linear-V reblock: q=1 kv=4096 was sm120 `0.287 ms` versus nvfp4_fa2 `0.0272 ms` (`10.6x` slower), q=1 kv=262144 was sm120 `0.710 ms` versus nvfp4_fa2 `0.0851 ms` (`8.34x` slower). This is generic prefill-shaped paged-stage overhead, not the linear reblock path.
+- Paired linear/PV comparison across the 14 cells: linear is `1.46x` slower geomean than PV. The largest extra linear tax is decode long context: q=1 kv=262144 linear `3.439 ms` versus PV `0.710 ms` (`4.85x`), q=1 kv=65536 linear `1.012 ms` versus PV `0.320 ms` (`3.16x`). For q=512 long-context prefill, linear/PV is about `1.28x`; this is the in-kernel reblock cost on top of the paged stage.
+- Decision: keep measuring the production specs before further code changes. Current Qwen result says there are two separate issues: (1) linear-V reblock tax for stock-vLLM, and (2) a decode-shape mismatch where this prefill kernel is not competitive even on PV.
