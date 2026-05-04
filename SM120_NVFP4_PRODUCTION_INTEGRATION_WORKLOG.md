@@ -3434,3 +3434,49 @@ Conclusion:
 - D256 is still not dense-like: paged-PV remains about `8.9x` dense at this
   cell. The next bottleneck is likely split/combine and per-tile fixed work,
   not the catastrophic scalar producer serialization.
+
+## 2026-05-04 00:39 CDT - Residual Gap Localization
+
+Checks:
+- Prepacked-Q paged path vs BF16-Q paged path:
+  - D256 PV `q=512 kv=65536 g=6`: prepacked-Q `14.034 ms`, BF16-Q
+    `14.133 ms`, standalone Q quantize `0.007 ms`.
+  - D512 PV `q=512 kv=65536 g=8 softcap=30`: prepacked-Q `15.181 ms`,
+    BF16-Q `15.281 ms`, standalone Q quantize `0.007 ms`.
+- Single-split check with `split_kv_len=65536`:
+  - D256 PV paged `37.866 ms`, dense `4.168 ms`.
+  - D512 PV paged `56.004 ms`, dense `20.393 ms`.
+
+Conclusions:
+- The residual paged-vs-dense gap is not caused by the BF16-Q production path;
+  Q quantization/padding overhead is around `0.1 ms` in the wrapper call.
+- The residual gap is not solved by removing split-KV combine. Single split
+  reduces parallelism and makes both dense and paged slower.
+- D256 eight-load-warp retry with the fixed handoff still failed the same
+  multi-KV and standard-wrapper tolerances:
+  greatest diffs `0.00177` vs `1e-3` and `0.002106` vs `2e-3`. Reverted to
+  the validated four-load-warp setting.
+
+## 2026-05-04 00:49 CDT - Production-Gate Hot Producer Traps
+
+What changed:
+- Replaced raw `asm volatile("trap;")` hot-loop invariants in D128/D256/D512
+  with `SM120_NVFP4_DEBUG_TRAP()`.
+- `SM120_NVFP4_DEBUG_TRAP()` is defined in
+  `fmha_nvfp4_sm120_paged_kv.cuh` and defaults off. Developers can re-enable
+  it with `-DFLASHINFER_SM120_NVFP4_DEBUG_TRAPS=1` for layout validation.
+
+Validation:
+- Full `tests/attention/test_nvfp4_kv_head_dim_512.py -q`:
+  `36 passed in 319.68s`.
+
+Reference cells with production split:
+- D256 PV `q=512 kv=65536 g=6`: `14.139 ms` -> `8.831 ms`.
+- D512 PV `q=512 kv=65536 g=8 softcap=30`: `15.288 ms` -> `11.682 ms`.
+- D512 linear same cell: `48.315 ms` -> `47.738 ms`.
+
+Conclusion:
+- The invariant branches/traps were part of the residual PV runtime cost.
+  Gating them is both upstream-style cleanup and a real performance fix.
+- Linear-V remains dominated by the reblock path; trap gating does not change
+  that bottleneck materially.

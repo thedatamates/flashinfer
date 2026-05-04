@@ -852,7 +852,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
           // K producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
-            asm volatile("trap;\n");
+            SM120_NVFP4_DEBUG_TRAP();
           }
           for (int i = 0; i < int(cute::size(dst)); i += 8) {
             auto coord0 = coord_tensor(i);
@@ -863,7 +863,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             // K producer requires 4-byte-aligned contiguous dim stride.
             if (((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) ||
                 ((k0 & 7) != 0) || paged_kv_params.k_stride_dim3 != 1) {
-              asm volatile("trap;\n");
+              SM120_NVFP4_DEBUG_TRAP();
             }
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -875,7 +875,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
               // CUTLASS B smem must colocate the 8 logical K nibbles in 4 bytes.
               if (row != row0 || k != k0 + j ||
                   dst_byte != dst0 + (j >> 1)) {
-                asm volatile("trap;\n");
+                SM120_NVFP4_DEBUG_TRAP();
               }
             }
             const int token = kv_tile * kCutlassTileN + row0;
@@ -1017,7 +1017,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 
       if constexpr (kPvLayoutV) {
         if (paged_kv_params.v_stride_dim3 != 1) {
-          asm volatile("trap;\n");
+          SM120_NVFP4_DEBUG_TRAP();
         }
         constexpr int kTransposeTokens = 8;
         constexpr int kTransposeDims = 8;
@@ -1070,7 +1070,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           auto ref0 = pv_sB(local_col, local_k0, write_stage);
           uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
           if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
-            asm volatile("trap;\n");
+            SM120_NVFP4_DEBUG_TRAP();
           }
 #pragma unroll
           for (int j = 0; j < 8; ++j) {
@@ -1081,7 +1081,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
             if (dst_byte < dst0 || dst_byte >= dst0 + 4 ||
                 pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
-              asm volatile("trap;\n");
+              SM120_NVFP4_DEBUG_TRAP();
             }
           }
           *reinterpret_cast<uint32_t*>(dst0) = packed_word;
@@ -1089,7 +1089,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       } else {
         if (paged_kv_params.v_stride_dim3 != 1 ||
             paged_kv_params.v_scale_stride_dim3 != 1) {
-          asm volatile("trap;\n");
+          SM120_NVFP4_DEBUG_TRAP();
         }
         constexpr int kTransposeTokens = 8;
         constexpr int kTransposeDims = 8;
@@ -1147,7 +1147,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           auto ref0 = pv_sB(local_col, local_k0, write_stage);
           uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
           if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
-            asm volatile("trap;\n");
+            SM120_NVFP4_DEBUG_TRAP();
           }
 #pragma unroll
           for (int j = 0; j < 8; ++j) {
@@ -1158,7 +1158,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
             if (dst_byte < dst0 || dst_byte >= dst0 + 4 ||
                 pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
-              asm volatile("trap;\n");
+              SM120_NVFP4_DEBUG_TRAP();
             }
           }
           *reinterpret_cast<uint32_t*>(dst0) = packed_word;
@@ -1245,7 +1245,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           auto coord_tensor = tAcA_prod(_, _, k_block, cute::Int<0>{});
           // Q producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
-            asm volatile("trap;\n");
+            SM120_NVFP4_DEBUG_TRAP();
           }
           for (int i = 0; i < int(cute::size(dst)); i += 8) {
             auto coord0 = coord_tensor(i);
@@ -1256,7 +1256,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             // Q producer writes each packed word through a 4-byte smem store.
             if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u ||
                 ((k0 & 7) != 0)) {
-              asm volatile("trap;\n");
+              SM120_NVFP4_DEBUG_TRAP();
             }
             const int64_t row_base0 = q_row_base(row0);
             const int dim0 = k_outer * kCutlassTileK + k0;
@@ -1274,7 +1274,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
               // Q smem layout must colocate each FP4 pair inside the word.
               if (row != row0 || k != k0 + j || dst_byte < dst0 ||
                   dst_byte >= dst0 + 4 || pair_byte != dst_byte) {
-                asm volatile("trap;\n");
+                SM120_NVFP4_DEBUG_TRAP();
               }
               const int dim = k_outer * kCutlassTileK + k;
               const uint8_t code = q_code(row_base0, dim, word_scale);
@@ -1998,7 +1998,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           *reinterpret_cast<uint32_t*>(dst0) = packed_lo;
           *reinterpret_cast<uint32_t*>(dst0 + 4) = packed_hi;
         } else {
-          asm volatile("trap;\n");
+          SM120_NVFP4_DEBUG_TRAP();
         }
       }
       float tile_l_scaled = tile_l_scaled_local;

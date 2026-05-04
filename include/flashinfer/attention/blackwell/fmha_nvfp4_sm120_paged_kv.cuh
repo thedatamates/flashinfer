@@ -8,6 +8,16 @@
 
 #include <cstdint>
 
+#ifndef FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
+#define FLASHINFER_SM120_NVFP4_DEBUG_TRAPS 0
+#endif
+
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
+#define SM120_NVFP4_DEBUG_TRAP() asm volatile("trap;\n")
+#else
+#define SM120_NVFP4_DEBUG_TRAP() ((void)0)
+#endif
+
 namespace flashinfer::attention::blackwell::sm120_nvfp4 {
 
 struct Sm120Nvfp4PagedKvLoadParams {
