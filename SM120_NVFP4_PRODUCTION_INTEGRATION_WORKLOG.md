@@ -4893,3 +4893,78 @@ Next profiling target:
 
 - Any store-side fix now needs a real transpose of ownership before the store, or a small staging layout that makes the final store lane-contiguous in the CUTLASS operand.
 - The next experiment should be scoped to D256 first and should be measured against both correctness and NCU shared-wavefront counters before propagation.
+
+## 2026-05-04 12:30 CDT - Full-KV-Tile Bounds-Hoist Target
+
+Finding:
+
+- The post-coalescing full NCU pass for D256 Qwen paged-PV reports `2.33 ms` stage time versus `1.25 ms` dense.
+- Paged still executes `1.044B` instructions and reports `Stall Barrier 5.71`, while dense is around `0.576B` instructions and `Stall Barrier 0.27`.
+- The reference cell has full 128-token KV tiles for the measured split geometry, but the paged producer still carries per-token `token < kv_len_tokens` checks in the V data loop.
+- The top barrier samples are reconvergence (`BSSY/BSYNC`) rather than named barriers, so uniformizing/eliminating inner-loop runtime branches is the next profiler-backed low-risk target.
+
+Implementation target:
+
+- Start with D256 PV-layout V only.
+- Compute a uniform `full_kv_tile` predicate once per staged KV tile.
+- Use a full-tile fast path in the PV V data producer that omits the per-token OOB branch inside the unrolled 8-token loop.
+- Keep the tail-tile path unchanged for partial tiles.
+
+Validation:
+
+- Run the D256 PV wrapper correctness target first.
+- Benchmark D256 Qwen paged-PV `q=512 kv=65536 g=6 split=3072`.
+- If timing moves materially, re-run NCU and check whether reconvergence/barrier samples or instruction count drop before propagating to D128/D512.
+
+Decision criteria:
+
+- Keep and propagate only if correctness passes and either timing or NCU reconvergence/instruction counters improve.
+- Revert if the branch hoist only reshuffles compiler codegen without reducing measured stage time.
+
+## 2026-05-04 12:32 CDT - Store-Side Register Transpose Target
+
+Finding:
+
+- The full-KV-tile bounds hoist is a low-yield cleanup relative to the measured gap. It may still be valid later, but it should not be the next priority.
+- The current NCU target is larger and structural: post-coalescing PV V has `35,489,280` excessive shared wavefronts, with the top eight PCs corresponding to the unrolled `packed_words[dim_offset]` stores.
+- The lane-local vector-store route is blocked because the PV B smem layout does not make one lane's eight output words physically contiguous.
+- The current ownership is load-coalesced but store-strided. A register transpose can change ownership before the store: source lane owns `packed_words[0..7]` for columns `lane * 8 + offset`; destination lane `offset` can fetch `packed_words[offset]` from each source lane and store columns `source_lane * 8 + offset`, making each store issue lane-contiguous.
+
+Implementation target:
+
+- Start with D256 PV-layout V only.
+- Keep the coalesced global-load loop unchanged.
+- Add an 8-lane register transpose after `packed_words[]` is produced.
+- Store the transposed words so, for each unrolled store iteration, subgroup lanes write contiguous columns in the CUTLASS PV B operand layout.
+
+Validation:
+
+- Run D256 PV wrapper correctness first.
+- Benchmark D256 Qwen paged-PV `q=512 kv=65536 g=6 split=3072`.
+- If timing improves, run NCU SourceCounters and WarpStateStats and compare shared-wavefront excess, long-scoreboard stalls, and executed instructions against the coalesced-load baseline.
+
+Decision criteria:
+
+- Keep and propagate only if correctness passes and the D256 reference cell improves materially.
+- If the extra `SHFL` cost cancels the shared-store win, revert the D256 code and keep the profiler result as evidence.
+
+## 2026-05-04 12:36 CDT - Store-Side Register Transpose Result
+
+Finding:
+
+- The D256-only register-transpose store experiment compiled and passed the focused PV wrapper correctness subset: `3 passed in 44.59s`.
+- It did not improve the measured reference cell.
+- D256 Qwen paged-PV `q=512 kv=65536 g=6 split=3072` measured `2.313 ms` mean with the register transpose.
+- The committed coalesced-load baseline for the same cell is `2.271 ms` mean.
+
+Decision:
+
+- Reverted the D256 register-transpose store code.
+- Do not propagate this shape to D128/D512.
+- The result says the extra select/shuffle work costs more than the shared-store coalescing it buys in the current CUTLASS operand layout.
+
+Next profiling target:
+
+- Keep the global-load-coalesced PV producer from `f7ac8e9`.
+- The next high-risk path should change the producer/store architecture more substantially than an intra-subgroup register transpose, or attack the remaining `1.044B` instruction count and reconvergence samples directly.
+- Continue using NCU as the gate: each candidate needs a named counter/PC target before code and a measured counter/timing result after code.
