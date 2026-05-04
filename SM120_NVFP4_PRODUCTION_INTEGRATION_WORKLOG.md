@@ -4407,3 +4407,39 @@ Production-focused matrix conclusion:
   1. Large D512 global prefill: sm120 paged is faster than nvfp4_fa2 on the important long-context cells.
   2. D256 Qwen long prefill: PV can reach parity at the largest q/kv cells, but stock linear-V remains behind due to reblock overhead.
   3. Decode and Gemma sliding window: the prefill-shaped paged kernel has a fixed overhead floor that dominates small work. This needs a decode/window-specialized path or routing to an existing backend; more V producer micro-optimization will not close an order-of-magnitude fixed-overhead gap.
+
+Dense-vs-paged small-work diagnostic:
+- D256 Qwen decode q=1 kv=262144 g=6 no softcap:
+  - Dense PV: `0.345 ms`.
+  - Paged PV: `0.710 ms`.
+  - Production report nvfp4_fa2: `0.085 ms`.
+- D256 Gemma sliding q=512 kv=1024 g=2 SWA=1024 softcap=30:
+  - Dense PV: `0.102 ms`.
+  - Paged PV: `0.239 ms`.
+  - Production report nvfp4_fa2: `0.0326 ms`.
+- D512 Gemma global decode q=1 kv=262144 g=8 softcap=30:
+  - Dense PV: `1.106 ms`.
+  - Paged PV: `1.456 ms`.
+  - Production report nvfp4_fa2: `0.360 ms`.
+- Conclusion: paged adds overhead, but the bad q=1/window cells are not exclusively a paged producer problem. Dense is already slower than nvfp4_fa2 on those cells, so the fused kernel template itself is prefill-shaped and pays a fixed floor. Next check: split scheduling, because q=1 auto currently uses `split_kv_len=1024`, creating many split CTAs on long context.
+
+Decode split scheduling diagnostic and change plan:
+- D256 q=1 kv=262144 no-window split sweep:
+  - Dense best among tested splits: split `4096`, `0.253 ms`; auto split `1024`, `0.345 ms`.
+  - Paged-PV best among tested splits: split `2048`, `0.603 ms`; auto split `1024`, `0.708 ms`.
+- D512 q=1 kv=262144 no-window split sweep:
+  - Dense best among tested splits: split `2048`, `0.793 ms`; auto split `1024`, `1.097 ms`.
+  - Paged-PV best among tested splits: split `2048`, `1.235 ms`; auto split `1024`, `1.452 ms`.
+- What I am about to change: for non-windowed single-q-tile workloads, set auto `split_kv_len=2048` instead of the current floor of `1024`. This is the best paged decode split for both D256 and D512, and it does not affect Gemma sliding because windowed runs still return `round_up(window_left, 128)`.
+- Decision criterion: keep the change if the focused q=1 decode benches improve and the NVFP4 tests still pass. This is a real scheduling fix, but it does not remove the larger decode-shape mismatch.
+
+Decode split scheduling change result:
+- Changed auto split selection in `flashinfer/fmha_nvfp4_sm120.py` so non-windowed single-q-tile wrapper workloads use `split_kv_len=2048`.
+- Mirrored the benchmark helper so auto-reported numbers match wrapper behavior; dense D256 q=1 keeps its measured best split `4096`, while paged decode uses `2048`.
+- Post-change focused decode benches:
+  - D256 q=1 kv=262144 dense auto: split `4096`, `0.253 ms`.
+  - D256 q=1 kv=262144 paged-PV auto: split `2048`, `0.603 ms` versus previous auto `~0.710 ms`.
+  - D512 q=1 kv=262144 dense auto: split `2048`, `0.795 ms`.
+  - D512 q=1 kv=262144 paged-PV auto: split `2048`, `1.242 ms` versus previous auto `~1.45 ms`.
+- Test status: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 1.05s`).
+- Conclusion: the split heuristic was leaving 15-18% decode performance on the table. The remaining decode gap is still architectural: the fused kernel remains a prefill-shaped template and is slower than nvfp4_fa2 even on dense decode.

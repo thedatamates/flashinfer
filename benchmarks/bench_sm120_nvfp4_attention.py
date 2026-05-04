@@ -63,9 +63,12 @@ def auto_split_kv_len(
         split_kv_len = round_up(sliding_window, 128)
     else:
         q_tiles = max(1, round_up(q_len * group, tile_m) // tile_m)
-        if api == "paged-wrapper" and head_dim == 512:
-            q_tiles *= 3
-        split_kv_len = min(max(q_tiles, 8), 96) * 128
+        if q_tiles == 1:
+            split_kv_len = 4096 if api == "dense" and head_dim == 256 else 2048
+        else:
+            if api == "paged-wrapper" and head_dim == 512:
+                q_tiles *= 3
+            split_kv_len = min(max(q_tiles, 8), 96) * 128
     padded_rows = num_kv_heads * round_up(q_len * group, tile_m)
     bytes_per_split = padded_rows * (head_dim * 2 + 2 * 4)
     total_kv_tiles = math.ceil(kv_len / 128)

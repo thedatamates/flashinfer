@@ -66,6 +66,8 @@ def _auto_split_kv_len(
         return _round_up(window_left, 128)
     tile_m = _paged_tile_m_for_config(head_dim, False)
     q_tiles = max(1, _round_up(max_q_len * group_size, tile_m) // tile_m)
+    if q_tiles == 1:
+        return 2048
     if head_dim == 512:
         q_tiles *= 3
     split_tiles = min(max(q_tiles, 8), 96)
