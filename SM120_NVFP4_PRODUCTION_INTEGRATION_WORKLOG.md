@@ -4299,3 +4299,35 @@ D256 split-length recheck result:
   - split 32768 (`2` splits): `9.942 ms`.
   - split 65536 (`1` split): `20.014 ms`.
 - All outputs were finite. The current auto split `3072` remains the best tested split after direct-index K and PV-scale-store reduction. Split scheduling is not the remaining gap.
+
+## 2026-05-04 10:55 CDT - D256 PV Pair Path Diagnostic Plan
+
+What I found:
+- D256 has a special `run_pv_tile_pair_nonfinal` path for `kOutputGroupSpan == 2`. It copies a P stage once, then consumes two V stages for two PV accumulators through a nested lambda.
+- D512 uses a grouped nonfinal path for span 4 and D128 has only one output group. D256 is the only file with this exact pair helper shape.
+- The D256 paged stage resource report is `REG:96 STACK:1080` while D128 paged is `REG:96 STACK:208`; D512 also has large stack but tracks dense, so stack is not sufficient by itself, but the D256 pair path remains the clearest D256-only control-flow difference in the hot MMA loop.
+
+What I am about to do:
+- Temporarily route `kOutputGroupSpan == 2` through the generic per-group `run_pv_tile` calls instead of `run_pv_tile_pair_nonfinal`.
+- Benchmark D256 q=512 kv=65536 g=6 paged-PV. If it improves or materially reduces resource usage, keep/refine. If it regresses, revert and record.
+
+D256 PV pair path diagnostic result:
+- D256 q=512 kv=65536 g=6 paged-PV with `kOutputGroupSpan == 2` forced through generic per-group `run_pv_tile`: `4.141 ms`.
+- Baseline with `run_pv_tile_pair_nonfinal`: about `2.96 ms`.
+- The pair path is a real optimization, not the residual bug. I reverted the diagnostic.
+
+## 2026-05-04 11:05 CDT - D256 Load-Warp Recheck Plan
+
+What I found:
+- The committed D256 paged no-SWA load-warp override is `10`. Earlier 8/10/12 testing was before direct-index K and PV-scale-store reduction.
+- Direct-index K changed the load producer balance, so the best load-warp count may have shifted by one warp even if the broad conclusion remains.
+
+What I am about to do:
+- Test D256 paged no-SWA `LOAD_WARPS=9` and `LOAD_WARPS=11` against the current committed `10`.
+- Decision criterion: keep the fastest PV/linear balanced setting if it is not a correctness risk; otherwise retain `10`.
+
+D256 load-warp recheck result:
+- Current committed `LOAD_WARPS=10`: D256 q=512 kv=65536 g=6 paged-PV about `2.96 ms`, paged-linear about `3.66 ms`.
+- Diagnostic `LOAD_WARPS=9`: paged-PV `3.041 ms`; worse.
+- Diagnostic `LOAD_WARPS=11`: paged-PV `2.863 ms`, paged-linear `3.562 ms`; better on both PV and linear.
+- Decision: keep D256 paged no-SWA `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=11` and validate with the focused NVFP4 suite.
