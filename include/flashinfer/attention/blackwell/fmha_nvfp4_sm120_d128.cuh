@@ -2112,17 +2112,25 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
   char* pv_workspace = workspace_base + qk_workspace_alloc;
   const size_t base_required_workspace_bytes =
       qk_workspace_alloc + pv_workspace_size;
+  const int fallback_q_tiles_per_sequence = q_rows / kCutlassTileM;
+  const int effective_q_tiles_per_sequence =
+      q_tiles_per_sequence > 0
+          ? q_tiles_per_sequence
+          : (fallback_q_tiles_per_sequence > 1 ? fallback_q_tiles_per_sequence
+                                               : 1);
+  const bool use_linear_v_cache =
+      kUsePagedKv && !kPvLayoutV && effective_q_tiles_per_sequence > 1;
   const size_t linear_scale_cache_offset =
       align_workspace(base_required_workspace_bytes);
   const size_t linear_scale_cache_bytes =
-      (kUsePagedKv && !kPvLayoutV)
+      use_linear_v_cache
           ? sm120_nvfp4_linear_v_scale_cache_bytes(batch_size, num_kv_heads,
                                                    head_dim, kv_len)
           : 0;
   const size_t linear_data_cache_offset =
       align_workspace(linear_scale_cache_offset + linear_scale_cache_bytes);
   const size_t linear_data_cache_bytes =
-      (kUsePagedKv && !kPvLayoutV)
+      use_linear_v_cache
           ? sm120_nvfp4_linear_v_data_cache_bytes(batch_size, num_kv_heads,
                                                   head_dim, kv_len)
           : 0;
@@ -2166,21 +2174,23 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
       pv_args, pv_workspace);
 
   if constexpr (kUsePagedKv && !kPvLayoutV) {
-    uint8_t* linear_scale_cache = reinterpret_cast<uint8_t*>(
-        workspace_base + linear_scale_cache_offset);
-    auto scale_cache_status = sm120_nvfp4_prepare_linear_v_scale_cache(
-        paged_kv_params, linear_scale_cache, kv_lens, batch_size,
-        num_kv_heads, head_dim, kv_len, stream);
-    if (scale_cache_status != cudaSuccess) {
-      return scale_cache_status;
-    }
-    uint8_t* linear_data_cache = reinterpret_cast<uint8_t*>(
-        workspace_base + linear_data_cache_offset);
-    auto data_cache_status = sm120_nvfp4_prepare_linear_v_data_cache(
-        paged_kv_params, linear_data_cache, kv_lens, batch_size,
-        num_kv_heads, head_dim, kv_len, stream);
-    if (data_cache_status != cudaSuccess) {
-      return data_cache_status;
+    if (use_linear_v_cache) {
+      uint8_t* linear_scale_cache = reinterpret_cast<uint8_t*>(
+          workspace_base + linear_scale_cache_offset);
+      auto scale_cache_status = sm120_nvfp4_prepare_linear_v_scale_cache(
+          paged_kv_params, linear_scale_cache, kv_lens, batch_size,
+          num_kv_heads, head_dim, kv_len, stream);
+      if (scale_cache_status != cudaSuccess) {
+        return scale_cache_status;
+      }
+      uint8_t* linear_data_cache = reinterpret_cast<uint8_t*>(
+          workspace_base + linear_data_cache_offset);
+      auto data_cache_status = sm120_nvfp4_prepare_linear_v_data_cache(
+          paged_kv_params, linear_data_cache, kv_lens, batch_size,
+          num_kv_heads, head_dim, kv_len, stream);
+      if (data_cache_status != cudaSuccess) {
+        return data_cache_status;
+      }
     }
   }
 

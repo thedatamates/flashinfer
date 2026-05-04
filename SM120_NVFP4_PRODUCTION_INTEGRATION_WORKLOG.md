@@ -6369,3 +6369,72 @@ Next profiling target:
 - Worst row: `q=1 kv=262144`, dense `0.796 ms`, paged-PV `1.044 ms`, paged-linear `6.740 ms`.
 - Since paged-PV is only `1.31x` over dense on that row while paged-linear is `8.46x` over dense, the next NCU pass should compare `q=1 kv=262144` paged-linear against paged-PV and attribute the linear-only cost.
 - This is a production-stock-vLLM path issue because stock vLLM writes linear V.
+
+## 2026-05-04 16:48 CDT - Decode Linear-V Cache Bypass Target
+
+Finding:
+
+- NCU source counters on D512 `q=1 kv=262144` showed the stage kernel itself is not the linear/PV gap:
+  - Paged-linear stage duration: `945.95 us`.
+  - Paged-PV stage duration: `931.68 us`.
+- NSYS kernel timeline found the missing linear-only work inside the same FFI call:
+  - `sm120_nvfp4_linear_v_scale_cache_kernel`: `2` instances, average `2.816 ms`.
+  - `sm120_nvfp4_linear_v_data_cache_kernel`: `2` instances, average `2.784 ms`.
+  - Stage kernel: `2` instances, average `0.949 ms`.
+  - Split-KV combine: `2` instances, average `0.089 ms`.
+- The `2` instances are expected because the bench script runs once before timing and once under the CUDA event. Per measured call, the linear cache prepass costs about `5.6 ms`.
+- Paged-PV has no linear cache prepass; its per-call stage time is essentially the same as linear.
+
+Implementation target:
+
+- Do not change public layout/API. This is internal auto behavior inside the existing linear-V path.
+- Bypass the full-V linear scale/data cache prepass when the paged launch has only one Q tile per sequence.
+- In decode, the cache is pure overhead: it converts the entire V cache to a temporary layout for one Q tile, then the stage reads it once.
+- Keep the cache for multi-Q-tile prefill where it can amortize reblock work across Q tiles.
+- Apply the same q-tile based cache gate to D128, D256, and D512 for consistent behavior across head dimensions.
+
+Validation:
+
+- Run focused D512 correctness.
+- Benchmark D512 `q=1 kv=262144` paged-linear and paged-PV; target is linear close to PV plus irreducible in-stage reblock cost, not `6.7 ms`.
+- Re-run a prefill sanity cell (`q=128 kv=65536` or `q=512 kv=16384`) to confirm the cache remains enabled and prefill numbers do not regress.
+- If decode improves, run NSYS again and verify the linear cache kernels disappear from the q1 timeline.
+
+## 2026-05-04 17:01 CDT - Decode Linear-V Cache Bypass Result
+
+Implementation:
+
+- Added a q-tile gate around the linear-V scale/data cache prepass in D128, D256, and D512.
+- The cache is now prepared only when `effective_q_tiles_per_sequence > 1`.
+- Decode (`q_tiles == 1`) falls back to the in-stage linear-V reblock path and no longer allocates or fills the full linear-V cache workspace.
+- Prefill paths with more than one Q tile keep the cache behavior unchanged.
+
+Correctness:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py`: `36 passed in 292.57s`.
+- D128 decode linear smoke: `q=1 kv=4096 g=8`, output finite, split `2048`.
+- D256 decode linear smoke: `q=1 kv=4096 g=6`, output finite, split `2048`.
+
+Measured result:
+
+| cell | v_layout | split | mean ms | min ms |
+|:---|:---|---:|---:|---:|
+| D512 q=1 kv=262144 g=8 | linear | 2048 | 6.206 | 6.149 |
+| D512 q=1 kv=262144 g=8 | pv | 2048 | 1.052 | 1.041 |
+| D512 q=128 kv=65536 g=8 | linear | 3072 | 3.086 | 3.080 |
+| D512 q=128 kv=65536 g=8 | pv | 3072 | 1.697 | 1.692 |
+| D512 q=512 kv=16384 g=8 | linear | 4096 | 2.259 | 2.253 |
+| D512 q=512 kv=16384 g=8 | pv | 4096 | 1.817 | 1.807 |
+
+NSYS confirmation:
+
+- The q1 linear cache kernels disappeared after the bypass.
+- The stage kernel became the dominant q1 linear cost:
+  - Stage kernel: `2` instances, average `6.229 ms`.
+  - Split-KV combine: `2` instances, average `0.089 ms`.
+- This confirms the full-V linear reblock cost is still paid once per token either as a prepass or in-stage. The bypass saves launch/workspace overhead but does not solve the decode linear-V floor.
+
+Decision:
+
+- Keep the bypass because it is a small decode improvement, reduces decode workspace pressure, and does not regress the measured prefill sanity cells.
+- Do not treat it as the structural linear-V solution. The remaining decode gap requires avoiding full-cache linear reblock for q1 entirely, or changing the production writer/layout so the kernel consumes PV-layout V.
