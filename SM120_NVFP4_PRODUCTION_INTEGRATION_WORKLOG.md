@@ -6337,3 +6337,35 @@ Decision:
 - Keep the conditional heuristic.
 - It preserves the major q512 outlier fix (`paged-PV 4.668 ms -> 1.807 ms`, `paged-linear 5.446 ms -> 2.251 ms`) while recovering the long q128 cells to the old faster split.
 - The remaining D512 overhead is now dominated by normal producer/layout costs again, not the auto-split geometry bug.
+
+## 2026-05-04 16:43 CDT - D512 Refined Production Report Result
+
+Report:
+
+- Generated `reports/prod_gemma_global_d512_g8_softcap30_splitrefine_20260504` from the committed refined split heuristic.
+- The report uses the same 16 D512 Gemma global cells as the previous focused matrix:
+  - `q={1,128,512,2048}`
+  - `kv={4096,16384,65536,262144}`
+  - `group=8`, `head_dim=512`, causal, `softcap=30`, no sliding window.
+
+Finding:
+
+- Geomean paged-PV / dense improved from `1.44x` in the post-no-shuffle report to `1.23x`.
+- Geomean paged-linear / dense improved from `2.10x` to `1.82x`.
+- Geomean paged-linear speedup vs `nvfp4_fa2` improved from `0.393x` to `0.452x`.
+- The q512/kv16384 outlier is resolved:
+  - Before: dense `1.479 ms`, paged-PV `4.668 ms`, paged-linear `5.446 ms`.
+  - After: dense `1.478 ms`, paged-PV `1.796 ms`, paged-linear `2.245 ms`.
+- The q128 short cells remain on the faster smaller split:
+  - `q=128 kv=4096`: paged-PV `1.281 ms -> 0.510 ms`, paged-linear `1.472 ms -> 0.631 ms`.
+  - `q=128 kv=16384`: paged-PV `1.279 ms -> 0.571 ms`, paged-linear `1.729 ms -> 0.947 ms`.
+- The q128 long cells recovered the old larger split:
+  - `q=128 kv=65536`: paged-PV `1.710 ms`, paged-linear `3.086 ms`.
+  - `q=128 kv=262144`: paged-PV `6.715 ms`, paged-linear `12.438 ms`.
+
+Next profiling target:
+
+- The largest remaining production gap is now D512 decode linear-V, not the q512 prefill split geometry.
+- Worst row: `q=1 kv=262144`, dense `0.796 ms`, paged-PV `1.044 ms`, paged-linear `6.740 ms`.
+- Since paged-PV is only `1.31x` over dense on that row while paged-linear is `8.46x` over dense, the next NCU pass should compare `q=1 kv=262144` paged-linear against paged-PV and attribute the linear-only cost.
+- This is a production-stock-vLLM path issue because stock vLLM writes linear V.
