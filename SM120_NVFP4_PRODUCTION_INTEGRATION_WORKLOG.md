@@ -6761,3 +6761,156 @@ Decision:
 
 - Keep FastDivmod. It recovers most of the benefit that the shared row cache hinted at, without changing shared-memory layout or failing D256 multi-KV/ragged correctness.
 - Re-run NCU source sampling before the next producer change. The prior top instruction site should no longer be a runtime integer division, so the next target needs fresh attribution.
+
+## 2026-05-04 18:14 CDT - Large-Q Default Benchmark Target
+
+Finding:
+
+- Large-Q rows are now optimization targets, not just one-off characterization cells.
+- The focused extended-Q reports already used `q={4096,8192,16384}` explicitly, but the grid driver's `--q-lens all` default only includes `4096` from that set.
+- Leaving `8192` and `16384` out of the reusable default makes broad sweeps underrepresent the new long-prefill target space unless every run manually passes `--cells`.
+
+Implementation target:
+
+- Extend `benchmarks/bench_sm120_nvfp4_attention_grid.py::DEFAULT_Q_LENS` to include `8192` and `16384`.
+- Keep the existing `--cells` override behavior unchanged for focused production reports.
+- Do not change benchmark device semantics, kernel code, public APIs, or report schema.
+
+Validation:
+
+- Run the grid help/parser smoke after the edit.
+- Re-run current-code large-Q/max-KV rows for Qwen D256 with the updated benchmark harness before selecting the next NCU target.
+
+## 2026-05-04 18:17 CDT - Large-Q Default Benchmark Result
+
+Implementation:
+
+- Extended `benchmarks/bench_sm120_nvfp4_attention_grid.py::DEFAULT_Q_LENS` from `q<=4096` to `q<=16384` by adding `8192` and `16384`.
+- Kept `--cells` behavior and report schema unchanged.
+- Ran the grid parser/help smoke successfully.
+- Generated a current-code compact Qwen D256 max-KV report at `reports/prod_qwen_full_d256_g6_largeq_maxkv_current_20260504` using `q={4096,8192,16384}`, `kv=262144`, `group=6`.
+
+Measured result:
+
+| q | dense ms | paged-PV ms | paged-linear ms | nvfp4_fa2 ms | linear/dense | linear/PV | linear speedup vs nvfp4 |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| `4096` | `27.062` | `51.426` | `52.852` | `62.777` | `1.900x` | `1.028x` | `1.188x` |
+| `8192` | `57.099` | `101.853` | `103.039` | `107.978` | `1.784x` | `1.012x` | `1.048x` |
+| `16384` | `117.773` | `204.968` | `206.392` | `202.268` | `1.740x` | `1.007x` | `0.980x` |
+
+Finding:
+
+- Current code has recovered most of the stale extended-Q deficit against `nvfp4_fa2`; the worst max-KV large-Q row is now essentially FA2 parity at `q=16384`.
+- The remaining large-Q gap is paged-vs-dense, not linear-V reblock: `linear/PV` is only `0.7-2.8%` across these max-KV rows.
+- The next optimization target should stay on the paged-PV large-Q path and use the fresh post-FastDivmod NCU attribution. The largest concrete memory-source target there is the PV V-scale path: `params.v_scales[src]` still shows `201,326,592` global sectors and `176,160,768` excessive sectors.
+
+Decision:
+
+- Keep the benchmark default extension.
+- Target PV V-scale loop ordering next. The current PV scale loop maps neighboring lanes across token groups for one column; that creates strided scale loads. Remapping the loop so neighboring lanes cover adjacent columns for one token group should coalesce the scale load without changing public layout, smem layout, or test contracts.
+
+## 2026-05-04 18:18 CDT - PV V-Scale Loop Coalescing Target
+
+Finding:
+
+- Fresh post-FastDivmod NCU source attribution on D256 Qwen large-Q paged-PV still flags the PV V-scale load as a large global-sector waste source:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:904`: `params.v_scales[src]` with `201,326,592` total global sectors and `176,160,768` excessive global sectors.
+- The current D256 PV scale loop at `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh:1261-1264` linearizes `idx` as `col` outer, `token_group` inner:
+  - lanes `0..7` load the same `col` across token groups `0..7`.
+  - those scale addresses are separated by page/token-scale stride, so neighboring lanes do not coalesce.
+- The PV scale layout is dim-contiguous within each token group. For the same token group, adjacent `col` values are contiguous or near-contiguous by `scale_col`.
+
+Implementation target:
+
+- D256 first.
+- Remap only the `kPvLayoutV` scale loop index order from `col-major/token-inner` to `token-group-major/col-inner`:
+  - `token_group = idx / kOutputTileN`.
+  - `col = idx - token_group * kOutputTileN`.
+- Keep the same number of scale elements, same `pv_sSFB(col, k0, write_stage)` destination, same static scale helper, and same OOB sentinel.
+- Do not change the V data producer, public tensor layouts, launch geometry, or FFI signatures.
+
+Validation:
+
+- Benchmark D256 Qwen max-KV paged-PV at `q=4096` and `q=16384`.
+- If timing is positive or neutral, run the D256 focused NVFP4 correctness selection and port the loop remap to D128/D512.
+- If timing regresses, revert the D256 diagnostic and keep the NCU finding as evidence that the loop order alone is not enough.
+
+## 2026-05-04 18:21 CDT - PV V-Scale Loop Coalescing Result
+
+Implementation:
+
+- Tested a D256-only diagnostic that remapped the PV V-scale loop from `col-major/token-inner` to `token-group-major/col-inner`.
+- The diagnostic kept the same scale helper, same destination tensor, same OOB sentinel, same public layouts, and same launch geometry.
+
+Measured result:
+
+| cell | baseline paged-PV ms | scale-loop remap paged-PV ms | result |
+|:---|---:|---:|:---|
+| D256 Qwen `q=4096 kv=262144 g=6` | `52.356` | `61.044` | regressed |
+| D256 Qwen `q=16384 kv=262144 g=6` | `205.183` | `214.522` | regressed |
+
+Decision:
+
+- Reverted the diagnostic and did not port it to D128/D512.
+- The NCU V-scale excessive-sector finding remains real, but simple loop reordering is not a profitable fix. It likely worsens shared-store/layout locality or instruction scheduling enough to dominate the improved global coalescing.
+- Do not revisit V-scale loop order without a new NCU comparison showing the regression mechanism directly.
+
+## 2026-05-04 18:22 CDT - PV Old-Scale Accumulator Rescale Target
+
+Finding:
+
+- Fresh post-FastDivmod NCU source attribution on D256 Qwen paged-PV shows `storage.old_scale_stage[tile & 1][row]` in the PV accumulator rescale path as the top long-scoreboard source:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh:2237`: `243,295` long-scoreboard samples and `713,613,312` executed instructions in the earlier source table.
+- The current D256 PV rescale loops reload `old_scale_stage` for every accumulator element, even though the row coordinate may repeat across the CUTE fragment order.
+- Both `run_pv_tile()` and `rescale_pv_accum()` also branch on `tile == 0` inside the per-element loop.
+
+Implementation target:
+
+- D256 first.
+- Split the `tile == 0` clear case out of the per-element rescale loops.
+- For `tile > 0`, add a per-thread row cache:
+  - Track `cached_row` and `cached_old_scale` in registers.
+  - Reload `storage.old_scale_stage[tile & 1][row]` only when the CUTE fragment row changes.
+- Keep accumulator math, smem storage, softmax statistics, and public APIs unchanged.
+
+Validation:
+
+- Benchmark D256 Qwen max-KV paged-PV at `q=4096` and `q=16384`.
+- If timing is positive or neutral, run focused D256 correctness and consider porting to D128/D512.
+- If timing regresses, revert the diagnostic and keep the NCU old-scale finding as not addressed by row-local caching.
+
+## 2026-05-04 18:32 CDT - PV Old-Scale Accumulator Rescale Result
+
+Implementation:
+
+- Split the `tile == 0` clear case out of the PV accumulator rescale loops in D128/D256/D512.
+- Added a per-thread `(cached_row, cached_old_scale)` register cache for `tile > 0` in both `run_pv_tile()` and `rescale_pv_accum()`.
+- Kept accumulator math, `old_scale_stage` storage, softmax statistics, smem layout, public APIs, FFI signatures, and tolerances unchanged.
+
+Measured result:
+
+| cell | baseline paged-PV ms | old-scale paged-PV ms | baseline paged-linear ms | old-scale paged-linear ms | result |
+|:---|---:|---:|---:|---:|:---|
+| D256 Qwen `q=4096 kv=262144 g=6` | `52.356` | `50.524` | `53.489` | `53.065` | PV improved, linear neutral/slightly better |
+| D256 Qwen `q=8192 kv=262144 g=6` | `102.703` | `98.974` | `104.097` | `102.882` | improved |
+| D256 Qwen `q=16384 kv=262144 g=6` | `205.183` | `200.354` | `206.769` | `204.862` | improved |
+| D512 Gemma global `q=16384 kv=262144 g=8` | `879.168` | `793.273` | `892.559` | `838.136` | improved |
+
+Current large-Q comparison after this change:
+
+| q | dense ms | paged-PV ms | paged-linear ms | nvfp4_fa2 ms | linear/dense | linear/PV | linear speedup vs nvfp4 |
+|:---|---:|---:|---:|---:|---:|---:|---:|
+| `4096` | `27.084` | `49.785` | `52.323` | `62.925` | `1.932x` | `1.051x` | `1.203x` |
+| `8192` | `57.270` | `97.675` | `101.474` | `108.336` | `1.772x` | `1.039x` | `1.068x` |
+| `16384` | `118.144` | `199.961` | `204.656` | `202.346` | `1.733x` | `1.023x` | `0.989x` |
+
+Correctness:
+
+- D256 focused selection that previously caught score-cache regressions: `10 passed, 26 deselected in 88.62s`.
+- Full SM120 NVFP4 attention test file after D128/D256/D512 port: `36 passed in 196.86s`.
+
+Decision:
+
+- Keep and commit the old-scale rescale-loop change.
+- The gain is NCU-aligned and shows up on both D256 and D512 large-Q/max-KV production rows.
+- The remaining large-Q gap is still paged-vs-dense. After this change, D256 `q=16384 kv=262144` paged-PV is at FA2 parity but still `~1.69x` over dense, so the next profiler pass should compare current paged-PV vs dense again and use fresh source attribution; previous line rankings are now stale.

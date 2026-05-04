@@ -2195,15 +2195,23 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         acquire_output_stage();
       }
       pv_consume_v_stage();
-      for (int i = 0; i < cute::size(pv_accum); ++i) {
-        if (tile == 0) {
+      if (tile == 0) {
+        for (int i = 0; i < cute::size(pv_accum); ++i) {
           pv_accum(i) = 0.0f;
-          continue;
         }
-        auto coord = pv_tCcC(i);
-        const int row = int(cute::get<0>(coord));
-        if (row < kCutlassTileM) {
-          pv_accum(i) *= storage.old_scale_stage[tile & 1][row];
+      } else {
+        int cached_row = -1;
+        float cached_old_scale = 0.0f;
+        for (int i = 0; i < cute::size(pv_accum); ++i) {
+          auto coord = pv_tCcC(i);
+          const int row = int(cute::get<0>(coord));
+          if (row < kCutlassTileM) {
+            if (row != cached_row) {
+              cached_row = row;
+              cached_old_scale = storage.old_scale_stage[tile & 1][row];
+            }
+            pv_accum(i) *= cached_old_scale;
+          }
         }
       }
       if ((tile & 1) == 0) {
@@ -2226,15 +2234,23 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     };
 
     auto rescale_pv_accum = [&](int tile, auto& pv_accum) {
-      for (int i = 0; i < cute::size(pv_accum); ++i) {
-        if (tile == 0) {
+      if (tile == 0) {
+        for (int i = 0; i < cute::size(pv_accum); ++i) {
           pv_accum(i) = 0.0f;
-          continue;
         }
-        auto coord = pv_tCcC(i);
-        const int row = int(cute::get<0>(coord));
-        if (row < kCutlassTileM) {
-          pv_accum(i) *= storage.old_scale_stage[tile & 1][row];
+      } else {
+        int cached_row = -1;
+        float cached_old_scale = 0.0f;
+        for (int i = 0; i < cute::size(pv_accum); ++i) {
+          auto coord = pv_tCcC(i);
+          const int row = int(cute::get<0>(coord));
+          if (row < kCutlassTileM) {
+            if (row != cached_row) {
+              cached_row = row;
+              cached_old_scale = storage.old_scale_stage[tile & 1][row];
+            }
+            pv_accum(i) *= cached_old_scale;
+          }
         }
       }
     };
