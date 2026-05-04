@@ -6615,3 +6615,52 @@ Decision:
 - Reverted both code variants. The shared row cache proves that the score-mask division is a real cost, but its naive storage placement perturbs D256 correctness.
 - The no-smem cache is correctness-safe but regresses the large-Q target, likely by adding loop-carried state and branch pressure without removing enough runtime divisions.
 - Do not reattempt score-mask caching without first identifying a safe lifetime/alias location or using NCU to show the division remains the dominant source after other changes.
+
+## 2026-05-04 17:47 CDT - PV Scale Addressing Strength-Reduction Target
+
+Finding:
+
+- The same lineinfo NCU run identifies PV V-scale addressing as another hot source site:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:878`: `scale_row = dim / params.scale_dim`.
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:885`: `return params.v_scales[src]`.
+- For the SM120 head-dimension specializations, `scale_dim` is not actually dynamic:
+  - D128: `kHeadDim / 16 = 8`.
+  - D256: `kHeadDim / 16 = 16`.
+  - D512: `kHeadDim / 16 = 32`.
+- The wrapper and FFI already validate `scale_dim * 16 == head_dim`, so using a compile-time `kScaleDim` inside the specialization does not change the public contract.
+
+Implementation target:
+
+- Add a templated PV-scale helper that takes `kScaleDim` as a compile-time parameter.
+- Replace D128/D256/D512 PV-layout V-scale callsites with the templated helper.
+- Keep the dynamic helper for generic callers and for any future path that does not have head-dim specialization.
+
+Validation:
+
+- Benchmark Qwen D256 `q=4096 kv=262144` and `q=16384 kv=262144`, paged-PV.
+- Run the focused NVFP4 correctness selection that caught the failed score-mask shared-cache variant.
+- Keep only if timing is positive or neutral and correctness is clean.
+
+## 2026-05-04 17:54 CDT - PV Scale Addressing Strength-Reduction Result
+
+Implementation:
+
+- Added `sm120_nvfp4_paged_v_pv_scale_from_physical_page_static<kScaleDim>()`.
+- Replaced the PV-layout V-scale callsites in D128/D256/D512 with `kScaleDim = kHeadDim / 16`.
+- Kept the dynamic helper unchanged for generic callers.
+
+Measured result:
+
+| cell | baseline paged-PV ms | static-scale paged-PV ms | result |
+|:---|---:|---:|:---|
+| D256 Qwen `q=4096 kv=262144 g=6` | `~61.6` | `59.627` | improved |
+| D256 Qwen `q=16384 kv=262144 g=6` | `~234-242` | `230.881` | improved |
+
+Correctness:
+
+- Focused selection that previously caught the score-cache regression: `10 passed, 26 deselected in 287.73s`.
+
+Decision:
+
+- Keep the static PV-scale helper. The win is modest, but it directly removes an NCU-identified runtime division from the PV-scale hot path and does not affect public layout/API.
+- Re-run NCU source sampling before the next change; the previous source ranking is now stale because one of the top helper instructions changed.

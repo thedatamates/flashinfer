@@ -1267,7 +1267,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           if (token < kv_len_tokens) {
             const int local_page = k0 >> 4;
             const int physical_page = storage.physical_page_cache[local_page];
-            scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page(
+            scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page_static<
+                kHeadDim / 16>(
                 paged_kv_params, effective_kv_head, physical_page, dim);
           }
           const uint8_t store_scale = token < kv_len_tokens ? scale : 0x38;

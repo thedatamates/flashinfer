@@ -885,6 +885,25 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_pv_scale_from_physical_pa
   return params.v_scales[src];
 }
 
+template <int kScaleDim>
+__device__ __forceinline__ uint8_t
+sm120_nvfp4_paged_v_pv_scale_from_physical_page_static(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int kv_head,
+    int physical_page,
+    int dim) {
+  static_assert((kScaleDim & (kScaleDim - 1)) == 0,
+                "Static PV scale dimension must be a power of two.");
+  const int scale_row = dim / kScaleDim;
+  const int scale_col = dim - scale_row * kScaleDim;
+  const int64_t src =
+      static_cast<int64_t>(physical_page) * params.v_scale_stride_page +
+      static_cast<int64_t>(scale_row) * params.v_scale_stride_dim1 +
+      static_cast<int64_t>(kv_head) * params.v_scale_stride_dim2 +
+      static_cast<int64_t>(scale_col) * params.v_scale_stride_dim3;
+  return params.v_scales[src];
+}
+
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_pv_scale_from_physical_page(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int physical_page,
