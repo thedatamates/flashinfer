@@ -2304,3 +2304,71 @@ Characterization:
   answer to the 100x-plus paged gap.
 - Remaining cost is still V-data/reblock dominated. Paged-linear remains
   `2.13x` paged-PV and `226.7x` dense at this cell.
+
+## 2026-05-03 19:25 CDT - P4 Remaining Scalar Walk Audit Plan
+
+What I am changing:
+
+- Audit remaining paged producer helper callsites after P1/P2/P3.
+- Keep the V data/reblock scalar walk documented as the dominant unresolved
+  path because P1's register-transpose implementation hit a real compile wall.
+- Patch only safe scalar walks whose layout semantics are already page/group
+  level and do not require a public tensor-layout change.
+- The concrete safe item found is PV-layout V scale staging in
+  `stage_paged_v_tile`: it reloads the same `sm120_nvfp4_paged_v_pv_scale` once
+  per FP4 pair even though PV scales are page-level for one dim. New shape:
+  load once per 16-token page group, then store the repeated scale to the eight
+  FP4-pair scale positions.
+
+Reference code:
+
+```cpp
+// include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:1090
+const int logical_page = token / paged_kv_params.page_size;
+const int physical_page =
+    paged_kv_params.block_table[logical_page];
+scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page(
+    paged_kv_params, physical_page, dim);
+```
+
+## 2026-05-03 19:25 CDT - P4 Remaining Scalar Walk Audit Result
+
+Implementation:
+
+- Rewrote PV-layout V scale staging in D128/D256/D512 from one scale load per
+  FP4 pair to one scale load per 16-token page group followed by repeated SFB
+  stores.
+- Preserved OOB behavior by writing `0x38` for invalid tail-token positions
+  inside the repeated-store loop.
+- Left V data/reblock as the remaining scalar path. Its page-table walk is
+  already hoisted by Path A, and the attempted register-transpose structural
+  fix hit the documented P1 compile wall.
+
+Correctness:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py -q`: 36 passed.
+- `tests/attention/test_nvfp4_kv_head_dim_512.py tests/utils/test_fp4_kv_quantization.py -q`:
+  62 passed.
+- No tolerance changes.
+
+Reference cell:
+
+`D=512, group=8, q=512, kv=65536, softcap=30, split_kv_len=32768,
+output_group_span=4, device=2`
+
+| state | dense min ms | paged-PV min ms | paged-linear min ms |
+| --- | ---: | ---: | ---: |
+| P3 Q-quantize hoist | 7.682 | 816.084 | 1741.079 |
+| P4 PV-scale hoist | 7.682 | 717.799 | 1740.975 |
+
+Characterization:
+
+- PV-scale hoist recovered `12.0%` on paged-PV at the reference cell, which
+  confirms PV scale staging was still a meaningful scalar walk.
+- Paged-linear did not move materially because it uses the linear scale/reblock
+  prepass instead of the PV scale path. The remaining linear cost is the
+  fp32 dequant/requant V-data reblock path plus the unresolved V data
+  token/dim layout mismatch.
+- After P4, paged-PV is still `93.4x` dense and paged-linear is still
+  `2.43x` paged-PV. Further large wins require a new V data structural design,
+  not more scalar scale hoists.

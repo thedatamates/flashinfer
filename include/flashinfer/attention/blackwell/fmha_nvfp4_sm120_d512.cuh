@@ -1078,11 +1078,12 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
 
       if constexpr (kPvLayoutV) {
-        for (int idx = lane_idx; idx < kCutlassTileN * kCutlassTileN / 2;
+        constexpr int kTokenScaleGroups = kCutlassTileN / 16;
+        for (int idx = lane_idx; idx < kCutlassTileN * kTokenScaleGroups;
              idx += cutlass::NumThreadsPerWarp) {
-          const int col = idx / (kCutlassTileN / 2);
-          const int packed_k = idx - col * (kCutlassTileN / 2);
-          const int k0 = 2 * packed_k;
+          const int col = idx / kTokenScaleGroups;
+          const int token_group = idx - col * kTokenScaleGroups;
+          const int k0 = token_group * 16;
           const int token = kv_tile * kCutlassTileN + k0;
           const int dim = effective_out_group_idx * kCutlassTileN + col;
           uint8_t scale = 0x38;
@@ -1093,7 +1094,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page(
                 paged_kv_params, physical_page, dim);
           }
-          pv_sSFB(col, k0, write_stage) = make_ue4m3_raw(scale);
+#pragma unroll
+          for (int k_offset = 0; k_offset < 16; k_offset += 2) {
+            const uint8_t store_scale =
+                token + k_offset < kv_len_tokens ? scale : 0x38;
+            pv_sSFB(col, k0 + k_offset, write_stage) =
+                make_ue4m3_raw(store_scale);
+          }
         }
       }
     }
