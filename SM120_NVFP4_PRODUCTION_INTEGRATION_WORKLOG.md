@@ -5825,3 +5825,66 @@ Next profiling target:
 
 - Stop spending effort on low-yield cache prepass launch fusion.
 - Use NCU/NSYS source attribution on the stage kernel itself. The current stage gap is dominated by stage-kernel time, not Python, wrapper orchestration, or linear cache prepass launch count.
+
+## 2026-05-04 14:58 CDT - D256 Linear Scale Pair Load Target
+
+Finding:
+
+- Re-parsed the post-cache D256 Qwen paged-linear NCU source export after rejecting prepass fusion.
+- The top global excessive-sector PCs are no longer the linear data-cache word path.
+- The top entries are two adjacent `LDG.E.U8` loads from `v_linear_scale_cache`:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh:940`.
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh:944`.
+  - Both resolve to `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:109`.
+- Each top scale-cache load has `905,520` excessive L2 sectors in the source export.
+- The D256 coalesced internal scale-cache layout stores adjacent dims contiguously for a `(token_group, dim_pair)` pair, so the two byte loads can be replaced with one aligned 16-bit load in the coalesced path.
+
+Implementation target:
+
+- Add a stage-side scale-pair helper.
+- For `kLinearVCacheCoalesced == true`, load `sf0/sf1` with one 16-bit load from the adjacent scale-cache bytes.
+- For non-coalesced layouts, keep the existing two byte loads because adjacent dims are separated by `token_groups`.
+- Use the helper only in the D256 linear-V stage producer path where NCU identified the source line.
+
+Validation:
+
+- Focused D256 correctness.
+- D256 Qwen paged-linear benchmark against the `3.105 ms` baseline.
+- Re-run NCU if timing moves materially to verify the top scale-cache excessive-sector PCs drop.
+
+Decision criteria:
+
+- Keep if correctness passes and timing improves or the NCU excessive-sector source moves away from scale-cache byte loads.
+- Revert if timing regresses or the helper increases register pressure/spills enough to offset the load coalescing.
+
+## 2026-05-04 15:02 CDT - D256 Linear Scale Pair Load Rejected
+
+Finding:
+
+- Implemented the stage-side scale-pair load experiment:
+  - D256/coalesced layout used one 16-bit load for adjacent `sf0/sf1` bytes.
+  - Non-coalesced layouts preserved the prior two-byte load behavior.
+- Focused D256 correctness passed:
+  - `3 passed in 44.49s`.
+- Wall-time did not improve:
+  - Baseline after D256 cache-layout commit: `3.105 ms`.
+  - Scale-pair experiment: `3.117 ms` mean (`3.112 ms` min, `3.119 ms` max).
+- NCU confirmed the intended local effect:
+  - L2 theoretical global excessive sectors dropped from `6,291,456` to `3,145,728`.
+  - L1 shared excessive wavefronts stayed flat at `18,974,208`.
+  - Barrier not-issued stalls rose from `60,334` to `62,853`.
+  - Long-scoreboard not-issued stalls rose from `37,461` to `38,255`.
+  - NCU elapsed cycles rose from `5,817,760` to `5,945,564`.
+
+Decision:
+
+- Rejected the scale-pair load and restored the committed byte-load implementation.
+- Global sector count is no longer a sufficient proxy for wall time on this cell. The paired load removed half of the measured global excess but did not reduce the dominant stage time.
+
+Next profiling target:
+
+- Focus on the flat sources that did not move:
+  - `18,974,208` excessive shared wavefronts.
+  - `37,408,368` local spill requests.
+  - Barrier/sleeping waits around CUTLASS pipeline handoff.
+- The next useful experiment needs to target shared-memory operand access or register pressure, not global scale-cache coalescing.
