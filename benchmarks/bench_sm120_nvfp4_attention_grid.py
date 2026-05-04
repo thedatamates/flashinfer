@@ -862,7 +862,7 @@ def main() -> None:
     parser.add_argument(
         "--fused-split-kv-len",
         type=int,
-        default=8192,
+        default=4096,
         help=(
             "Split length passed to the SM120 fused benchmark. Defaults to "
             "the production wrapper default. Use 0 to auto-select from "

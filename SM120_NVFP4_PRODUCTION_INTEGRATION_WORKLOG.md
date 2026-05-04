@@ -3608,3 +3608,38 @@ Conclusion:
   the production input path, and the wrapper/FFI performs the necessary
   one-call internal conversion without exposing a bridge tensor or adding a
   second Python-visible step.
+
+## 2026-05-04 02:14 CDT - Production Split Default Retune
+
+Checks:
+- D512 Gemma-global `q=512 kv=65536 g=8 softcap=30`, linear:
+  - split `4096`: `11.347 ms`
+  - split `8192`: `13.640 ms`
+  - split `16384`: `12.835 ms`
+  - split `32768`: `23.288 ms`
+  - split `65536`: `45.118 ms`
+- D512 PV same cell:
+  - split `4096`: `10.259 ms`
+  - split `8192`: `12.424 ms`
+- D256 Qwen-full `q=512 kv=65536 g=6`:
+  - linear split `4096`: `8.677 ms`
+  - linear split `8192`: `10.035 ms`
+  - PV split `4096`: `7.549 ms`
+  - PV split `8192`: `8.862 ms`
+
+What changed:
+- Retuned the production wrapper default `split_kv_len` from `8192` to
+  `4096`.
+- Matched the defaults in `bench_sm120_nvfp4_attention.py` and
+  `bench_sm120_nvfp4_attention_grid.py`.
+- Explicit caller-provided split lengths and `0` auto-split behavior in the
+  benchmark remain unchanged.
+
+Validation:
+- Full `tests/attention/test_nvfp4_kv_head_dim_512.py -q` on warm cache:
+  `36 passed in 1.00s`.
+
+Conclusion:
+- After the linear-V cache fixes, the prior `8192` split default is no longer
+  optimal. `4096` consistently improves the sampled D512 and D256 production
+  cells for both PV and linear layouts.

@@ -158,7 +158,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         causal: bool = True,
         window_left: int = -1,
         logits_soft_cap: float = 0.0,
-        split_kv_len: int = 8192,
+        split_kv_len: int = 4096,
         output_group_span: Optional[int] = None,
         v_cache_uses_pv_layout: bool = True,
     ) -> None:
