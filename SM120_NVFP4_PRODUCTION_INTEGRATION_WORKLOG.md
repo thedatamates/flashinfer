@@ -2833,3 +2833,103 @@ Next structural implication:
   (`1742.628 / 283.155`).
 - The linear branch needs a separate register-transpose-plus-requant design with
   helper boundaries to avoid the previous D512 ptxas wall.
+
+## 2026-05-03 22:08 CDT - Linear-V Register Transpose Slice Plan
+
+Reference pattern:
+
+- `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1733-1736`
+  resolves the paged row once for the current V row:
+  `char const* kv_row_ptr; char const* scale_head_ptr; int row_in_page; bool const valid_row = get_nvfp4_row_ptrs(row_idx, kv_row_ptr, scale_head_ptr, row_in_page);`
+- `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1743-1753`
+  loads the original V scale once per 8-column register group and then loads
+  four byte-pairs from that row pointer: `original_scale_byte =
+  load_v_original_scale_byte(...)` and `fmha::ldg(original_pair, kv_row_ptr +
+  col0 / 2);`.
+- `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1757-1771`
+  reads the already-computed PV output scale from smem, applies
+  original-scale dequant and PV-scale requant in registers, then packs eight
+  FP4 codes.
+
+What I am about to do:
+
+- Apply the same row-pointer/requant separation to the SM120 D512 linear-V
+  branch without changing the public V layout.
+- Reuse the PV register-transpose shape: each 8-lane subgroup loads one
+  dim-contiguous 32-bit row word per token row, shuffles those rows into one
+  token-contiguous operand word per output dim, then writes the partition-derived
+  `pv_sB` word.
+- For linear-V only, add an out-of-line helper that consumes the transposed row
+  words, original scale bytes, and already-written PV scale byte, then performs
+  the fp32 dequant/requant and packs the final token-contiguous word.
+
+Why this variant:
+
+- The full-tile staging option exceeded D512 smem budget and was reverted.
+- The previous all-inline register-transpose attempt hit a D512 ptxas wall.
+  Keeping the conversion chain behind a helper boundary is the cheapest way to
+  test the same data-movement structure without expanding the producer lambda.
+
+Done criteria:
+
+- D512 tests compile and pass with no tolerance changes.
+- D512 reference cell `q=512 kv=65536 group=8 softcap=30 v_layout=linear`
+  improves materially from the current `1742.628 ms`.
+- If D512 passes and improves, port the same linear branch to D128/D256.
+
+## 2026-05-03 22:45 CDT - Linear-V Register Transpose Slice Result
+
+Implementation:
+
+- Added an out-of-line `sm120_nvfp4_linear_v_requant_transposed_word()` helper
+  for the linear-V path. The helper shuffles the eight row-major V words across
+  an 8-lane subgroup, applies original-scale dequant plus PV-scale requant in
+  registers, and returns one token-contiguous 32-bit operand word.
+- Replaced the `kPvLayoutV=false` V data producer in D128/D256/D512 with the
+  same 8-lane register-transpose store shape used by the PV path.
+- Removed the now-dead V-stage CUTLASS `partition_D` setup from the paged V
+  producer. The QK/K producer and MMA consumer partitioning remain unchanged.
+
+Validation:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py`
+  `tests/utils/test_fp4_kv_quantization.py` -> `62 passed in 192.54s`.
+- No tolerance changes.
+- All benchmarked outputs reported `output_finite=true`.
+- One full-suite run before the final D128/D256 port hit the known
+  sequence-dependent scratch-poison PV-layout test once; the same test passed in
+  isolation immediately after. The post-port combined validation run passed.
+
+Bench deltas:
+
+| cell | PV mean ms | linear mean ms | linear/PV |
+| --- | ---: | ---: | ---: |
+| D512 g8 q512 kv65536 softcap30 | 285.166 | 482.927 | 1.69x |
+| D256 g6 q512 kv65536 softcap30 | 104.157 | 204.414 | 1.96x |
+| D256 g2 q512 kv8192 swa1024 softcap30 | 25.905 | 50.839 | 1.96x |
+| D128 g8 q512 kv8192 | 21.113 | 35.867 | 1.70x |
+
+Reference delta:
+
+- D512 linear reference improved from `1742.628 ms` to `482.927 ms`, a `3.61x`
+  speedup.
+- D512 PV stayed effectively stable versus the prior PV transpose result
+  (`283.155 ms` -> `285.166 ms`).
+
+Characterization:
+
+- The linear-V production path is no longer dominated by per-codepoint
+  block-table/data loads. Its remaining cost is now roughly `1.7x-2.0x` over
+  PV-layout V on the focused cells, which is plausible for the irreducible
+  fp32 dequant/requant work.
+- The paged path is still not benchmark-inline with dense. At the D512 reference
+  cell, paged-PV is still roughly `37x` dense and paged-linear roughly `63x`
+  dense. This means the remaining large gap is not "linear reblock only"; it is
+  the current paged producer/scheduler scaffold doing too little parallel V/scale
+  work per CTA.
+
+Post-cleanup validation note:
+
+- After removing the dead V-stage CUTLASS partition setup, reran
+  `tests/attention/test_nvfp4_kv_head_dim_512.py`
+  `tests/utils/test_fp4_kv_quantization.py` -> `62 passed in 317.43s`.

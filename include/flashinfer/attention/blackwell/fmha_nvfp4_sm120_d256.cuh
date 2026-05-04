@@ -914,13 +914,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto stage_paged_v_tile = [&](int kv_tile, int effective_out_group_idx,
                                 int write_stage) {
     if constexpr (kUsePagedKv) {
-      auto smem_tiled_copy_B = cute::make_tiled_copy_B(
-          typename CutlassCollectiveMainloopK128Stage2::SmemCopyAtomB{},
-          pv_tiled_mma);
-      auto cB = cute::make_identity_tensor(
-          cute::make_shape(cute::Int<kOutputTileN>{},
-                           cute::Int<kCutlassTileN>{}, cute::Int<1>{}));
-
       auto pv_scale_pair_for = [&](int token_group_start, int dim0,
                                    uint8_t& sf0, uint8_t& sf1) {
         float max_abs0 = 0.0f;
@@ -1078,130 +1071,79 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           *reinterpret_cast<uint32_t*>(dst0) = packed_word;
         }
       } else {
-        for (int copy_thread = lane_idx;
-             copy_thread < CutlassCollectiveMainloopK128Stage2::ThreadCount;
-             copy_thread += cutlass::NumThreadsPerWarp) {
-        auto smem_thr_copy_B =
-            smem_tiled_copy_B.get_thread_slice(copy_thread);
-        auto tBsB_prod = smem_thr_copy_B.partition_D(pv_sB);
-        auto tBcB_prod = smem_thr_copy_B.partition_D(cB);
-        auto K_BLOCK_MAX_PROD = cute::size<2>(tBsB_prod);
-        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
-                       [&](auto k_block) {
-          auto dst = tBsB_prod(_, _, k_block, write_stage);
-          auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
-          // V producer emits one 32-bit word for each 8-nibble partition.
-          if (int(cute::size(dst)) % 8 != 0) {
+        if (paged_kv_params.v_stride_dim3 != 1 ||
+            paged_kv_params.v_scale_stride_dim3 != 1) {
+          asm volatile("trap;\n");
+        }
+        constexpr int kTransposeTokens = 8;
+        constexpr int kTransposeDims = 8;
+        constexpr int kTokenGroups = kCutlassTileN / kTransposeTokens;
+        constexpr int kDimGroups = kOutputTileN / kTransposeDims;
+        constexpr int kWarpTransposeGroups = cutlass::NumThreadsPerWarp / 8;
+        const int subgroup = lane_idx >> 3;
+        const int subgroup_lane = lane_idx & 7;
+        const unsigned subgroup_mask =
+            static_cast<unsigned>(0xffu << (subgroup * 8));
+        for (int tile = subgroup; tile < kTokenGroups * kDimGroups;
+             tile += kWarpTransposeGroups) {
+          const int token_group = tile % kTokenGroups;
+          const int dim_group = tile / kTokenGroups;
+          const int local_k0 = token_group * kTransposeTokens;
+          const int local_dim0 = dim_group * kTransposeDims;
+          const int token =
+              kv_tile * kCutlassTileN + local_k0 + subgroup_lane;
+          const int dim_base =
+              effective_out_group_idx * kOutputTileN + local_dim0;
+          const int scale_col = dim_base >> 4;
+          uint32_t row_word = 0;
+          uint32_t row_scale_byte = 0x38u;
+          if (token < kv_len_tokens) {
+            const int logical_page =
+                token / paged_kv_params.page_size;
+            const int page_offset =
+                token - logical_page * paged_kv_params.page_size;
+            const int physical_page =
+                paged_kv_params.block_table[logical_page];
+            const int64_t data_page_base =
+                sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
+                                                    physical_page);
+            const int64_t scale_page_base =
+                sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
+                                                     physical_page);
+            row_word = sm120_nvfp4_paged_v_word_from_page_base(
+                paged_kv_params, data_page_base, page_offset, dim_base >> 1);
+            row_scale_byte = sm120_nvfp4_paged_v_linear_scale_from_page_base(
+                paged_kv_params, scale_page_base, page_offset, scale_col);
+          }
+
+          const int local_col = local_dim0 + subgroup_lane;
+          const int dim = effective_out_group_idx * kOutputTileN + local_col;
+          const int token0 = kv_tile * kCutlassTileN + local_k0;
+          const uint8_t output_scale =
+              token0 < kv_len_tokens ? pv_scale_for(token0, dim) : 0x38;
+          const uint32_t packed_word =
+              sm120_nvfp4_linear_v_requant_transposed_word(
+                  row_word, row_scale_byte, output_scale, subgroup_mask,
+                  subgroup * 8, subgroup_lane);
+
+          auto ref0 = pv_sB(local_col, local_k0, write_stage);
+          uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+          if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
             asm volatile("trap;\n");
           }
-          for (int i = 0; i < int(cute::size(dst)); i += 8) {
-            auto coord0 = coord_tensor(i);
-            const int col0 = int(cute::get<0>(coord0));
-            const int k0 = int(cute::get<1>(coord0));
-            auto ref0 = dst(i);
-            uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
-            // V producer writes each packed word through a 4-byte smem store.
-            if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            auto ref = pv_sB(local_col, local_k0 + j, write_stage);
+            auto pair_ref =
+                pv_sB(local_col, local_k0 + (j ^ 1), write_stage);
+            uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
+            uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
+            if (dst_byte < dst0 || dst_byte >= dst0 + 4 ||
+                pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
               asm volatile("trap;\n");
             }
-            uint32_t packed_word = 0;
-            if constexpr (!kPvLayoutV) {
-              // Linear-V reblock groups 8 contiguous token positions per word.
-              if ((k0 & 7) != 0) {
-                asm volatile("trap;\n");
-              }
-              const int token0 = kv_tile * kCutlassTileN + k0;
-              const int logical_page =
-                  token0 / paged_kv_params.page_size;
-              const int page_offset0 =
-                  token0 - logical_page * paged_kv_params.page_size;
-              const bool has_valid_token = token0 < kv_len_tokens;
-              const int physical_page =
-                  has_valid_token ? paged_kv_params.block_table[logical_page] : 0;
-              const int64_t data_page_base =
-                  sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
-                                                      physical_page);
-              const int64_t scale_page_base =
-                  sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
-                                                       physical_page);
-              float vals[8];
-#pragma unroll 1
-              for (int j = 0; j < 8; ++j) {
-                auto coord = coord_tensor(i + j);
-                auto ref = dst(i + j);
-                auto pair_ref = dst(i + (j ^ 1));
-                uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
-                uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
-                const int col = int(cute::get<0>(coord));
-                const int k = int(cute::get<1>(coord));
-                // Linear-V reblock requires byte-pair colocation within the word.
-                if (col != col0 || k != k0 + j ||
-                    dst_byte < dst0 || dst_byte >= dst0 + 4 ||
-                    pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
-                  asm volatile("trap;\n");
-                }
-                const int token = kv_tile * kCutlassTileN + k;
-                const int dim = effective_out_group_idx * kOutputTileN + col;
-                const uint8_t scale =
-                    token < kv_len_tokens ? pv_scale_for(token, dim) : 0x38;
-                const float pv_scale = fmaxf(e4m3_byte_to_fp32(scale), 1.0e-8f);
-                const float value =
-                    token < kv_len_tokens
-                        ? sm120_nvfp4_paged_v_linear_value_from_page_base(
-                              paged_kv_params, data_page_base, scale_page_base,
-                              page_offset0 + j, dim)
-                        : 0.0f;
-                vals[j] = value / pv_scale;
-              }
-              packed_word =
-                  static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[0], vals[1])) |
-                  (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[2], vals[3])) << 8) |
-                  (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[4], vals[5])) << 16) |
-                  (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[6], vals[7])) << 24);
-            } else {
-              const int token0 = kv_tile * kCutlassTileN + k0;
-              const int logical_page =
-                  token0 / paged_kv_params.page_size;
-              const int page_offset0 =
-                  token0 - logical_page * paged_kv_params.page_size;
-              const bool has_valid_token = token0 < kv_len_tokens;
-              const int physical_page =
-                  has_valid_token ? paged_kv_params.block_table[logical_page] : 0;
-              const int64_t data_page_base =
-                  sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
-                                                      physical_page);
-#pragma unroll 1
-              for (int j = 0; j < 8; ++j) {
-                auto coord = coord_tensor(i + j);
-                auto ref = dst(i + j);
-                auto pair_ref = dst(i + (j ^ 1));
-                uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
-                uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
-                const int col = int(cute::get<0>(coord));
-                const int k = int(cute::get<1>(coord));
-                // PV-layout V must map each logical pair to one physical byte.
-                if (col != col0 || k != k0 + j ||
-                    dst_byte < dst0 || dst_byte >= dst0 + 4 ||
-                    pair_byte != dst_byte) {
-                  asm volatile("trap;\n");
-                }
-                const int token = kv_tile * kCutlassTileN + k;
-                const int dim = effective_out_group_idx * kOutputTileN + col;
-                const uint8_t code =
-                    token < kv_len_tokens
-                        ? sm120_nvfp4_paged_v_code_from_page_base(
-                              paged_kv_params, data_page_base,
-                              page_offset0 + j, dim)
-                        : 0;
-                const int byte_offset = int(dst_byte - dst0);
-                const int nibble_shift = (k & 1) ? 4 : 0;
-                packed_word |= static_cast<uint32_t>(code)
-                               << (8 * byte_offset + nibble_shift);
-              }
-            }
-            *reinterpret_cast<uint32_t*>(dst0) = packed_word;
           }
-        });
+          *reinterpret_cast<uint32_t*>(dst0) = packed_word;
         }
       }
 

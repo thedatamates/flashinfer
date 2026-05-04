@@ -283,6 +283,40 @@ __device__ __forceinline__ uint32_t sm120_nvfp4_paged_v_word_from_page_base(
   return *reinterpret_cast<const uint32_t*>(params.v_pages + src);
 }
 
+static __device__ __noinline__ uint32_t sm120_nvfp4_linear_v_requant_transposed_word(
+    uint32_t row_word,
+    uint32_t row_scale_byte,
+    uint8_t output_scale_byte,
+    unsigned subgroup_mask,
+    int subgroup_base_lane,
+    int dim_lane) {
+  const float output_scale =
+      fmaxf(e4m3_byte_to_fp32(output_scale_byte), 1.0e-8f);
+  const float inv_output_scale = 1.0f / output_scale;
+  float vals[8];
+#pragma unroll
+  for (int src_lane = 0; src_lane < 8; ++src_lane) {
+    const uint32_t peer_word =
+        __shfl_sync(subgroup_mask, row_word, subgroup_base_lane + src_lane);
+    const uint32_t peer_scale_byte =
+        __shfl_sync(subgroup_mask, row_scale_byte,
+                    subgroup_base_lane + src_lane) & 0xffu;
+    const uint8_t code =
+        static_cast<uint8_t>((peer_word >> (4 * dim_lane)) & 0x0fu);
+    vals[src_lane] =
+        e2m1_code_to_fp32(code) *
+        e4m3_byte_to_fp32(static_cast<uint8_t>(peer_scale_byte)) *
+        inv_output_scale;
+  }
+  return static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[0], vals[1])) |
+         (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[2], vals[3]))
+          << 8) |
+         (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[4], vals[5]))
+          << 16) |
+         (static_cast<uint32_t>(fp32_pair_to_e2m1_byte(vals[6], vals[7]))
+          << 24);
+}
+
 __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_code_from_page_base(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int64_t page_base,
