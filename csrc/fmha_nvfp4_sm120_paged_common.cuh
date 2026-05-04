@@ -406,7 +406,9 @@ static void RunDenseImpl(
                        kv_len_tokens, output_group_span, causal,
                        sliding_window, logits_soft_cap);
   ffi::CUDADeviceGuard device_guard(q_packed.device().device_id);
-  const cudaStream_t stream = stream_from_handle(stream_handle);
+  const cudaStream_t stream =
+      stream_handle != 0 ? stream_from_handle(stream_handle)
+                         : get_stream(q_packed.device());
   const int q_rows = static_cast<int>(q_packed.size(0));
   const int kv_len = static_cast<int>(k_packed.size(0));
   const int head_dim = kernel.head_dim;
@@ -504,7 +506,9 @@ static void RunPagedBatchImpl(
   CHECK_DIM(1, kv_lens);
 
   ffi::CUDADeviceGuard device_guard(q_packed.device().device_id);
-  const cudaStream_t stream = stream_from_handle(stream_handle);
+  const cudaStream_t stream =
+      stream_handle != 0 ? stream_from_handle(stream_handle)
+                         : get_stream(q_packed.device());
 
   const int64_t batch = block_tables.size(0);
   TVM_FFI_ICHECK_EQ(qo_indptr.size(0), batch + 1);
@@ -742,7 +746,9 @@ static void RunPagedBatchBf16QImpl(
   TVM_FFI_ICHECK_EQ(q_scales.size(1), head_dim / 16);
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
-  const cudaStream_t stream = stream_from_handle(stream_handle);
+  const cudaStream_t stream =
+      stream_handle != 0 ? stream_from_handle(stream_handle)
+                         : get_stream(q.device());
   const int64_t batch = block_tables.size(0);
   const int64_t num_kv_heads =
       kv_layout_hnd ? k_pages.size(1) : k_pages.size(2);

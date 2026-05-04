@@ -2933,3 +2933,132 @@ Post-cleanup validation note:
 - After removing the dead V-stage CUTLASS partition setup, reran
   `tests/attention/test_nvfp4_kv_head_dim_512.py`
   `tests/utils/test_fp4_kv_quantization.py` -> `62 passed in 317.43s`.
+
+## 2026-05-03 23:24 CDT - BF16-Q Split-Repetition Fix Plan
+
+What I am about to do:
+
+- Stop quantizing BF16 Q inside every split CTA for paged wrapper runs.
+- `csrc/fmha_nvfp4_sm120_paged_common.cuh` already has
+  `QuantizeQToPaddedBatchKernel`, which writes `q_packed_scratch` and
+  `q_scales_scratch` once for the padded batch.
+- `RunPagedBatchBf16QImpl` currently bypasses that prepass and passes
+  `q_bf16` into the stage kernel, so `stage_bf16_q_tile()` runs per q-tile and
+  per split.
+
+Why:
+
+- The D512 split-KV sweep showed that smaller splits improve paged producer
+  parallelism, but the curve bottoms out around `83 ms` PV / `125 ms` linear.
+  Repeating Q quantization once per split is a direct cost floor when
+  `num_splits` becomes large.
+- Moving Q quantization into a single C++ prepass stays within the existing FFI
+  call and public API. It is not a Python-side workaround and it reuses an
+  existing production helper in the same TU.
+
+Done criteria:
+
+- D512/D256/D128 validation passes with no tolerance changes.
+- D512 reference split sweep improves at small split sizes without regressing
+  the larger split baseline.
+
+## 2026-05-03 23:43 CDT - BF16-Q Split-Repetition Fix Result
+
+Attempted:
+
+- Added a single-call `QuantizeQToPaddedBatchKernel` prepass inside
+  `RunPagedBatchBf16QImpl`, then invoked the existing stage kernel with
+  `q_bf16=nullptr` so the Q operand would be loaded from the packed scratch via
+  the existing TMA path.
+- Extended the prepass to support the same 2D/3D Q strides as the fused in-stage
+  quantizer.
+- Limited the prepass to compact Q after the non-contiguous scratch-poison test
+  exposed mismatch in the general strided path.
+
+Observed:
+
+- Compact multi-KV D512 targeted test passed.
+- The scratch-poison test remained non-bitexact even when the non-compact Q case
+  fell back to the existing in-stage quantizer. Mismatch scale after fallback was
+  back in the previous intermittent range (`~1e-4` to `~5e-4`), but it failed in
+  isolation, so this slice is not safe to keep.
+
+Decision:
+
+- Reverted the BF16-Q prepass code. No committed code from this attempt remains.
+- The useful finding is that repeated Q quantization is probably a real small-
+  split cost, but moving to the TMA packed-Q path changes enough execution state
+  to reopen the scratch-residue nondeterminism. Do not reattempt this as a local
+  prepass until the scratch-poison class is fully closed.
+
+## 2026-05-04 00:03 CDT - Stream Handle Zero Fix Plan
+
+Finding:
+
+- The scratch-poison test fails without a synchronization after the PyTorch
+  `fill_()` calls, but becomes bit-exact when synchronizing after the fills.
+- Poisoning any single scratch buffer with a synchronization after the fill is
+  also bit-exact. That rules out one uncovered scratch buffer and points to
+  stream ordering between PyTorch ops and the SM120 FFI call.
+- In this environment, `torch.cuda.current_stream(device).cuda_stream` can be
+  `0`. The SM120 FFI path interpreted `stream_handle=0` as literal null stream
+  via `stream_from_handle(0)`.
+- Existing FlashInfer stream-handle APIs use the idiom
+  `stream_handle != 0 ? stream_from_handle(stream_handle) : get_stream(device)`.
+  Example: `csrc/fp4_kv_quantization.cu` and
+  `csrc/fp4_kv_dequantization.cu`.
+
+What I am changing:
+
+- Apply that same fallback in `csrc/fmha_nvfp4_sm120_paged_common.cuh` for
+  dense, paged, and paged-BF16-Q entry points.
+
+Done criteria:
+
+- Scratch-poison test passes without adding Python-side synchronization.
+- Combined nvfp4 validation passes.
+
+## 2026-05-04 00:42 CDT - Stream Handle / O-Smem Coverage Result
+
+Implementation:
+
+- Applied the canonical FlashInfer stream-handle fallback in
+  `csrc/fmha_nvfp4_sm120_paged_common.cuh` for dense, paged, and paged-BF16-Q:
+  nonzero handles are used directly, while zero handles fall back to
+  `get_stream(device)`.
+- Removed the Python-side private-stream experiment. The wrapper does not add
+  synchronization or stream bridging.
+- Added a no-init `ZeroSmemTile` handle for `smem_epilogue_o` in D128/D256/D512
+  and fills it at the final PV->O handoff before
+  `sm120_stage_o_fragment_to_epilogue_smem()`.
+
+Diagnosis:
+
+- The stream fallback is the idiomatic FFI fix, but it did not by itself close
+  the intermittent scratch-poison failure.
+- The remaining drift localized to another shared-memory coverage gap:
+  `smem_epilogue_o` aliases the logits region, the MMA O-fragment store writes
+  only its partition-covered subset, and the epilogue warp copies the full
+  `kCutlassTileM x output_tile_n` region to global memory.
+- Filling O smem to zero at the consumer-prep boundary closes the class without
+  relying on global scratch initialization, Python sync, or tolerance changes.
+
+Validation:
+
+- Scratch-poison test loop:
+  `tests/attention/test_nvfp4_kv_head_dim_512.py::test_sm120_nvfp4_wrapper_scratch_poison_does_not_affect_output_sm12x`
+  -> `5/5` passes.
+- `tests/attention/test_nvfp4_kv_head_dim_512.py`
+  `tests/utils/test_fp4_kv_quantization.py` -> `62 passed in 271.78s`.
+- Focused D512 reference bench, `q=512 kv=65536 group=8 softcap=30
+  split_kv_len=32768`: paged-PV `285.301 ms`, paged-linear `482.657 ms`.
+  This is unchanged versus the pre-fix reference range, so the O-smem fill did
+  not create a measurable regression at this cell.
+
+Implication:
+
+- This is the fourth confirmed smem coverage site in the SM120 kernel family
+  (Q operand, logits, probability/O aliasing, and now epilogue O smem). Any
+  future producer rewrite should treat CoveredSmemTile-style full-extent
+  initialization as mandatory at every aliased consumer boundary, not as an
+  optional debug cleanup.

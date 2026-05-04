@@ -1720,6 +1720,8 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
     NegInfSmemTile<__nv_bfloat16, decltype(logits_layout)> logits0_covered(
         CoveredSmemNoInit{}, smem_logits0, logits_layout);
     auto logits0 = logits0_covered.tensor();
+    ZeroSmemTile<__nv_bfloat16, decltype(logits_layout)> epilogue_o_covered(
+        CoveredSmemNoInit{}, smem_epilogue_o, logits_layout);
     auto score_is_valid = [&](int row, int col, int tile) {
       const int global_q_row = local_q_tile * kCutlassTileM + row;
       if (global_q_row >= q_len * group_size) {
@@ -1961,6 +1963,10 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
       pv_release_v_stage();
       if (final_tile) {
         const float pv_base_scale = pv_alpha / kProbGlobalScale;
+        epilogue_o_covered.fill_and_sync(
+            CutlassCollectiveMainloopK128Stage2::ThreadCount,
+            cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier,
+            pv_mma_thread_idx);
         sm120_stage_o_fragment_to_epilogue_smem(
             pv_accum, pv_tCcC, smem_epilogue_o, storage.global_l,
             pv_base_scale, split_m == nullptr);
