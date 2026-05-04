@@ -6011,3 +6011,70 @@ Next profiling target:
 - The new top linear-specific long-scoreboard source is the cached V transpose:
   - `d256.cuh:1173` / `__shfl_sync(subgroup_mask, row_word, ...)`.
 - The next source change should remove or reduce that shuffle chain, not continue optimizing global scale-cache loads.
+
+## 2026-05-04 15:31 CDT - D256 Cached Linear V No-Shuffle Target
+
+Finding:
+
+- The current D256 paged-linear lineinfo profile after the dead-scale cleanup points at the cached V transpose as the next source-level target.
+- The top linear-specific long-scoreboard source is `d256.cuh:1173`, the `__shfl_sync(subgroup_mask, row_word, ...)` loop that transposes one cached dim-contiguous row word per lane into token-contiguous operand words.
+- The cached D256 linear-V data layout is already coalesced by packed-word column: `sm120_nvfp4_linear_v_data_cache_word<true>` maps `(word_col, token)` so lanes can read adjacent dim words for one token without walking the public paged layout.
+- The PV-layout V producer in the same D256 file already uses that ownership pattern: each 8-lane subgroup owns one token group and one 64-dim block, loads dim-contiguous row words, accumulates eight token-contiguous packed words in registers, and writes the existing CUTLASS operand smem layout.
+
+Implementation target:
+
+- Add a D256-only cached-linear path under `kLinearVCacheCoalesced && v_linear_data_cache != nullptr`.
+- Reuse the PV producer's no-shuffle ownership: one 8-lane subgroup handles an `8 token x 64 dim` block, each lane loads one adjacent 32-bit cached word per token, and each lane writes eight packed operand words.
+- Keep the uncached linear fallback unchanged. D128/D512 keep the current path because their linear-V cache layout is not the D256 coalesced layout.
+- Do not change public tensor shapes, layout names, FFI signatures, or tolerances.
+
+Validation:
+
+- Run focused D256 correctness first.
+- Benchmark the D256 Qwen reference cell against the current source baseline: paged-linear `2.944 ms` mean.
+- If timing improves, run lineinfo NCU and verify the `__shfl_sync` source drops from the dominant long-scoreboard attribution.
+
+Decision:
+
+- Keep if correctness passes and the reference benchmark improves materially.
+- Revert the code if it hits a ptxas wall, regresses runtime, or shifts the bottleneck without reducing wall time.
+
+## 2026-05-04 15:39 CDT - D256 Cached Linear V No-Shuffle Result
+
+Finding:
+
+- Implemented the D256 cached-linear no-shuffle path under `v_linear_data_cache != nullptr`.
+- The path reuses the PV producer ownership pattern: each 8-lane subgroup loads dim-contiguous cached words for one token at a time, accumulates eight token-contiguous packed operand words in registers, and writes the existing `pv_sB` CUTLASS operand layout.
+- Focused D256 correctness passed:
+  - `3 passed in 44.28s`.
+- Full NVFP4 head-dim test file passed:
+  - `36 passed in 45.28s`.
+
+Benchmark:
+
+- D256 Qwen reference cell `q=512 kv=65536 g=6 split=3072`, paged-linear:
+  - Before no-shuffle: `2.944 ms` mean.
+  - After no-shuffle: `2.696 ms` mean (`2.688 ms` min, `2.708 ms` max).
+  - Delta: `8.4%` faster.
+- D256 Qwen reference cell, paged-PV sanity:
+  - `2.117 ms` mean (`2.105 ms` min, `2.130 ms` max), unchanged versus the current PV baseline.
+
+NCU:
+
+- Lineinfo NCU confirms the targeted `__shfl_sync(subgroup_mask, row_word, ...)` source is no longer the top long-scoreboard attribution.
+- Executed instructions dropped from `944,134,647` to `847,479,774`.
+- Local spill requests changed from `21,121,296` to `20,943,744`, effectively flat.
+- New source-level costs after the change:
+  - Top global excessive-sector source is now the cached data word load at `paged_kv.cuh:137`, `50,331,648` excessive sectors.
+  - Top shared excessive-wavefront source is now the operand store at `d256.cuh:1189`, `11,010,048` excessive wavefronts.
+  - Top long-scoreboard sources shifted to scale/stats/MMA-side lines (`d256.cuh:2234`, `d256.cuh:921`, `d256.cuh:2183`, `d256.cuh:1023`), not the removed V transpose shuffle.
+
+Decision:
+
+- Keep the D256 cached-linear no-shuffle path.
+- This is high-risk producer restructuring, but NCU identified the source and wall time improved without correctness fallout.
+
+Next profiling target:
+
+- The remaining D256 linear gap is no longer the cached V shuffle.
+- Next NCU-driven candidates are the cached data word global-sector pattern and the operand smem store wavefront excess; do not optimize them by inspection without checking whether source-level reductions move wall time.
