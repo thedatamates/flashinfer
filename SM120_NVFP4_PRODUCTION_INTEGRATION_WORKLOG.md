@@ -4486,3 +4486,19 @@ Output copy removal result:
   - D512 q=512 kv=65536 paged-PV: `7.320 ms`.
 - Test status: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 1.00s`).
 - Conclusion: keep the cleanup because it removes an unnecessary output allocation/copy path, but the performance gain is tiny. The fixed floor is inside the FFI launch sequence and kernel shape, not the final Python `copy_`.
+
+BF16-Q fused stage activation plan:
+- While comparing FA2 and SM120 launcher structure, I found `paged_run_bf16_q` still launches `QuantizeQToPaddedBatchKernel` before the stage kernel.
+- The SM120 kernel body already has a paged BF16-Q path: `paged_kv_params.q_bf16 != nullptr` routes `load_q_chunk` to `stage_bf16_q_tile`, which quantizes Q directly into Q smem for the current K chunk.
+- What I am about to change: remove the standalone `QuantizeQToPaddedBatchKernel` launch from `RunPagedBatchBf16QImpl` and pass `q_bf16` plus Q strides through `RunPagedBatchImpl`. Keep the FFI signature unchanged and keep the existing scratch tensors for ABI/check compatibility.
+- Decision criterion: keep the change if the focused NVFP4 test passes and small-work benches improve or at least do not regress. This removes one whole GPU launch from every wrapper call and matches the intended fused-Q architecture.
+
+BF16-Q fused stage activation result:
+- The change compiled and produced finite outputs, but it regressed every smoke cell tested:
+  - D256 q=1 kv=262144 paged-PV: `0.619 ms` versus prior `~0.601 ms`.
+  - D256 sliding q=512 kv=1024 paged-PV: `0.260 ms` versus prior `~0.236 ms`.
+  - D256 q=512 kv=65536 paged-PV: `2.636 ms` versus prior `~2.55 ms`.
+  - D512 q=1 kv=262144 paged-PV: `1.292 ms` versus prior `~1.25 ms`.
+  - D512 q=512 kv=65536 paged-PV: `7.354 ms` versus prior `~7.32 ms`.
+- Diagnosis: the in-stage BF16-Q path is not a free replacement for the standalone Q quantize launch. The stage path restages Q for each K chunk, while `QuantizeQToPaddedBatchKernel` quantizes/pads once per wrapper call and the stage kernel reuses scratch across splits. Removing a launch added repeated per-chunk Q work.
+- Decision: reverted the code change. Keep the standalone Q quantize launch for now. The remaining gap is not caused by this launch.
