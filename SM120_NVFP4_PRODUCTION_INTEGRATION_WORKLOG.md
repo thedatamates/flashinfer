@@ -5888,3 +5888,70 @@ Next profiling target:
   - `37,408,368` local spill requests.
   - Barrier/sleeping waits around CUTLASS pipeline handoff.
 - The next useful experiment needs to target shared-memory operand access or register pressure, not global scale-cache coalescing.
+
+## 2026-05-04 15:06 CDT - Current D256 Linear Scheduler Comparison
+
+Finding:
+
+- Ran dense and paged-linear scheduler/occupancy NCU passes on the current D256 Qwen reference cell.
+- Dense stage:
+  - Duration under NCU: `1.25 ms`.
+  - Block shape: `512` threads, `50.18 KiB` dynamic smem.
+  - Registers/thread: `128`.
+  - Active warps/scheduler: `2.54`.
+  - Eligible warps/scheduler: `0.36`.
+  - Waves/SM: `5.62`.
+- Paged-linear stage:
+  - Duration under NCU: `2.62 ms`.
+  - Block shape: `640` threads, `92.16 KiB` dynamic smem.
+  - Registers/thread: `96`.
+  - Active warps/scheduler: `4.92`.
+  - Eligible warps/scheduler: `0.36`.
+  - Waves/SM: `2.81`.
+- Dense source/memory comparison:
+  - Dense has more shared-wavefront excess (`21,136,896`) than paged-linear (`18,974,208`), so shared wavefronts alone are not the paged-only limiter.
+  - Paged-linear has much higher local spill requests (`37,408,368`) than dense (`14,411,520`), much higher barrier stalls, and almost twice the executed instructions.
+
+Implementation target:
+
+- Re-test the D256 no-SWA paged `LOAD_WARPS` knob on the current linear-cache baseline.
+- The current source default is `TILE_M=128`, `LOAD_WARPS=11`; previous sweeps were PV-focused and predate the D256 linear cache-layout state.
+- Use isolated JIT workspaces and `FLASHINFER_EXTRA_CUDAFLAGS=-DFLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=N` so this is a compile-time diagnostic, not a source edit.
+
+Validation:
+
+- Benchmark D256 Qwen paged-linear at `LOAD_WARPS={7,9,11}` against the committed default.
+- Keep source unchanged unless a different load-warp count materially improves current linear timing.
+
+Decision criteria:
+
+- If a lower load-warp count improves current linear timing without hurting PV materially, update the D256 paged TU default and run focused correctness.
+- If the curve is flat or worse, keep the default and move to a source-level producer/spill target.
+
+## 2026-05-04 15:13 CDT - D256 Current Linear Load-Warp Sweep Result
+
+Finding:
+
+- Re-ran the D256 no-SWA paged load-warp sweep on the current linear-cache baseline using isolated JIT workspaces.
+- D256 Qwen paged-linear `q=512 kv=65536 g=6 split=3072`:
+  - `LOAD_WARPS=7`: `2.960 ms` mean.
+  - `LOAD_WARPS=9`: `3.200 ms` mean.
+  - `LOAD_WARPS=11`: `3.102 ms` mean.
+  - Committed pre-change default (`LOAD_WARPS=11`) baseline: about `3.105 ms`.
+- D256 Qwen paged-PV with `LOAD_WARPS=7`:
+  - `2.115 ms` mean, versus the current committed PV baseline around `2.227 ms`.
+- Normal source build after changing the D256 no-SWA paged default to `LOAD_WARPS=7` reproduces the win:
+  - Paged-linear: `2.981 ms` mean (`2.950 ms` min, `3.075 ms` max).
+  - Paged-PV: `2.115 ms` mean (`2.101 ms` min, `2.136 ms` max).
+- Focused D256 correctness passed after the source change:
+  - `3 passed in 44.33s`.
+
+Decision:
+
+- Keep the D256 no-SWA paged default at `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=7`.
+- The earlier `LOAD_WARPS=11` result was stale relative to the current producer/cache baseline. With the current stage, extra load warps increase blocked active warps without increasing eligible warp issue.
+
+Next profiling target:
+
+- Run full NVFP4 correctness before committing.
+- Re-profile the kept `LOAD_WARPS=7` stage if the next source target needs attribution; prior NCU scheduler data for `LOAD_WARPS=11` is no longer the active geometry.
