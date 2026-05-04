@@ -2330,7 +2330,11 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
   if (workspace_bytes < required_workspace_bytes) {
     return cudaErrorInvalidValue;
   }
-  constexpr size_t kWorkspaceClearBytes = 32 * 1024 * 1024;
+#ifndef FLASHINFER_SM120_NVFP4_WORKSPACE_CLEAR_BYTES
+#define FLASHINFER_SM120_NVFP4_WORKSPACE_CLEAR_BYTES (32 * 1024 * 1024)
+#endif
+  constexpr size_t kWorkspaceClearBytes =
+      FLASHINFER_SM120_NVFP4_WORKSPACE_CLEAR_BYTES;
   const size_t workspace_clear_bytes =
       workspace_bytes < kWorkspaceClearBytes ? workspace_bytes
                                              : kWorkspaceClearBytes;

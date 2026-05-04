@@ -4581,3 +4581,14 @@ D256 real geometry sweep result:
 - `TILE_M=128`, `LOAD_WARPS=13`: mean `2.972 ms`.
 - `TILE_M=64`, `LOAD_WARPS=11`: mean `3.080 ms`.
 - Decision: the committed D256 no-SWA geometry is the best tested configuration. The earlier invalidated flat result is superseded by this entry. No geometry default change.
+
+Workspace clear-size diagnostic plan:
+- The raw dense/paged launcher zeros a bounded workspace prefix before initializing CUTLASS argument objects. The current bound is hardcoded as `32 * 1024 * 1024` bytes.
+- This zero is paid on every wrapper call and every dense benchmark call, independent of q/kv work. It is therefore a plausible contributor to the q=1 and Gemma sliding fixed floor.
+- What I am about to change: make the clear-size cap overrideable with a compile-time macro while preserving the default 32 MiB behavior.
+- Decision criterion: keep the overrideability patch if the focused NVFP4 test passes under default settings. Then benchmark 32 MiB versus smaller caps on small-work and long-prefill cells. Only reduce the production default if tests remain deterministic and the timing gain is material.
+
+Workspace clear-size overrideability result:
+- Added `FLASHINFER_SM120_NVFP4_WORKSPACE_CLEAR_BYTES` to D128/D256/D512 raw launchers. The default remains `(32 * 1024 * 1024)` bytes.
+- Test status with default settings: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 297.69s`).
+- Next: run isolated JIT diagnostics with smaller clear caps on D256 q=1, D256 Gemma sliding, and D256 Qwen long-prefill.
