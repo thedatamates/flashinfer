@@ -4154,3 +4154,31 @@ Grid-constant params and D256 load-warp result:
 - K vectorization trials: 128-bit and 64-bit cp.async variants both failed with CUDA `misaligned address`; reverted. The CUTLASS D256 B partition only supports the current 32-bit K cp.async granularity safely.
 - Cross-checks after this patch: D512 Gemma q=512 kv=65536 g=8 measured paged-PV `9.025 ms`, paged-linear `9.403 ms`; D128 q=512 kv=65536 g=4 measured dense `0.945 ms`, paged-PV `1.931 ms`, paged-linear `2.203 ms`.
 - Test status: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed, `36 passed in 389.98s`.
+
+## 2026-05-04 08:45 CDT - Post-D256 Load-Warp Re-Localization Plan
+
+What I am about to do:
+- After the D256 paged-only 10-load-warp commit, the reference cell is still `3.65 ms` PV versus `1.32 ms` dense, so the residual gap remains inside the stage kernel.
+- The previous producer isolation numbers are stale because the load-warp schedule changed. I will repeat the timing-only K/V producer disable checks on D256 q=512 kv=65536 g=6 paged-PV to find the remaining dominant producer cost.
+- The diagnostic patches will be reverted immediately after measurement. Decision criterion: target the largest remaining isolated component, not wrapper code or split scheduling.
+
+Post-D256 load-warp re-localization result:
+- Current D256 q=512 kv=65536 g=6 paged-PV after the committed load-warp patch: `3.651 ms`.
+- V producer body disabled, barriers/schedule retained: `3.111 ms`. Remaining V producer cost is about `0.54 ms`.
+- K producer body disabled, barriers/schedule retained: `2.628 ms`. Remaining K staging/manual QK pipeline cost is about `1.02 ms`.
+- The load-warp patch reduced the previous K-isolated cost from about `1.66 ms` to about `1.02 ms`; K remains the largest producer-side residual. V is now secondary. Next target is K staging/pipeline overhead, not split scheduling or wrapper code.
+
+K data versus K scale/pipeline split:
+- D256 q=512 kv=65536 g=6 paged-PV with only K data cp.async loop disabled and K scale/pipeline retained: `2.828 ms`.
+- Current D256 paged-PV is `3.651 ms`; K data copy/staging accounts for about `0.82 ms`.
+- Full K producer disabled was `2.628 ms`; K scale plus K pipeline handoff accounts for about `0.20 ms`.
+- Conclusion: K data staging remains the largest residual inside K. The failed 64/128-bit cp.async attempts show the existing CUTLASS B partition does not guarantee >4B smem alignment, so the next K path must change the mapping/partition strategy rather than widening the current copy loop.
+
+Direct-index K producer result:
+- Replaced the paged K producer's `make_tiled_copy_B(...).partition_D(...)` traversal with a direct `(row, k0)` mapping into `qk_sB(row, k0, write_stage)` and the existing 32-bit `cp_async::pred_load_32b`.
+- This keeps the safe 4-byte transfer granularity after the 64/128-bit alignment failures, but removes the per-copy-thread CUTE partition setup and partition tensor walk from the hot producer path.
+- Reference cells after the change:
+  - D128 q=512 kv=65536 g=4 paged-PV `1.566 ms`, paged-linear `1.833 ms`.
+  - D256 q=512 kv=65536 g=6 paged-PV `3.088 ms`, paged-linear `3.659 ms`.
+  - D512 q=512 kv=65536 g=8 paged-PV `7.651 ms`, paged-linear `8.149 ms`.
+- Previous same-session references before direct-index K were roughly D128 PV `1.931 ms`, D256 PV `3.651 ms`, D512 PV `9.025 ms`; this is a broad K producer win across all head dims.

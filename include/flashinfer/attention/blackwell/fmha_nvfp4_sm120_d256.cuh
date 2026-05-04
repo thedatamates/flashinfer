@@ -841,69 +841,40 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       static_assert(decltype(cute::size<1>(QkSmemLayoutB{}))::value >= 8,
                     "Paged K producer requires an inner-K layout extent large "
                     "enough for byte-packed FP4 writes.");
-      auto smem_tiled_copy_B = cute::make_tiled_copy_B(
-          typename CutlassCollectiveMainloop::SmemCopyAtomB{}, qk_tiled_mma);
-      auto cB = cute::make_identity_tensor(
-          cute::make_shape(cute::Int<kCutlassTileN>{},
-                           cute::Int<kCutlassTileK>{}, cute::Int<1>{}));
-
-      for (int copy_thread = load_thread_idx;
-           copy_thread < CutlassCollectiveMainloop::ThreadCount;
-           copy_thread += kSm120Nvfp4FmhaLoadThreadCount) {
-        auto smem_thr_copy_B =
-            smem_tiled_copy_B.get_thread_slice(copy_thread);
-        auto tBsB_prod = smem_thr_copy_B.partition_D(qk_sB);
-        auto tBcB_prod = smem_thr_copy_B.partition_D(cB);
-        auto K_BLOCK_MAX_PROD = cute::size<2>(tBsB_prod);
-        cute::for_each(cute::make_int_sequence<K_BLOCK_MAX_PROD>{},
-                       [&](auto k_block) {
-          auto dst = tBsB_prod(_, _, k_block, write_stage);
-          auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+      constexpr int kPackedWordsPerKRow = kCutlassTileK / 8;
+      constexpr int kPackedKWords = kCutlassTileN * kPackedWordsPerKRow;
+      for (int word_idx = load_thread_idx; word_idx < kPackedKWords;
+           word_idx += kSm120Nvfp4FmhaLoadThreadCount) {
+        const int row0 = word_idx / kPackedWordsPerKRow;
+        const int k0 = (word_idx - row0 * kPackedWordsPerKRow) * 8;
+        auto ref0 = qk_sB(row0, k0, write_stage);
+        uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
 #if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
-          // K producer emits one 32-bit word for each 8-nibble partition.
-          if (int(cute::size(dst)) % 8 != 0) {
+        // K producer requires 4-byte-aligned contiguous dim stride.
+        if (((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) ||
+            ((k0 & 7) != 0) || paged_kv_params.k_stride_dim3 != 1) {
+          SM120_NVFP4_DEBUG_TRAP();
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          auto ref = qk_sB(row0, k0 + j, write_stage);
+          uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
+          if (dst_byte != dst0 + (j >> 1)) {
             SM120_NVFP4_DEBUG_TRAP();
           }
+        }
 #endif
-          for (int i = 0; i < int(cute::size(dst)); i += 8) {
-            auto coord0 = coord_tensor(i);
-            const int row0 = int(cute::get<0>(coord0));
-            const int k0 = int(cute::get<1>(coord0));
-            auto ref0 = dst(i);
-            uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
-#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
-            // K producer requires 4-byte-aligned contiguous dim stride.
-            if (((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) ||
-                ((k0 & 7) != 0) || paged_kv_params.k_stride_dim3 != 1) {
-              SM120_NVFP4_DEBUG_TRAP();
-            }
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-              auto coord = coord_tensor(i + j);
-              auto ref = dst(i + j);
-              uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
-              const int row = int(cute::get<0>(coord));
-              const int k = int(cute::get<1>(coord));
-              // CUTLASS B smem must colocate the 8 logical K nibbles in 4 bytes.
-              if (row != row0 || k != k0 + j ||
-                  dst_byte != dst0 + (j >> 1)) {
-                SM120_NVFP4_DEBUG_TRAP();
-              }
-            }
-#endif
-            const int token = kv_tile * kCutlassTileN + row0;
-            const int dim0 = k_outer * kCutlassTileK + k0;
-            const bool in_bounds = token < kv_len_tokens;
-            const uint32_t* src =
-                in_bounds
-                    ? sm120_nvfp4_paged_k_word_ptr(
-                          paged_kv_params, effective_block_table,
-                          effective_kv_head, token, dim0)
-                    : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
-            cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
-                reinterpret_cast<uint32_t*>(dst0), src, in_bounds);
-          }
-        });
+        const int token = kv_tile * kCutlassTileN + row0;
+        const int dim0 = k_outer * kCutlassTileK + k0;
+        const bool in_bounds = token < kv_len_tokens;
+        const uint32_t* src =
+            in_bounds
+                ? sm120_nvfp4_paged_k_word_ptr(
+                      paged_kv_params, effective_block_table,
+                      effective_kv_head, token, dim0)
+                : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
+        cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
+            reinterpret_cast<uint32_t*>(dst0), src, in_bounds);
       }
 
       cp_async::commit_group();
