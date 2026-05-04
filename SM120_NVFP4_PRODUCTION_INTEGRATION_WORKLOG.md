@@ -2489,3 +2489,148 @@ Result:
   not SM120-owned cleanup targets and were left untouched.
 
 No code changes were needed for P6.
+
+## 2026-05-03 20:18 CDT - P7 Silent Failure Audit Result
+
+What I checked:
+
+- `flashinfer/fmha_nvfp4_sm120.py` wrapper scratch lifecycle and run path.
+- `csrc/fmha_nvfp4_sm120_paged_common.cuh` Q padding/quantize, output copy,
+  and split-KV combine kernels.
+- `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d{128,256,512}.cuh`
+  workspace initialization before CUTLASS persistent scheduler setup.
+
+Result:
+
+- The old wrapper-side defensive calls are no longer present. There is no
+  `_partial.zero_()`, `_split_m.fill_()`, `_split_l.zero_()`,
+  `_out_scratch.zero_()`, or `_out_group.zero_()` in the wrapper run path.
+- The BF16-Q production path passes `q_bf16` into the fused kernel and does not
+  consume stale `_q_packed_scratch` / `_q_scales_scratch` contents. The
+  prepacked-Q path still uses `CopyQToPaddedBatchKernel`, which writes full
+  packed/scales scratch rows and zero-fills padded rows.
+- `Sm120Nvfp4SplitKvCombineBatchKernel` recomputes `num_splits` from the
+  actual `kv_lens[batch_idx]` and only reads `split < num_splits`; it does not
+  reduce over the max-splits allocation. Padded Q rows return before reading
+  partial/split buffers.
+- `CopyPaddedBatchOutKernel` returns on padded Q rows and copies only valid rows
+  from `_out_scratch` into `_out_group`; the wrapper then copies the valid
+  flattened `_out_group` extent into the caller output.
+- The remaining `cudaMemsetAsync(workspace_base, ...)` in each D-specialization
+  is not a wrapper band-aid. It is a bounded clear before CUTLASS persistent
+  scheduler workspace initialization, with an explicit in-code contract:
+  persistent scheduler state is sensitive to allocator residue. That clear is
+  load-bearing and was kept.
+
+Conclusion:
+
+- No wrapper defensive zero/fill calls remain to remove.
+- The global scratch regions that feed consumer kernels are either fully written
+  for their consumed extent or are read using the actual split/Q-row bounds.
+- The only kept zeroing is kernel-internal CUTLASS workspace initialization; it
+  should stay unless CUTLASS workspace construction changes to own its full
+  initialized extent directly.
+
+## 2026-05-03 20:22 CDT - P8 Tolerance Review Result
+
+What I tested:
+
+- Tightened the remaining SM120-owned `2e-3` checks in
+  `tests/attention/test_nvfp4_kv_head_dim_512.py` to `1e-3` locally:
+  multi-KV vs per-KV-head, standard-wrapper vs direct-wrapper, and
+  linear-V vs PV-layout mean difference.
+- Ran the affected tests on GPU 2:
+  `test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x`,
+  `test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x`,
+  and `test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x`.
+
+Result:
+
+- `1e-3` failed immediately and was reverted before committing.
+- D512 multi-KV vs per-head failed with max diff `0.001129150390625`.
+- D512 standard-wrapper vs direct-wrapper failed with max diff
+  `0.00146484375`.
+- D128 linear-V vs PV-layout failed the tightened mean threshold with mean diff
+  approximately `0.0011`.
+- The existing thresholds then passed the affected test set five consecutive
+  times: `9 passed` in each run.
+- Final full NVFP4 suite at HEAD:
+  `tests/attention/test_nvfp4_kv_head_dim_512.py`
+  `tests/utils/test_fp4_kv_quantization.py` -> `62 passed in 1.64s`.
+
+Conclusion:
+
+- The remaining `2e-3` checks are currently load-bearing. They are not hiding
+  gross nondeterminism; the observed failures are sparse BF16/FP4 rounding-level
+  deltas just above `1e-3`.
+- No tolerance was loosened.
+- No tolerance was tightened because the required five-run stability criterion
+  failed at `1e-3`.
+
+## 2026-05-03 20:24 CDT - Pass Complete
+
+Start state for this pass:
+
+- Paged K cp.async was already shipped on D128/D256/D512.
+- Path A linear-V page lookup hoist was already shipped at commit `581e6f4`.
+- Reference cell `D=512 g=8 q=512 kv=65536 softcap=30`:
+  dense `7.69 ms`, paged-PV `899 ms`, paged-linear `1883 ms`.
+
+End state:
+
+| point | dense ms | paged-PV ms | paged-linear ms |
+| --- | ---: | ---: | ---: |
+| start | 7.69 | 899 | 1883 |
+| after K-scale hoist | 7.69 | 819.818 | 1805.615 |
+| after Q-quant hoist | 7.682 | 816.084 | 1741.079 |
+| after PV V-scale hoist | 7.682 | 717.799 | 1740.975 |
+
+Total reference-cell delta:
+
+- Paged-PV improved from `899 ms` to `717.799 ms` (`20.2%` faster).
+- Paged-linear improved from `1883 ms` to `1740.975 ms` (`7.5%` faster).
+- Dense stayed healthy and effectively unchanged.
+
+What landed:
+
+- K-scale block-table/page-base hoist across D128/D256/D512.
+- Q BF16 quantization row-base/scale-group hoist across D128/D256/D512.
+- PV-layout V-scale staging hoist across D128/D256/D512.
+- Production-cell matrix reports for Qwen full, Gemma sliding, and Gemma global.
+- Cleanup audit confirming debug graveyard and stale owned bench scripts are
+  already absent.
+- Silent-failure audit confirming wrapper defensive zero/fill calls are gone and
+  remaining workspace clearing is kernel-internal CUTLASS state initialization.
+- Tolerance review confirming the remaining `2e-3` checks are load-bearing and
+  the full NVFP4 suite passes at HEAD.
+
+Walls / pivots:
+
+- P1 register-transpose V data path was attempted and reverted after the D512
+  linear spec hit a ptxas compile wall. The blocked shape is documented in the
+  P1 section.
+- Direct cp.async into the V operand remains blocked by public V layout
+  mismatch: public `linear`/`pv` V tensors are dim-contiguous in gmem, while the
+  CUTLASS PV operand wants token-contiguous packed words.
+- Full-tile V staging remains blocked by the 99 KiB shared-memory budget on
+  D512. Do not retry that design without changing the memory model.
+
+Current cost floor:
+
+- On the production matrix, paged-PV is still roughly `90x-153x` slower than
+  direct dense, and paged-linear is another `2.39x-2.49x` slower than paged-PV.
+- The dominant cost is no longer K scale, Q quantization, or PV V-scale scalar
+  staging. The dominant cost is the paged V data path and split-KV/page-traversal
+  launch geometry.
+- The stock-vLLM production path is `linear` V. That path still pays the
+  in-kernel reblock cost and remains about `2.4x-2.5x` slower than PV-layout V.
+
+What unlocks further wins:
+
+- A new V data structural design that avoids per-codepoint/page traversal
+  without full-tile smem staging and without exploding D512 compile time.
+- A vLLM-side PV writer or cache-production path that stores PV-layout V once,
+  eliminating the linear-V reblock tax from the hot attention call.
+- A schedule restructure for paged split-KV / page traversal so the paged path
+  stops launching/executing work at two orders of magnitude above the dense
+  kernel for the same logical attention cell.
