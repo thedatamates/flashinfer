@@ -4748,3 +4748,51 @@ Next profiling target:
 
 - Use NCU on the committed stage kernel to classify the remaining gap before making another producer change.
 - The next decision should be based on stage-kernel counters: memory/LSU stalls, barrier stalls, shared-memory conflicts, issue eligibility, and executed instruction mix.
+
+## 2026-05-04 11:53 CDT - NCU Barrier-Stall Target
+
+Finding:
+
+- Nsight Systems still attributes the D256 Qwen paged-PV reference cell to the stage kernel, not wrapper, Q quantize, or split-combine.
+- NCU on `D=256 g=6 q=512 kv=65536 paged-PV split=3072` shows `2.467 ms` stage time.
+- Matching dense NCU for the same logical cell shows `1.248 ms` stage time.
+- Paged executes `1.91x` as many dynamic instructions as dense (`1.101B` vs `0.576B`) and has `1.98x` NCU time.
+- DRAM is not the primary wall: paged DRAM throughput is only `11.6%` of peak. The largest paged-vs-dense stall delta is synchronization: `Stall Barrier 5.22` vs dense `0.27`, and `Stall Long Scoreboard 2.61` vs dense `0.26`.
+
+Implementation target:
+
+- Reduce paged load-group synchronization in the Q/K/V producer handoff without changing pipeline semantics.
+- Current paged Q/K/V chunks use three load-group barriers around each producer action: after leader acquire, before leader completion, and after leader completion.
+- The post-complete barrier is redundant with the next chunk's pre-stage barrier: non-leader load threads cannot enter the next staging body until the leader reaches the next acquire-and-sync point.
+- Remove only the post-complete load-group barrier after `complete_manual_tma_pipeline_stage(...)` in D128, D256, and D512 paged Q/K/V load paths.
+
+Validation:
+
+- Run focused NVFP4 correctness first, because this touches producer-consumer ordering.
+- Re-bench D256 Qwen paged-PV and D512 Gemma global paged-PV reference cells.
+- Re-run NCU on D256 Qwen paged-PV if benchmarks move, and verify barrier stalls decrease without introducing memory-scoreboard regressions.
+
+Decision criteria:
+
+- Keep if correctness passes and stage time or barrier counters improve.
+- Revert if any intermittent correctness appears or the barrier counters fail to move.
+
+## 2026-05-04 12:02 CDT - Load-Group Barrier Reduction Result
+
+Finding:
+
+- The post-complete load-group barrier removal was correctness-safe in the focused suite: `36 passed in 288.76s`.
+- It did not improve reference-cell timing.
+- D256 Qwen paged-PV `q=512 kv=65536 g=6 split=3072` measured `2.446 ms` mean, worse than the committed page-cache baseline around `2.403 ms`.
+- D512 Gemma global paged-PV `q=512 kv=65536 g=8 softcap=30 split=3072` measured `7.098 ms` mean, worse than the committed page-cache baseline around `6.98 ms`.
+
+Decision:
+
+- Reverted the barrier-removal code change.
+- Kept the NCU finding: paged barrier stalls are high relative to dense, but the removed post-complete barrier was not the profitable barrier to remove.
+- The post-complete barrier likely helps keep the load warpgroup aligned with the leader's producer state; removing it shifts cost into later synchronization or scoreboard stalls rather than reducing total stage time.
+
+Next profiling target:
+
+- Use NCU source/SASS attribution or narrower metrics to locate where `Stall Barrier` and `Stall Long Scoreboard` are charged.
+- Do not remove more barriers by inspection. The next barrier change must identify the specific stall location first.
