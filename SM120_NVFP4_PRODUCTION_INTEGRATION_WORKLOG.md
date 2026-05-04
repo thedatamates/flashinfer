@@ -6130,3 +6130,31 @@ Next profiling target:
 
 - Move from single-cell producer work to production-cell benchmark coverage.
 - Use the focused production matrix to find remaining outlier cells. The next high-risk kernel change should be driven by an outlier cell's NCU profile, not by the now-acceptable D512 reference cell.
+
+## 2026-05-04 15:44 CDT - Focused Production Matrix Target
+
+Finding:
+
+- Current single-cell references show D256 and D512 are no longer in the stale 100x paged-failure state.
+- Single-cell tuning is now lower value than finding actual production outlier cells across q/kv regimes.
+- Existing reports under `reports/prod_*_20260504` predate the latest D256 cached-linear no-shuffle producer and are not current for this pass.
+
+Benchmark target:
+
+- Run focused production reports with fresh prefixes:
+  - `reports/prod_qwen_full_d256_g6_post_noshfl_20260504`
+  - `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_post_noshfl_20260504`
+  - `reports/prod_gemma_global_d512_g8_softcap30_post_noshfl_20260504`
+- For each prefix, collect `sm120_fused` variants for paged-linear, paged-PV, and dense, plus `nvfp4_fa2`, `fp8_fa2`, and `bf16_fa2` reference rows.
+- Use `--cells` rather than a q/kv Cartesian product where the deployment cell list is explicit.
+
+Validation:
+
+- Use GPU 2 via `CUDA_VISIBLE_DEVICES=2`; pass bench `--device 0`.
+- Use `--warmup 2 --repeat 5 --timeout-sec 1800`.
+- Do not change source during the benchmark run.
+
+Decision:
+
+- If a report shows a large paged-linear or paged-PV outlier versus dense, profile that exact cell with NCU before changing code.
+- If the matrix is broadly in line, move to cleanup/tolerance work instead of speculative producer rewrites.
