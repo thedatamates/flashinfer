@@ -4502,3 +4502,35 @@ BF16-Q fused stage activation result:
   - D512 q=512 kv=65536 paged-PV: `7.354 ms` versus prior `~7.32 ms`.
 - Diagnosis: the in-stage BF16-Q path is not a free replacement for the standalone Q quantize launch. The stage path restages Q for each K chunk, while `QuantizeQToPaddedBatchKernel` quantizes/pads once per wrapper call and the stage kernel reuses scratch across splits. Removing a launch added repeated per-chunk Q work.
 - Decision: reverted the code change. Keep the standalone Q quantize launch for now. The remaining gap is not caused by this launch.
+
+FA2 versus SM120 paged V producer architecture audit:
+- `include/flashinfer/attention/prefill.cuh::make_v_frag_fp4` does the same V-side FP4 dequant/requant shape as SM120 linear-V: for each output register it reads 8 V values through `get_v_value(...)`, divides by the output scale, clamps to E2M1 range, then packs with `mma::float8_to_e2m1x8(...)`.
+- `include/flashinfer/attention/prefill.cuh::page_produce_kv` loads FP4 KV data through `smem.load_64b_async<fill_mode>(...)` for FP4. `include/flashinfer/permuted_smem.cuh::load_64b_async` implements this as `cp_async::pred_load_128b_from_64b(...)`, so FA2 moves 8 bytes of packed FP4 per async issue.
+- SM120 D128/D256/D512 K producer uses `cp_async::pred_load_32b(...)` into CUTLASS operand smem. The paged V producer uses 8-lane subgroup transposes (`__shfl_sync` loop over 8 source lanes) and then writes a 32-bit packed word into the CUTLASS PV B operand smem. The 64-bit/128-bit cp.async trials failed earlier because the CUTLASS operand smem partition only gives the producer a reliable 4-byte alignment/contiguity invariant.
+- The fp32 reblock arithmetic is shared with FA2, so it is not the reason SM120 paged trails FA2 on D256 PV/linear cells. The structural differences that remain are:
+  - FA2 uses a custom permuted smem layout that accepts 64-bit FP4 cp.async from dim-contiguous gmem.
+  - FA2 constructs the V MMA register fragment from that smem layout via explicit coordinate reads (`make_v_frag_fp4`), not by requiring gmem to be staged directly in CUTLASS operand layout.
+  - SM120 stages directly into CUTLASS collective PV B operand smem, which forces 32-bit producer granularity and the token/dim transpose before the MMA copy path can consume it.
+- Consequence: staying on the current CUTLASS operand-smem producer likely has a structural floor around the observed 1.5-2x dense overhead on D256 paged. Closing the remaining gap to FA2's paged overhead requires lifting the V operand staging constraint, not more block-table or scale-loop hoisting.
+- Narrowest architectural option: replace only the paged V operand construction path. Keep the QK/softmax/P staging and MMA instruction shape, but stage V into an FA2-like 64-bit-cp.async-friendly smem layout and construct the PV B register fragment explicitly from that layout before `cute::gemm`. This is still substantial because it bypasses `pv_sB`/`pv_sSFB` plus `pv_smem_tiled_copy_B`/`partition_fragment_SFB` for the paged V path, but it does not require rewriting the whole QK/softmax pipeline.
+
+PV B-fragment direct-fill feasibility probe:
+- What I am about to test: whether the SM120 CUTE PV path can construct a B register fragment from a logical `(N,K)` layout and obtain matching `(n,k)` coordinates through `pv_thread_mma.partition_B(make_identity_tensor(...))`, without first staging through `pv_sB`.
+- Reference pattern: `cute/algorithm/cooperative_gemm.hpp` constructs coordinate tensors with `Tensor cB = make_identity_tensor(shape(sB));` and partitions them with `Tensor tCcB = thr_mma.partition_B(cB);`, then uses the coordinates to predicate/copy the B fragment.
+- Reference pattern: `include/flashinfer/attention/decode_mla_cute_sm80.cuh` constructs a B register fragment directly from a synthetic layout with `thr_mma_output.partition_fragment_B(make_tensor((DTypeKV*)0x0, layout_ckv_trans_no_stage));`.
+- Decision criterion: if a D256 compile-only probe can create the direct B fragment, recast it as `uint32_t`, apply `fp4_shift_B`, and build the coordinate tensor with the same shape, then a narrow paged-V replacement can stay inside `cute::gemm`. If that does not compile, the remaining path requires lower-level MMA-fragment construction like FA2 rather than a producer-only rewrite.
+
+PV B-fragment direct-fill feasibility result:
+- Compile result: D256 can construct a synthetic logical PV B register fragment, recast it as 32-bit packed FP4 words, apply `fp4_shift_B`, and build the matching coordinate tensor with `pv_thread_mma.partition_B(make_identity_tensor(...))`.
+- Host layout probe result for one D256 PV thread slice:
+  - `frag size=256`, `word size=32`, `coord size=256`.
+  - Each packed word maps to one fixed local output column and eight consecutive K/token positions, e.g. word 0 maps `(0,0)..(0,7)`, word 1 maps `(0,32)..(0,39)`, word 2 maps `(8,0)..(8,7)`.
+  - Existing `v_smem_B` storage is exactly large enough for a compact row-major two-stage V tile: `16384` bytes = `128 tokens * 64 packed columns * 2 stages`.
+- Correctness probe: replacing the D256 PV B smem-copy path with direct register-fragment fill from paged gmem passed `tests/attention/test_nvfp4_kv_head_dim_512.py -q` (`36 passed`). The mapping is correct.
+- Performance probes:
+  - Direct-from-gmem register fill, while still staging SFB scales, produced `1.54 ms` on D256 q=128 kv=4096 paged-PV. This is slower than the current staged path.
+  - Compact row-major V smem with 64-bit cp.async and scalar smem-to-register reconstruction produced `0.615 ms` on D256 q=128 kv=4096 paged-PV and `4.13 ms` on D256 q=512 kv=65536 paged-PV.
+  - Current staged baseline for the long D256 q=512 kv=65536 paged-PV cell is around `2.55 ms`, so the compact-smem scalar reconstruction path is a regression.
+- Implementation detail found during the probe: 64-bit cp.async into compact smem works when the destination address is computed from the raw shared-memory base. Taking the destination through a CUTE `uint8_t` smem tensor reference caused an illegal memory access. The failure was address plumbing, not gmem stride alignment.
+- Diagnosis: the narrow CUTE-fragment route removes the producer shfl transpose, but it also replaces CUTLASS's optimized smem-to-register copy/`ldmatrix` path with scalar smem reads to assemble each packed B register. That scalar reconstruction cost is larger than the producer-side savings.
+- Decision: reverted the experiment. Do not propagate the direct CUTE fill or compact-smem scalar reconstruction to D128/D512. Closing the remaining gap to FA2 requires preserving FA2's second half too: a custom smem layout plus an efficient ldmatrix/fragment-construction path, or a lower-level FA2-like MMA path. A producer-only rewrite inside the current `cute::gemm` consumer is not enough.
