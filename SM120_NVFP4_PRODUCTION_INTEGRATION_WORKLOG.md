@@ -3812,3 +3812,45 @@ Implementation result:
 - Conclusion: this is a valid workload-specialized structural win using an
   existing spec axis. It does not solve the whole paged-vs-dense gap, but it
   removes one obvious source of excess D256 full-attention producer CTA count.
+
+Split schedule recheck after D256 non-SWA `M=128`:
+- Qwen-full `q=512 kv=65536 g=6`, PV:
+  - split `2048`: `4.72 ms`
+  - split `4096`: `5.29 ms`
+  - split `8192`: `6.75 ms`
+  - split `16384`: `6.73 ms`
+  - split `32768`: `13.41 ms`
+  - split `65536`: `26.76 ms`
+- Qwen-full `q=512 kv=65536 g=6`, linear:
+  - split `2048`: `5.56 ms`
+  - split `4096`: `6.29 ms`
+  - split `8192`: `7.87 ms`
+  - split `16384`: `7.88 ms`
+  - split `32768`: `14.90 ms`
+  - split `65536`: `29.26 ms`
+- Conclusion: after larger D256 non-SWA Q tile, the best split for this
+  production cell moved from `4096` to `2048`. The broad gap is still the paged
+  stage kernel, but the wrapper/bench auto-scheduler should not keep using the
+  old split geometry.
+
+Refined split sweep below `2048`:
+- Qwen-full `q=512 kv=65536 g=6`, PV:
+  - split `128`: `9.83 ms`
+  - split `256`: `6.84 ms`
+  - split `512`: `5.31 ms`
+  - split `1024`: `4.68 ms`
+  - split `1536`: `4.41 ms`
+  - split `2048`: `4.75 ms`
+  - split `3072`: `4.24 ms`
+- Qwen-full `q=512 kv=65536 g=6`, linear:
+  - split `128`: `10.60 ms`
+  - split `256`: `7.61 ms`
+  - split `512`: `6.17 ms`
+  - split `1024`: `5.54 ms`
+  - split `1536`: `5.27 ms`
+  - split `2048`: `5.58 ms`
+  - split `3072`: `5.07 ms`
+- Conclusion: `3072` is the best tested split for this cell in both PV and
+  linear. Very small splits lose to split/combine overhead, while large splits
+  lose to per-stage work. The optimum is a real schedule balance, not a
+  monotonic "more splits" answer.
