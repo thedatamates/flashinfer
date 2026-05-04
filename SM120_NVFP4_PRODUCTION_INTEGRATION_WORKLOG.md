@@ -4072,3 +4072,85 @@ D256 output-group-span check:
 - D256 Qwen q=512 kv=65536 PV with production span=2: `~4.17 ms` after Q-prequant change.
 - Same cell with paged kernel compiled for output_group_span=1: `6.94 ms` PV, `7.72 ms` linear.
 - Decision: reverted. Span=2 is the correct D256 paged schedule among these two.
+
+## 2026-05-04 06:55 CDT - Paged V Block-Table Broadcast Plan
+
+What I am about to do:
+- Current D128/D256/D512 V data staging uses an 8-lane subgroup transpose. For each `(token_group, dim_group)`, all eight lanes are within one 16-token page, but every lane independently reads `block_table[logical_page]`, and every dim group repeats that lookup.
+- The in-tree fmha_v2 paged loader pattern performs the block-table walk before the row load: `physical_page = paged_kv_global_block_offsets_[page_idx]`, then derives the row pointer and loads from that row.
+- I will adopt the same granularity inside the existing SM120 subgroup transpose: lane 0 of each 8-lane subgroup reads the physical page for the shared logical page, broadcasts it with `__shfl_sync`, and all lanes derive page bases from the broadcast value.
+- The same hoist applies to the PV-layout V-scale loop, where `token_group` determines one page and `col` changes. Decision criterion: tests stay green and D256/D512 paged-PV reference cells improve without changing public layouts, FFI signatures, split scheduling, or tolerances.
+
+Measured result:
+- D256 Qwen-full q=512 kv=65536 paged-PV after the broadcast/cache patch: `4.179 ms`, effectively unchanged from the current `~4.17 ms`.
+- D512 Gemma-global q=512 kv=65536 paged-PV after the patch: `9.694 ms`, effectively unchanged from the current `~9.67 ms`.
+- Decision: reverted the local patch. The repeated V `block_table` lookup is not the load-bearing paged-PV gap at these production prefill cells.
+
+## 2026-05-04 07:10 CDT - D256 Paged TileM Check
+
+What I am about to do:
+- D256 dense compiles with `kCutlassTileM=64`; D256 paged no-SWA currently defines `FLASHINFER_SM120_NVFP4_D256_TILE_M=128` in `csrc/fmha_nvfp4_sm120_d256_paged.cu`.
+- At Qwen q=512 kv=65536, the auto split makes tileM=128/split=3072 and tileM=64/split=6144 produce the same total CTA count. This makes it a direct per-CTA tile-shape check rather than a launch-count check.
+- I will temporarily remove the paged-only tileM=128 override and benchmark the D256 Qwen paged-PV reference cell. Decision criterion: keep only if it materially improves paged-PV without breaking correctness; otherwise revert.
+
+Measured result:
+- D256 Qwen-full q=512 kv=65536 paged-PV with paged tileM=64: `6.202 ms`.
+- Current paged tileM=128 reference: `~4.17 ms`.
+- Decision: reverted. The D256 paged-only tileM=128 override is beneficial, not the source of the paged-vs-dense gap.
+
+## 2026-05-04 07:25 CDT - D256 Stage Producer Isolation Plan
+
+What I am about to do:
+- Dense and paged use the same stage kernel skeleton, but dense stage averages `1.304 ms` while paged stage averages `4.223 ms` at Qwen D256 q=512 kv=65536.
+- Wrapper/Q-quant/combine/copy/CTA count/tileM/output span are ruled out. The remaining candidates are paged K/V producer cost, producer/consumer overlap loss from manual completion, and paged-specific control flow inside the stage body.
+- I will temporarily disable the paged V producer body while leaving the V pipeline barrier and PV MMA schedule intact. Existing `CoveredSmemTile` initialization leaves V operand smem zero and scale smem one, so this is a timing-only diagnostic, not a correctness run.
+- Decision criterion: if runtime collapses, V producer is load-bearing; if not, the gap is in QK/K producer or the common online softmax/PV schedule under paged pipeline semantics. The patch will be reverted after measurement.
+
+V producer diagnostic result:
+- D256 Qwen-full q=512 kv=65536 paged-PV with V producer body disabled: `3.514 ms`.
+- Current paged-PV reference: `~4.17 ms`.
+- V producer accounts for roughly `0.65 ms`, real but not the `~2.9 ms` stage gap versus dense. Reverted the diagnostic patch.
+
+Next isolation:
+- I will temporarily disable the paged K producer body while leaving the K pipeline barrier and QK/PV schedule intact. K operand smem is already zero-filled and scale smem one-filled, so this is timing-only.
+- Decision criterion: a large drop localizes the gap to K staging/manual QK pipeline; a small drop means the remaining gap is online softmax/PV schedule or other paged control flow.
+
+K producer diagnostic result:
+- D256 Qwen-full q=512 kv=65536 paged-PV with K producer body disabled: `2.510 ms`.
+- Current paged-PV reference: `~4.17 ms`.
+- K staging/manual QK pipeline accounts for roughly `1.66 ms`, the largest isolated producer cost. Reverted the diagnostic patch.
+- Combined with the V diagnostic, producer work explains about `2.3 ms` of the `~2.9 ms` dense-to-paged stage gap. The next real optimization target is K staging/vectorization/overlap, not wrapper logic.
+
+K scale isolation:
+- I will temporarily skip only the K scale staging loop while keeping the 32-bit K data cp.async path and the pipeline barriers intact.
+- K scale smem is initialized to UE4M3 one by `CoveredSmemTile`, so this is timing-only but safe for isolating whether the scalar scale loop is the expensive half of K staging.
+
+K scale diagnostic result:
+- D256 Qwen-full q=512 kv=65536 paged-PV with K scale staging skipped: `3.909 ms`.
+- Current paged-PV reference: `~4.17 ms`.
+- K scales account for only about `0.26 ms`; most of the `1.66 ms` K producer cost is K data staging and/or the manual K pipeline handoff. Reverted the diagnostic patch.
+
+## 2026-05-04 07:50 CDT - Paged Stage Stack Footprint Fix Plan
+
+What I found:
+- `cuobjdump --dump-resource-usage` on the current D256 Qwen module reports:
+  - Paged stage specialization: `REG:128 STACK:1104`.
+  - Dense stage specialization in the same module: `REG:128 STACK:200`.
+- Wrapper, Q quantize, combine, CTA count, tileM, output span, K scale loop, and V producer are already localized. The extra paged stack footprint is now a concrete structural difference inside the stage kernel.
+
+What I am about to do:
+- The stage kernel takes `Sm120Nvfp4PagedKvLoadParams` by value and mutates `paged_kv_params.kv_head` and `paged_kv_params.block_table` for all-head and varlen dispatch. That prevents treating the large params struct as grid-constant and can force a per-thread local copy/stack state.
+- I will make the kernel parameter grid-constant/const and move the mutable fields into explicit lightweight runtime overrides: `effective_kv_head` and `effective_block_table`.
+- I will add small helper accessors in `paged_kv.cuh` that take `(params, block_table, kv_head)` for the hot K/V data and scale paths, then update D128/D256/D512 producers to use the overrides. Decision criterion: D256 paged stage stack shrinks and the Qwen reference cell improves while tests remain green.
+
+Grid-constant params and D256 load-warp result:
+- Made `Sm120Nvfp4PagedKvLoadParams` a `CUTLASS_GRID_CONSTANT const` stage-kernel parameter and replaced the in-kernel `kv_head` / `block_table` mutations with lightweight `effective_kv_head` and `effective_block_table` locals.
+- Added helper overloads in `fmha_nvfp4_sm120_paged_kv.cuh` that take explicit `(block_table, kv_head)` so D128/D256/D512 producers do not need a mutable params copy.
+- Resource result on D256 Qwen softcap PV module: paged stage stack dropped from `STACK:1104` to `STACK:792`; dense remained `STACK:200`. Runtime effect by itself was flat: D256 q=512 kv=65536 g=6 paged-PV `4.156 ms`.
+- Moved D256 hot-loop producer validation behind `FLASHINFER_SM120_NVFP4_DEBUG_TRAPS`. Runtime effect was small but positive: D256 paged-PV `4.140 ms`.
+- Tested split scheduling on D256 q=512 kv=65536 g=6 paged-PV: split 1024 `4.427 ms`, 1536 `4.323 ms`, 2048 `4.652 ms`, 3072 `4.141 ms`, 4096 `5.365 ms`, 6144 `5.366 ms`, 8192 `7.038 ms`, 12288 `5.403 ms`, 65536 `28.602 ms`. Auto split `3072` is still the best tested point; the remaining gap is not a too-many-splits issue.
+- D256 paged-only load-warp override: dense TU keeps default 7 load warps, paged no-SWA TU defines `FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS=10` alongside the existing paged-only tileM=128 override. Measured D256 q=512 kv=65536 g=6: dense `1.323 ms`, paged-PV `3.651 ms`, paged-linear `4.159 ms`.
+- Load-warp sweep: 8 load warps gave D256 paged-PV `3.773 ms` and linear `4.178 ms`; 10 load warps gave PV `3.646 ms` and linear `4.154 ms`; 12 load warps regressed to PV `3.933 ms` and linear `4.528 ms`. Decision: keep 10 for D256 paged no-SWA.
+- K vectorization trials: 128-bit and 64-bit cp.async variants both failed with CUDA `misaligned address`; reverted. The CUTLASS D256 B partition only supports the current 32-bit K cp.async granularity safely.
+- Cross-checks after this patch: D512 Gemma q=512 kv=65536 g=8 measured paged-PV `9.025 ms`, paged-linear `9.403 ms`; D128 q=512 kv=65536 g=4 measured dense `0.945 ms`, paged-PV `1.931 ms`, paged-linear `2.203 ms`.
+- Test status: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed, `36 passed in 389.98s`.

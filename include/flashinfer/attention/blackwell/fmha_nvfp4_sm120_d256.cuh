@@ -64,7 +64,11 @@ constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsCorrection = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsMma = 8;
-constexpr int kSm120Nvfp4FmhaNumWarpsLoad = 7;
+#ifndef FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS
+#define FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS 7
+#endif
+constexpr int kSm120Nvfp4FmhaNumWarpsLoad =
+    FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS;
 constexpr int kSm120Nvfp4FmhaNumWarpsEpilogue = 1;
 constexpr int kSm120Nvfp4FmhaWarpSoftmax0Begin = 0;
 constexpr int kSm120Nvfp4FmhaWarpSoftmax1Begin =
@@ -512,7 +516,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     float* split_l,
     int split_stats_stride_rows,
     int split_output_stride_elems,
-    Sm120Nvfp4PagedKvLoadParams paged_kv_params,
+    CUTLASS_GRID_CONSTANT Sm120Nvfp4PagedKvLoadParams const paged_kv_params,
     const int32_t* qo_indptr,
     const int32_t* kv_lens,
     int batch_size,
@@ -533,6 +537,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   int local_q_tile = q_block_idx;
   int effective_q_tile = q_block_idx;
   int effective_q_begin = 0;
+  int effective_kv_head = paged_kv_params.kv_head;
+  const int32_t* effective_block_table = paged_kv_params.block_table;
   if constexpr (kUsePagedKv) {
     if (all_kv_heads) {
       if (q_tiles_per_sequence <= 0 || batch_size <= 0 ||
@@ -545,7 +551,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         return;
       }
       head_q_block_idx = q_block_idx - kv_head * q_tiles_per_kv_head;
-      paged_kv_params.kv_head = kv_head;
+      effective_kv_head = kv_head;
     }
     const bool varlen_batch = qo_indptr != nullptr && kv_lens != nullptr;
     if (varlen_batch) {
@@ -570,7 +576,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         return;
       }
       total_kv_tiles = (kv_len_tokens + kCutlassTileN - 1) / kCutlassTileN;
-      paged_kv_params.block_table =
+      effective_block_table =
           paged_kv_params.block_table +
           static_cast<int64_t>(batch_idx) * paged_kv_params.block_table_stride;
     }
@@ -853,16 +859,19 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                        [&](auto k_block) {
           auto dst = tBsB_prod(_, _, k_block, write_stage);
           auto coord_tensor = tBcB_prod(_, _, k_block, cute::Int<0>{});
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
           // K producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
             SM120_NVFP4_DEBUG_TRAP();
           }
+#endif
           for (int i = 0; i < int(cute::size(dst)); i += 8) {
             auto coord0 = coord_tensor(i);
             const int row0 = int(cute::get<0>(coord0));
             const int k0 = int(cute::get<1>(coord0));
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
             // K producer requires 4-byte-aligned contiguous dim stride.
             if (((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) ||
                 ((k0 & 7) != 0) || paged_kv_params.k_stride_dim3 != 1) {
@@ -881,13 +890,15 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 SM120_NVFP4_DEBUG_TRAP();
               }
             }
+#endif
             const int token = kv_tile * kCutlassTileN + row0;
             const int dim0 = k_outer * kCutlassTileK + k0;
             const bool in_bounds = token < kv_len_tokens;
             const uint32_t* src =
                 in_bounds
-                    ? sm120_nvfp4_paged_k_word_ptr(paged_kv_params, token,
-                                                   dim0)
+                    ? sm120_nvfp4_paged_k_word_ptr(
+                          paged_kv_params, effective_block_table,
+                          effective_kv_head, token, dim0)
                     : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
             cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
                 reinterpret_cast<uint32_t*>(dst0), src, in_bounds);
@@ -909,11 +920,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           const int logical_page = token / paged_kv_params.page_size;
           const int page_offset =
               token - logical_page * paged_kv_params.page_size;
-          const int physical_page =
-              paged_kv_params.block_table[logical_page];
+          const int physical_page = effective_block_table[logical_page];
           const int64_t scale_page_base =
-              sm120_nvfp4_paged_k_scale_page_base(paged_kv_params,
-                                                   physical_page);
+              sm120_nvfp4_paged_k_scale_page_base(
+                  paged_kv_params, effective_kv_head, physical_page);
           scale = sm120_nvfp4_paged_k_scale_from_page_base(
               paged_kv_params, scale_page_base, page_offset, scale_col);
         }
@@ -939,10 +949,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             const int token_group = token_group_start >> 4;
             if (token_group < paged_kv_params.v_linear_scale_cache_groups) {
               sf0 = sm120_nvfp4_linear_v_scale_cache_load(
-                  paged_kv_params, batch_idx, paged_kv_params.kv_head, dim0,
+                  paged_kv_params, batch_idx, effective_kv_head, dim0,
                   token_group);
               sf1 = sm120_nvfp4_linear_v_scale_cache_load(
-                  paged_kv_params, batch_idx, paged_kv_params.kv_head,
+                  paged_kv_params, batch_idx, effective_kv_head,
                   dim0 + 1, token_group);
               return;
             }
@@ -952,13 +962,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 token_group_start / paged_kv_params.page_size;
             const int page_offset0 =
                 token_group_start - logical_page * paged_kv_params.page_size;
-            const int physical_page = paged_kv_params.block_table[logical_page];
+            const int physical_page = effective_block_table[logical_page];
             const int64_t data_page_base =
-                sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
-                                                    physical_page);
+                sm120_nvfp4_paged_v_data_page_base(
+                    paged_kv_params, effective_kv_head, physical_page);
             const int64_t scale_page_base =
-                sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
-                                                     physical_page);
+                sm120_nvfp4_paged_v_scale_page_base(
+                    paged_kv_params, effective_kv_head, physical_page);
             const int packed_col = dim0 >> 1;
             const int scale_col = dim0 >> 4;
             const int shift0 = (dim0 & 1) * 4;
@@ -1031,9 +1041,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
 
       if constexpr (kPvLayoutV) {
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
         if (paged_kv_params.v_stride_dim3 != 1) {
           SM120_NVFP4_DEBUG_TRAP();
         }
+#endif
         constexpr int kTransposeTokens = 8;
         constexpr int kTransposeDims = 8;
         constexpr int kTokenGroups = kCutlassTileN / kTransposeTokens;
@@ -1061,11 +1073,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 token / paged_kv_params.page_size;
             const int page_offset =
                 token - logical_page * paged_kv_params.page_size;
-            const int physical_page =
-                paged_kv_params.block_table[logical_page];
+            const int physical_page = effective_block_table[logical_page];
             const int64_t data_page_base =
-                sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
-                                                    physical_page);
+                sm120_nvfp4_paged_v_data_page_base(
+                    paged_kv_params, effective_kv_head, physical_page);
             row_word = sm120_nvfp4_paged_v_word_from_page_base(
                 paged_kv_params, data_page_base, page_offset, dim_base >> 1);
           }
@@ -1084,6 +1095,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           const int local_col = local_dim0 + subgroup_lane;
           auto ref0 = pv_sB(local_col, local_k0, write_stage);
           uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
           if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
             SM120_NVFP4_DEBUG_TRAP();
           }
@@ -1096,16 +1108,19 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
             if (dst_byte < dst0 || dst_byte >= dst0 + 4 ||
                 pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
-              SM120_NVFP4_DEBUG_TRAP();
+                SM120_NVFP4_DEBUG_TRAP();
             }
           }
+#endif
           *reinterpret_cast<uint32_t*>(dst0) = packed_word;
         }
       } else {
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
         if (paged_kv_params.v_stride_dim3 != 1 ||
             paged_kv_params.v_scale_stride_dim3 != 1) {
           SM120_NVFP4_DEBUG_TRAP();
         }
+#endif
         constexpr int kTransposeTokens = 8;
         constexpr int kTransposeDims = 8;
         constexpr int kTokenGroups = kCutlassTileN / kTransposeTokens;
@@ -1136,21 +1151,20 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           if (token < kv_len_tokens) {
             if (paged_kv_params.v_linear_data_cache != nullptr) {
               row_word = sm120_nvfp4_linear_v_data_cache_word(
-                  paged_kv_params, batch_idx, paged_kv_params.kv_head, token,
+                  paged_kv_params, batch_idx, effective_kv_head, token,
                   dim_base >> 1);
             } else {
               const int logical_page =
                   token / paged_kv_params.page_size;
               const int page_offset =
                   token - logical_page * paged_kv_params.page_size;
-              const int physical_page =
-                  paged_kv_params.block_table[logical_page];
+              const int physical_page = effective_block_table[logical_page];
               const int64_t data_page_base =
-                  sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
-                                                      physical_page);
+                  sm120_nvfp4_paged_v_data_page_base(
+                      paged_kv_params, effective_kv_head, physical_page);
               const int64_t scale_page_base =
-                  sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
-                                                       physical_page);
+                  sm120_nvfp4_paged_v_scale_page_base(
+                      paged_kv_params, effective_kv_head, physical_page);
               row_word = sm120_nvfp4_paged_v_word_from_page_base(
                   paged_kv_params, data_page_base, page_offset, dim_base >> 1);
               row_scale_byte = sm120_nvfp4_paged_v_linear_scale_from_page_base(
@@ -1179,6 +1193,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 
           auto ref0 = pv_sB(local_col, local_k0, write_stage);
           uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
           if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
             SM120_NVFP4_DEBUG_TRAP();
           }
@@ -1191,9 +1206,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
             if (dst_byte < dst0 || dst_byte >= dst0 + 4 ||
                 pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
-              SM120_NVFP4_DEBUG_TRAP();
+                SM120_NVFP4_DEBUG_TRAP();
             }
           }
+#endif
           *reinterpret_cast<uint32_t*>(dst0) = packed_word;
         }
       }
@@ -1210,10 +1226,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           uint8_t scale = 0x38;
           if (token < kv_len_tokens) {
             const int logical_page = token / paged_kv_params.page_size;
-            const int physical_page =
-                paged_kv_params.block_table[logical_page];
+            const int physical_page = effective_block_table[logical_page];
             scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page(
-                paged_kv_params, physical_page, dim);
+                paged_kv_params, effective_kv_head, physical_page, dim);
           }
 #pragma unroll
           for (int k_offset = 0; k_offset < 16; k_offset += 2) {
@@ -1236,7 +1251,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         }
         return sm120_nvfp4_paged_q_bf16_row_base(
             paged_kv_params, effective_q_begin, local_row, group_size,
-            num_kv_heads, all_kv_heads);
+            num_kv_heads, effective_kv_head, all_kv_heads);
       };
       auto q_value_from_row = [&](int64_t row_base, int dim) {
         if (row_base < 0) {
@@ -1276,21 +1291,25 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                        [&](auto k_block) {
           auto dst = tAsA_prod(_, _, k_block, write_stage);
           auto coord_tensor = tAcA_prod(_, _, k_block, cute::Int<0>{});
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
           // Q producer emits one 32-bit word for each 8-nibble partition.
           if (int(cute::size(dst)) % 8 != 0) {
             SM120_NVFP4_DEBUG_TRAP();
           }
+#endif
           for (int i = 0; i < int(cute::size(dst)); i += 8) {
             auto coord0 = coord_tensor(i);
             const int row0 = int(cute::get<0>(coord0));
             const int k0 = int(cute::get<1>(coord0));
             auto ref0 = dst(i);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
             // Q producer writes each packed word through a 4-byte smem store.
             if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u ||
                 ((k0 & 7) != 0)) {
               SM120_NVFP4_DEBUG_TRAP();
             }
+#endif
             const int64_t row_base0 = q_row_base(row0);
             const int dim0 = k_outer * kCutlassTileK + k0;
             const uint8_t word_scale = q_scale_byte(row_base0, dim0 >> 4);
@@ -1304,11 +1323,13 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
               uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
               const int row = int(cute::get<0>(coord));
               const int k = int(cute::get<1>(coord));
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
               // Q smem layout must colocate each FP4 pair inside the word.
               if (row != row0 || k != k0 + j || dst_byte < dst0 ||
                   dst_byte >= dst0 + 4 || pair_byte != dst_byte) {
                 SM120_NVFP4_DEBUG_TRAP();
               }
+#endif
               const int dim = k_outer * kCutlassTileK + k;
               const uint8_t code = q_code(row_base0, dim, word_scale);
               const int byte_offset = int(dst_byte - dst0);

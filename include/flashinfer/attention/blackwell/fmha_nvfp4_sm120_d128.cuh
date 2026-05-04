@@ -489,7 +489,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
     float* split_l,
     int split_stats_stride_rows,
     int split_output_stride_elems,
-    Sm120Nvfp4PagedKvLoadParams paged_kv_params,
+    CUTLASS_GRID_CONSTANT Sm120Nvfp4PagedKvLoadParams const paged_kv_params,
     const int32_t* qo_indptr,
     const int32_t* kv_lens,
     int batch_size,
@@ -509,6 +509,8 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
   int local_q_tile = q_block_idx;
   int effective_q_tile = q_block_idx;
   int effective_q_begin = 0;
+  int effective_kv_head = paged_kv_params.kv_head;
+  const int32_t* effective_block_table = paged_kv_params.block_table;
   if constexpr (kUsePagedKv) {
     if (all_kv_heads) {
       if (q_tiles_per_sequence <= 0 || batch_size <= 0 ||
@@ -521,7 +523,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
         return;
       }
       head_q_block_idx = q_block_idx - kv_head * q_tiles_per_kv_head;
-      paged_kv_params.kv_head = kv_head;
+      effective_kv_head = kv_head;
     }
     const bool varlen_batch = qo_indptr != nullptr && kv_lens != nullptr;
     if (varlen_batch) {
@@ -546,7 +548,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
         return;
       }
       total_kv_tiles = (kv_len_tokens + kCutlassTileN - 1) / kCutlassTileN;
-      paged_kv_params.block_table =
+      effective_block_table =
           paged_kv_params.block_table +
           static_cast<int64_t>(batch_idx) * paged_kv_params.block_table_stride;
     }
@@ -854,8 +856,9 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
             const bool in_bounds = token < kv_len_tokens;
             const uint32_t* src =
                 in_bounds
-                    ? sm120_nvfp4_paged_k_word_ptr(paged_kv_params, token,
-                                                   dim0)
+                    ? sm120_nvfp4_paged_k_word_ptr(
+                          paged_kv_params, effective_block_table,
+                          effective_kv_head, token, dim0)
                     : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
             cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
                 reinterpret_cast<uint32_t*>(dst0), src, in_bounds);
@@ -877,11 +880,10 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
           const int logical_page = token / paged_kv_params.page_size;
           const int page_offset =
               token - logical_page * paged_kv_params.page_size;
-          const int physical_page =
-              paged_kv_params.block_table[logical_page];
+          const int physical_page = effective_block_table[logical_page];
           const int64_t scale_page_base =
-              sm120_nvfp4_paged_k_scale_page_base(paged_kv_params,
-                                                   physical_page);
+              sm120_nvfp4_paged_k_scale_page_base(
+                  paged_kv_params, effective_kv_head, physical_page);
           scale = sm120_nvfp4_paged_k_scale_from_page_base(
               paged_kv_params, scale_page_base, page_offset, scale_col);
         }
@@ -907,10 +909,10 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
             const int token_group = token_group_start >> 4;
             if (token_group < paged_kv_params.v_linear_scale_cache_groups) {
               sf0 = sm120_nvfp4_linear_v_scale_cache_load(
-                  paged_kv_params, batch_idx, paged_kv_params.kv_head, dim0,
+                  paged_kv_params, batch_idx, effective_kv_head, dim0,
                   token_group);
               sf1 = sm120_nvfp4_linear_v_scale_cache_load(
-                  paged_kv_params, batch_idx, paged_kv_params.kv_head,
+                  paged_kv_params, batch_idx, effective_kv_head,
                   dim0 + 1, token_group);
               return;
             }
@@ -920,13 +922,13 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                 token_group_start / paged_kv_params.page_size;
             const int page_offset0 =
                 token_group_start - logical_page * paged_kv_params.page_size;
-            const int physical_page = paged_kv_params.block_table[logical_page];
+            const int physical_page = effective_block_table[logical_page];
             const int64_t data_page_base =
-                sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
-                                                    physical_page);
+                sm120_nvfp4_paged_v_data_page_base(
+                    paged_kv_params, effective_kv_head, physical_page);
             const int64_t scale_page_base =
-                sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
-                                                     physical_page);
+                sm120_nvfp4_paged_v_scale_page_base(
+                    paged_kv_params, effective_kv_head, physical_page);
             const int packed_col = dim0 >> 1;
             const int scale_col = dim0 >> 4;
             const int shift0 = (dim0 & 1) * 4;
@@ -1029,11 +1031,10 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                 token / paged_kv_params.page_size;
             const int page_offset =
                 token - logical_page * paged_kv_params.page_size;
-            const int physical_page =
-                paged_kv_params.block_table[logical_page];
+            const int physical_page = effective_block_table[logical_page];
             const int64_t data_page_base =
-                sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
-                                                    physical_page);
+                sm120_nvfp4_paged_v_data_page_base(
+                    paged_kv_params, effective_kv_head, physical_page);
             row_word = sm120_nvfp4_paged_v_word_from_page_base(
                 paged_kv_params, data_page_base, page_offset, dim_base >> 1);
           }
@@ -1103,21 +1104,20 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
           if (token < kv_len_tokens) {
             if (paged_kv_params.v_linear_data_cache != nullptr) {
               row_word = sm120_nvfp4_linear_v_data_cache_word(
-                  paged_kv_params, batch_idx, paged_kv_params.kv_head, token,
+                  paged_kv_params, batch_idx, effective_kv_head, token,
                   dim_base >> 1);
             } else {
               const int logical_page =
                   token / paged_kv_params.page_size;
               const int page_offset =
                   token - logical_page * paged_kv_params.page_size;
-              const int physical_page =
-                  paged_kv_params.block_table[logical_page];
+              const int physical_page = effective_block_table[logical_page];
               const int64_t data_page_base =
-                  sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
-                                                      physical_page);
+                  sm120_nvfp4_paged_v_data_page_base(
+                      paged_kv_params, effective_kv_head, physical_page);
               const int64_t scale_page_base =
-                  sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
-                                                       physical_page);
+                  sm120_nvfp4_paged_v_scale_page_base(
+                      paged_kv_params, effective_kv_head, physical_page);
               row_word = sm120_nvfp4_paged_v_word_from_page_base(
                   paged_kv_params, data_page_base, page_offset, dim_base >> 1);
               row_scale_byte = sm120_nvfp4_paged_v_linear_scale_from_page_base(
@@ -1177,10 +1177,9 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
           uint8_t scale = 0x38;
           if (token < kv_len_tokens) {
             const int logical_page = token / paged_kv_params.page_size;
-            const int physical_page =
-                paged_kv_params.block_table[logical_page];
+            const int physical_page = effective_block_table[logical_page];
             scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page(
-                paged_kv_params, physical_page, dim);
+                paged_kv_params, effective_kv_head, physical_page, dim);
           }
 #pragma unroll
           for (int k_offset = 0; k_offset < 16; k_offset += 2) {
@@ -1203,7 +1202,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
         }
         return sm120_nvfp4_paged_q_bf16_row_base(
             paged_kv_params, effective_q_begin, local_row, group_size,
-            num_kv_heads, all_kv_heads);
+            num_kv_heads, effective_kv_head, all_kv_heads);
       };
       auto q_value_from_row = [&](int64_t row_base, int dim) {
         if (row_base < 0) {
