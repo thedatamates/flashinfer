@@ -455,9 +455,15 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         )
 
         if out is None:
-            out = torch.zeros_like(q)
+            out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
         else:
             check_shape_dtype_device(out, q.shape, torch.bfloat16, q.device, "out")
+        direct_out = out.is_contiguous()
+        ffi_out = (
+            out.view(self._total_q_len * self._num_qo_heads, self._head_dim)
+            if direct_out
+            else self._out_group
+        )
 
         stream = torch.cuda.current_stream(q.device).cuda_stream
         run_kv_head = -1 if self._num_kv_heads > 1 else 0
@@ -478,7 +484,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             self._split_m,
             self._split_l,
             self._out_scratch,
-            self._out_group,
+            ffi_out,
             self._workspace_buffer,
             self._physical_kv_len,
             float(k_scale),
@@ -494,11 +500,12 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             v_scale_layout_code,
             stream,
         )
-        out.copy_(
-            self._out_group.view(
-                self._total_q_len, self._num_qo_heads, self._head_dim
+        if not direct_out:
+            out.copy_(
+                self._out_group.view(
+                    self._total_q_len, self._num_qo_heads, self._head_dim
+                )
             )
-        )
 
         return out
 

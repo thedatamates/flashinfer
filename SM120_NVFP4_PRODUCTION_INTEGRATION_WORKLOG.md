@@ -4469,3 +4469,20 @@ Qwen D256 PV prefill split sensitivity:
   - kv=65536 dense `4.541 ms`; paged auto split `12288`, `9.656 ms`. Split `3072` was slightly faster at `9.482 ms`.
   - kv=262144 dense `17.183 ms`; paged auto split `12288`, `36.458 ms`. Auto `12288` remained best/tied; split `3072` was slower at `37.926 ms`.
 - Decision: do not change the broad prefill split heuristic from this data. There is a short/medium-kv q=2048 opportunity for a workload-specific split override, but a global change would regress the longest-context production cell where the current heuristic is best.
+
+Output copy removal plan:
+- The paged wrapper currently allocates `torch.zeros_like(q)` when `out is None`, passes `_out_group` to the FFI, then does `out.copy_(_out_group.view(...))`.
+- For the default benchmark/production path, `out` is contiguous and shaped exactly like `q`, so the FFI can write directly into `out.view(total_q_rows, head_dim)`.
+- What I am about to change: allocate `torch.empty(...)` instead of `zeros_like` for `out is None`, pass contiguous `out.view(...)` directly to `paged_run_bf16_q`, and keep the old `_out_group + copy_` fallback for user-provided non-contiguous output.
+- Decision criterion: keep the change if the focused NVFP4 test passes and small-work benches do not regress. This removes one Python-side GPU operation without changing public API or tensor contracts.
+
+Output copy removal result:
+- Changed the wrapper to allocate `torch.empty(...)` for default output, pass contiguous `out.view(total_q_rows, head_dim)` directly to `paged_run_bf16_q`, and keep `_out_group + copy_` only for non-contiguous user-provided output.
+- Smoke timings after the change:
+  - D256 q=1 kv=262144 paged-PV: `0.601 ms`.
+  - D256 q=1 kv=262144 paged-linear: `3.320 ms`.
+  - D256 sliding q=512 kv=1024 paged-PV: `0.236 ms`.
+  - D512 q=1 kv=262144 paged-PV: `1.250 ms`.
+  - D512 q=512 kv=65536 paged-PV: `7.320 ms`.
+- Test status: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 1.00s`).
+- Conclusion: keep the cleanup because it removes an unnecessary output allocation/copy path, but the performance gain is tiny. The fixed floor is inside the FFI launch sequence and kernel shape, not the final Python `copy_`.
