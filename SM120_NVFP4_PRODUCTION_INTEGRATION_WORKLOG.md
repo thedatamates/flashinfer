@@ -6078,3 +6078,55 @@ Next profiling target:
 
 - The remaining D256 linear gap is no longer the cached V shuffle.
 - Next NCU-driven candidates are the cached data word global-sector pattern and the operand smem store wavefront excess; do not optimize them by inspection without checking whether source-level reductions move wall time.
+
+## 2026-05-04 15:40 CDT - D512 Paged Profiling Target
+
+Finding:
+
+- D256 is now near the current producer floor for the reference cell: paged-linear `2.696 ms`, paged-PV `2.117 ms`, dense previously `1.264 ms`.
+- The largest remaining production risk is D512, where previous worklog measurements had paged-PV and paged-linear still far above dense.
+- Source inspection confirms D512 has not received the D256 coalesced linear-cache ownership path: `kLinearVCacheCoalesced` is false for D512, and the cached linear path still reaches `__shfl_sync(subgroup_mask, row_word, ...)`.
+- Before carrying over any D256 structural change, the next step is to profile D512 directly and identify whether the dominant cost is the same V transpose/cache path, a D512-specific scale path, or something else in the mainloop.
+
+Implementation target:
+
+- No code change yet.
+- Run current-source D512 Gemma-global reference benches for dense, paged-PV, and paged-linear.
+- Run Nsight Compute lineinfo on the D512 paged-PV or paged-linear stage, prioritizing the slower production-linear path if the bench gap is still extreme.
+- Use the NCU source counters to decide whether the next D512 change should be cache-layout coalescing, producer ownership rewrite, load-warp retune, or a different mainloop target.
+
+Validation:
+
+- Benchmark cell: D512 Gemma-global `q=512 kv=65536 g=8 softcap=30 split=3072`.
+- Use one GPU process at a time on GPU 2 with `CUDA_VISIBLE_DEVICES=2` and bench `--device 0`.
+
+Decision:
+
+- Do not port D256 changes mechanically.
+- Only implement a D512 producer change after the current D512 NCU profile names the source-level hotspot.
+
+## 2026-05-04 15:42 CDT - D512 Current Reference Result
+
+Finding:
+
+- Re-ran the D512 Gemma-global reference cell on current source after the D256-specific changes.
+- Cell: `q=512 kv=65536 g=8 softcap=30 split=3072`.
+- Current timings:
+  - Dense: `5.260 ms` mean (`5.248 ms` min, `5.270 ms` max).
+  - Paged-PV: `6.633 ms` mean (`6.613 ms` min, `6.646 ms` max).
+  - Paged-linear: `8.089 ms` mean (`8.034 ms` min, `8.230 ms` max).
+- Ratios:
+  - Paged-PV / dense: `1.26x`.
+  - Paged-linear / dense: `1.54x`.
+  - Paged-linear / paged-PV: `1.22x`.
+
+Decision:
+
+- Do not spend a D512 architectural pass here right now.
+- The stale D512 100x-era numbers are no longer representative of current source; current D512 is in the same rough envelope as the D256 path, with linear-V reblock still visible but not catastrophic.
+- NCU is still useful for future D512 tuning, but it is not the biggest remaining blocker for benchmark readiness.
+
+Next profiling target:
+
+- Move from single-cell producer work to production-cell benchmark coverage.
+- Use the focused production matrix to find remaining outlier cells. The next high-risk kernel change should be driven by an outlier cell's NCU profile, not by the now-acceptable D512 reference cell.
