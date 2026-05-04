@@ -14,6 +14,9 @@
 #define FLASHINFER_SM120_NVFP4_D256_LOAD_WARPS 11
 #endif
 #endif
+#ifndef FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN
+#define FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN 2
+#endif
 
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh>
 
@@ -79,7 +82,8 @@ cudaError_t Sm120Nvfp4D256RunPagedRaw(
     const int32_t* kv_lens, int batch_size, int q_tiles_per_sequence,
     int num_kv_heads, bool all_kv_heads, bool skip_internal_combine) {
   return d256::sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw<
-      2, true, SM120_NVFP4_CAUSAL, SM120_NVFP4_USE_SLIDING_WINDOW,
+      FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN, true,
+      SM120_NVFP4_CAUSAL, SM120_NVFP4_USE_SLIDING_WINDOW,
       SM120_NVFP4_USE_LOGITS_SOFT_CAP, SM120_NVFP4_USE_PV_LAYOUT_V>(
       q_packed, q_scales, k_packed, k_scales, v_pv_packed, v_pv_scales,
       partial, split_m, split_l, out, workspace, workspace_bytes, qk_alpha,
@@ -93,7 +97,7 @@ cudaError_t Sm120Nvfp4D256RunPagedRaw(
 PagedKernelConfig Sm120Nvfp4D256PagedKernelConfig() {
   return {d256::kHeadDim,
           d256::kCutlassTileM,
-          2,
+          FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN,
           SM120_NVFP4_CAUSAL,
           SM120_NVFP4_USE_SLIDING_WINDOW,
           SM120_NVFP4_USE_LOGITS_SOFT_CAP,

@@ -4628,3 +4628,14 @@ D256 small-q tile-M diagnostic result:
 - q=128 kv=32768 g=6 split `1024`: default `TILE_M=128` mean `0.638 ms`; `TILE_M=64` mean `0.585 ms`.
 - q=512 kv=65536 g=6 split `3072`: default `TILE_M=128` mean `2.562 ms`; `TILE_M=64` mean `3.082 ms`.
 - Decision: no D256 no-SWA default change. `TILE_M=64` helps one short-prefill cell but regresses decode and long prefill. The q=1 floor is not caused by 128-row tile padding.
+
+D256 output-span overrideability plan:
+- The previous runtime span-1 probe failed because D256 paged hardwires template `kOutputGroupSpan=2` and reports `PagedKernelConfig.output_group_span=2`.
+- To measure span 1 honestly, the D256 paged translation unit needs the same kind of compile-time diagnostic override as tile-M/load-warps, while preserving default span 2.
+- What I am about to change: add `FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN` with default `2`, use it for the D256 paged template argument and config field.
+- Decision criterion: keep the overrideability patch if the focused NVFP4 test passes with default span 2. Then benchmark span 1 via isolated JIT root and `--output-group-span 1`.
+
+D256 output-span overrideability result:
+- Added `FLASHINFER_SM120_NVFP4_D256_OUTPUT_GROUP_SPAN` to `csrc/fmha_nvfp4_sm120_d256_paged.cu`; default remains span 2.
+- Test status with default span 2: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 90.85s`).
+- Next: benchmark span 1 as a real compile-time variant with isolated JIT roots.
