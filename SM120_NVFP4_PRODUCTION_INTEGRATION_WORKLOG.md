@@ -3062,3 +3062,42 @@ Implication:
   future producer rewrite should treat CoveredSmemTile-style full-extent
   initialization as mandatory at every aliased consumer boundary, not as an
   optional debug cleanup.
+
+## 2026-05-04 01:07 CDT - Benchmark Auto Split Policy
+
+Finding:
+
+- The grid benchmark's old auto split was stale: D512 defaulted to
+  `split_kv_len=32768`, which measured `~285 ms` PV at the D512 reference cell.
+- The measured split curve shows that smaller split lengths recover producer
+  parallelism, but they increase partial/split scratch memory. A fixed split
+  default is therefore the wrong abstraction for production cells with different
+  `q_len`, `group`, `head_dim`, and `kv_len`.
+
+Implementation:
+
+- `bench_sm120_nvfp4_attention.py --split-kv-len 0` now auto-selects the
+  smallest split length that keeps partial/split scratch under
+  `--max-partial-bytes` (default `1 GiB`).
+- `bench_sm120_nvfp4_attention_grid.py --fused-split-kv-len 0` now forwards
+  auto mode and exposes `--fused-max-partial-bytes` instead of using
+  head-dim-specific magic constants.
+- Explicit split lengths still work unchanged for controlled split sweeps.
+
+Validation:
+
+- `python -m py_compile benchmarks/bench_sm120_nvfp4_attention.py
+  benchmarks/bench_sm120_nvfp4_attention_grid.py` passed.
+- D512 reference smoke, `q=512 kv=65536 group=8 softcap=30 v_layout=pv`:
+  auto selected `split_kv_len=384` and measured `88.170 ms` mean/min range,
+  down from `~285 ms` at the stale `32768` split.
+- Grid-driver smoke wrote a row with `split_kv_len=384` and
+  `output_finite=true`. Temporary smoke report files were deleted so they do
+  not pollute the PR.
+
+Implication:
+
+- Focused production reports can now use `--fused-split-kv-len 0` and get a
+  memory-bounded split choice per cell. This does not solve the remaining
+  structural producer gap, but it prevents the benchmark harness from
+  overstating the gap by using stale split geometry.

@@ -25,6 +25,36 @@ def default_output_group_span(head_dim: int) -> int:
     raise ValueError("head_dim must be one of {128, 256, 512}")
 
 
+def tile_m_for_head_dim(head_dim: int) -> int:
+    if head_dim in (128, 256):
+        return 64
+    if head_dim == 512:
+        return 128
+    raise ValueError("head_dim must be one of {128, 256, 512}")
+
+
+def round_up(x: int, multiple: int) -> int:
+    return ((x + multiple - 1) // multiple) * multiple
+
+
+def auto_split_kv_len(
+    *,
+    q_len: int,
+    kv_len: int,
+    group: int,
+    head_dim: int,
+    num_kv_heads: int,
+    max_partial_bytes: int,
+) -> int:
+    tile_m = tile_m_for_head_dim(head_dim)
+    padded_rows = num_kv_heads * round_up(q_len * group, tile_m)
+    bytes_per_split = padded_rows * (head_dim * 2 + 2 * 4)
+    max_splits = max(1, max_partial_bytes // max(1, bytes_per_split))
+    total_kv_tiles = math.ceil(kv_len / 128)
+    split_kv_tiles = max(1, math.ceil(total_kv_tiles / max_splits))
+    return split_kv_tiles * 128
+
+
 def event_ms(fn, *, warmup: int, repeat: int) -> dict[str, float]:
     for _ in range(warmup):
         fn()
@@ -92,7 +122,21 @@ def main() -> None:
     parser.add_argument("--kv-len", type=int, required=True)
     parser.add_argument("--head-dim", type=int, choices=(128, 256, 512), required=True)
     parser.add_argument("--group", type=int, required=True)
-    parser.add_argument("--split-kv-len", type=int, required=True)
+    parser.add_argument(
+        "--split-kv-len",
+        type=int,
+        default=0,
+        help=(
+            "Split length in tokens. 0 auto-selects the smallest split that "
+            "keeps partial/split scratch under --max-partial-bytes."
+        ),
+    )
+    parser.add_argument(
+        "--max-partial-bytes",
+        type=int,
+        default=1 << 30,
+        help="Partial/split scratch budget used when --split-kv-len=0.",
+    )
     parser.add_argument("--output-group-span", type=int, choices=(1, 2, 4), default=0)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=10)
@@ -126,8 +170,10 @@ def main() -> None:
 
     if args.kv_len % 128 != 0:
         raise ValueError("--kv-len must be a multiple of 128")
-    if args.split_kv_len <= 0 or args.split_kv_len % 128 != 0:
-        raise ValueError("--split-kv-len must be a positive multiple of 128")
+    if args.split_kv_len < 0 or args.split_kv_len % 128 != 0:
+        raise ValueError("--split-kv-len must be 0 or a positive multiple of 128")
+    if args.max_partial_bytes <= 0:
+        raise ValueError("--max-partial-bytes must be positive")
     if args.q_len * args.group <= 0:
         raise ValueError("--q-len * --group must be positive")
 
@@ -142,6 +188,18 @@ def main() -> None:
         raise ValueError("head_dim must be divisible by output_group_span * 128")
     if args.num_kv_heads <= 0:
         raise ValueError("--num-kv-heads must be positive")
+    split_kv_len = (
+        auto_split_kv_len(
+            q_len=args.q_len,
+            kv_len=args.kv_len,
+            group=args.group,
+            head_dim=args.head_dim,
+            num_kv_heads=args.num_kv_heads,
+            max_partial_bytes=args.max_partial_bytes,
+        )
+        if args.split_kv_len == 0
+        else args.split_kv_len
+    )
 
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
@@ -219,7 +277,7 @@ def main() -> None:
             causal=bool(args.causal),
             window_left=args.sliding_window,
             logits_soft_cap=float(args.logits_soft_cap),
-            split_kv_len=args.split_kv_len,
+            split_kv_len=split_kv_len,
             output_group_span=output_group_span,
             v_cache_uses_pv_layout=v_cache_uses_pv_layout,
         )
@@ -248,7 +306,7 @@ def main() -> None:
             "group": args.group,
             "num_kv_heads": args.num_kv_heads,
             "output_group_span": output_group_span,
-            "split_kv_len": args.split_kv_len,
+            "split_kv_len": split_kv_len,
             "causal": bool(args.causal),
             "sliding_window": args.sliding_window,
             "logits_soft_cap": args.logits_soft_cap,
@@ -274,8 +332,8 @@ def main() -> None:
     )
     qk_alpha = float((1.0 / (q_global * k_global)).item())
     pv_alpha = float((1.0 / v_global).item())
-    split_kv_tiles = args.split_kv_len // 128
-    num_splits = math.ceil(args.kv_len / args.split_kv_len)
+    split_kv_tiles = split_kv_len // 128
+    num_splits = math.ceil(args.kv_len / split_kv_len)
 
     partial = torch.empty(
         (num_splits, q_rows, args.head_dim),
@@ -331,6 +389,7 @@ def main() -> None:
         "head_dim": args.head_dim,
         "group": args.group,
         "output_group_span": output_group_span,
+        "split_kv_len": split_kv_len,
         "causal": bool(args.causal),
         "sliding_window": args.sliding_window,
         "logits_soft_cap": args.logits_soft_cap,

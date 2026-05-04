@@ -71,12 +71,6 @@ def default_output_group_span(head_dim: int) -> int:
     raise ValueError("--head-dim must be one of 128, 256, or 512")
 
 
-def default_split_kv_len(head_dim: int) -> int:
-    if head_dim == 512:
-        return 32768
-    return 6656
-
-
 def fused_output_group_span(args: argparse.Namespace) -> int:
     if args.fused_output_group_span == 0:
         return default_output_group_span(args.head_dim)
@@ -86,8 +80,6 @@ def fused_output_group_span(args: argparse.Namespace) -> int:
 
 
 def fused_split_kv_len(args: argparse.Namespace) -> int:
-    if args.fused_split_kv_len == 0:
-        return default_split_kv_len(args.head_dim)
     return int(args.fused_split_kv_len)
 
 
@@ -170,6 +162,8 @@ def fused_command(root: Path, cell: Cell, args: argparse.Namespace) -> list[str]
         str(cell.group),
         "--split-kv-len",
         str(fused_split_kv_len(args)),
+        "--max-partial-bytes",
+        str(args.fused_max_partial_bytes),
         "--warmup",
         str(args.warmup),
         "--repeat",
@@ -869,7 +863,16 @@ def main() -> None:
         "--fused-split-kv-len",
         type=int,
         default=0,
-        help="0 selects the default split length for --head-dim: D512=32768, otherwise 6656.",
+        help=(
+            "Split length passed to the SM120 fused benchmark. 0 lets the "
+            "benchmark auto-select from --fused-max-partial-bytes."
+        ),
+    )
+    parser.add_argument(
+        "--fused-max-partial-bytes",
+        type=int,
+        default=1 << 30,
+        help="Partial/split scratch budget used when --fused-split-kv-len=0.",
     )
     parser.add_argument(
         "--fused-api",
