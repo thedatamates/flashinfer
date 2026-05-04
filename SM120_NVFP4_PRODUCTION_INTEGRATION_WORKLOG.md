@@ -5955,3 +5955,59 @@ Next profiling target:
 
 - Run full NVFP4 correctness before committing.
 - Re-profile the kept `LOAD_WARPS=7` stage if the next source target needs attribution; prior NCU scheduler data for `LOAD_WARPS=11` is no longer the active geometry.
+
+## 2026-05-04 15:20 CDT - Linear Cached V Dead Scale Lookup Target
+
+Finding:
+
+- Re-profiled the kept D256 `LOAD_WARPS=7` geometry with lineinfo.
+- The current lineinfo profile still shows hot samples in the linear V data loop:
+  - `d256.cuh:1175` `__shfl_sync(...)` is the top long-scoreboard source.
+  - `d256.cuh:1169` `token0 < kv_len_tokens ? pv_scale_for(token0, dim) : 0x38` appears in wait samples.
+- Source inspection shows `output_scale` is computed before the runtime `if (paged_kv_params.v_linear_data_cache != nullptr)` branch.
+- In the cached linear path, `output_scale` is not used. The data cache has already been requantized using the PV output scales, so the V data producer only needs to transpose cached codepoints.
+- This leaves a dead scale-smem read and predicate chain on the hot production path solely to serve the uncached fallback.
+
+Implementation target:
+
+- Move `output_scale = pv_scale_for(...)` into the uncached fallback branch in D128/D256/D512.
+- Keep the cached path behavior identical except that it no longer computes or reads the unused scale byte.
+- No public API or layout changes.
+
+Validation:
+
+- Focused D256 correctness.
+- D256 Qwen paged-linear benchmark against the new `LOAD_WARPS=7` baseline (`2.981 ms` normal source build).
+- If timing improves, run lineinfo NCU to verify samples attributed to the dead scale lookup drop.
+
+Decision criteria:
+
+- Keep if correctness passes and timing or lineinfo attribution improves.
+- Revert if compiler already eliminated the dead work or if branch restructuring regresses scheduling.
+
+## 2026-05-04 15:24 CDT - Linear Cached V Dead Scale Lookup Result
+
+Finding:
+
+- Moved `output_scale = pv_scale_for(...)` into the uncached fallback branch in D128/D256/D512.
+- Focused D256 correctness passed:
+  - `3 passed in 44.26s`.
+- D256 Qwen paged-linear reference improved:
+  - Post-load-warp baseline: `2.981 ms`.
+  - Dead-scale cleanup: `2.944 ms` mean (`2.936 ms` min, `2.952 ms` max).
+- Lineinfo NCU confirms the intended instruction reduction:
+  - Executed instructions dropped from `1,008,688,485` to `944,134,647`.
+  - Local spill requests stayed flat at `21,121,296`.
+  - L1 shared excessive wavefronts stayed flat at `18,974,208`.
+  - The previous wait attribution at the now-dead `pv_scale_for(...)` site disappeared from the top sources.
+
+Decision:
+
+- Keep the dead-scale lookup removal.
+- This is a real production-path cleanup: the cached linear-V path no longer pays scale-smem reads that only the uncached fallback needs.
+
+Next profiling target:
+
+- The new top linear-specific long-scoreboard source is the cached V transpose:
+  - `d256.cuh:1173` / `__shfl_sync(subgroup_mask, row_word, ...)`.
+- The next source change should remove or reduce that shuffle chain, not continue optimizing global scale-cache loads.

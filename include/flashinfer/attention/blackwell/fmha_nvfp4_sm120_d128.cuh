@@ -1123,8 +1123,6 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
             }
           }
 
-          const uint8_t output_scale =
-              token0 < kv_len_tokens ? pv_scale_for(token0, dim) : 0x38;
           uint32_t packed_word = 0;
           if (paged_kv_params.v_linear_data_cache != nullptr) {
 #pragma unroll
@@ -1137,6 +1135,8 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
               packed_word |= static_cast<uint32_t>(code) << (4 * src_lane);
             }
           } else {
+            const uint8_t output_scale =
+                token0 < kv_len_tokens ? pv_scale_for(token0, dim) : 0x38;
             packed_word = sm120_nvfp4_linear_v_requant_transposed_word(
                 row_word, row_scale_byte, output_scale, subgroup_mask,
                 subgroup_base_lane, subgroup_lane);
