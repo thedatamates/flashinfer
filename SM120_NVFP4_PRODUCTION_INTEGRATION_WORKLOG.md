@@ -3910,3 +3910,32 @@ Result:
 - Decision: reverted. The D512 span-4 path is the correct amortization point;
   halving the span increases CTAs and loses more than it saves in register
   pressure.
+
+## 2026-05-04 04:45 CDT - K Producer Vector cp.async Check
+
+What I am about to do:
+- The in-tree reference paged producers (`hopper/sparse_mainloop.cuh` and
+  `fmha_v2/fmha/gmem_tile_qkv_packed.h`) issue vectorized async loads after
+  page-table lookup.
+- The SM120 NVFP4 K producer currently emits one `pred_load_32b` per 8 FP4
+  nibbles. For K, the global layout is dim-contiguous and the CUTLASS B smem
+  invariant already requires contiguous packed-word groups.
+- I will test widening the D256 K producer to one 128-bit `cp.async` per 32
+  FP4 nibbles when the partition emits a 32-nibble contiguous span. Decision
+  criterion: keep only if correctness holds and the Qwen full-attention
+  reference cell improves. This is a K-only test before attempting the harder V
+  path.
+
+Result:
+- D256 Qwen-full `q=512 kv=65536 g=6`, PV, split `3072`:
+  current `32b` K cp.async path: `4.24 ms`.
+  ad hoc `128b` grouping experiment: `24.53 ms`.
+- Decision: reverted. The current smem partition is not a valid place to bolt
+  on vectorization by scanning for 32 contiguous nibbles. The reference kernels
+  vectorize by choosing a gmem/smem copy partition whose atom is already
+  128-bit; doing it inside the existing 32-bit partition adds branch/coverage
+  overhead and likely misses the intended layout grouping.
+- Follow-up implication: any real vectorization needs a separate producer
+  partition patterned after `hopper/sparse_mainloop.cuh` / fmha_v2
+  `Gmem_tile_paged_kv`, not local grouping inside the current CUTLASS
+  `SmemCopyAtomB` traversal.
