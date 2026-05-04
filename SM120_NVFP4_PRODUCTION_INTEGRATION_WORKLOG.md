@@ -3158,3 +3158,83 @@ Validation:
   measured `0.056 ms` mean.
 - The partial Qwen report containing dense decode errors was deleted before
   rerunning so the report prefix stays clean.
+
+## 2026-05-04 02:10 CDT - Focused Production Benchmark Reports
+
+Scope:
+
+- Ran the focused production-cell reports with the corrected device convention:
+  `CUDA_VISIBLE_DEVICES=2` and benchmark `--device 0`.
+- Kept the report prefixes stable and reran the Qwen prefix after fixing the
+  dense decode benchmark padding issue.
+- Reports generated:
+  - `reports/prod_qwen_full_d256_g6_20260504.{jsonl,csv,summary.csv,md}`
+  - `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_20260504.{jsonl,csv,summary.csv,md}`
+  - `reports/prod_gemma_global_d512_g8_softcap30_20260504.{jsonl,csv,summary.csv,md}`
+
+Status:
+
+- Qwen full D256/G6: `84` rows, `14` cells, `0` errors, `0` non-finite SM120
+  rows.
+- Gemma sliding D256/G2/SWA1024/softcap30: `48` rows, `8` cells, `0` errors,
+  `0` non-finite SM120 rows.
+- Gemma global D512/G8/softcap30: `66` rows, `11` cells, `11` errors, `0`
+  non-finite SM120 rows. All errors are `bf16_fa2` reference-backend failures
+  from FlashInfer prefill invalid configuration at D512/G8
+  (`NUM_MMA_D_QK=32`, `NUM_MMA_D_VO=32`). `sm120_fused`, `nvfp4_fa2`, and
+  `fp8_fa2` completed.
+
+Geomean ratios from `min_ms`:
+
+- Qwen full:
+  - paged-linear / dense: `17.31x`
+  - paged-PV / dense: `11.28x`
+  - paged-linear / paged-PV: `1.535x`
+  - `nvfp4_fa2 / paged-linear`: `0.0246x`
+  - `nvfp4_fa2 / paged-PV`: `0.0378x`
+- Gemma sliding:
+  - paged-linear / dense: `14.16x`
+  - paged-PV / dense: `9.886x`
+  - paged-linear / paged-PV: `1.432x`
+  - `nvfp4_fa2 / paged-linear`: `0.0296x`
+  - `nvfp4_fa2 / paged-PV`: `0.0425x`
+- Gemma global:
+  - paged-linear / dense: `15.61x`
+  - paged-PV / dense: `10.26x`
+  - paged-linear / paged-PV: `1.521x`
+  - `nvfp4_fa2 / paged-linear`: `0.0539x`
+  - `nvfp4_fa2 / paged-PV`: `0.0820x`
+
+Largest paged-linear slowdowns versus `nvfp4_fa2`:
+
+- Qwen full:
+  - `q=1 kv=262144 g=6`: `87.13x` slower (`7.199 ms` vs `0.083 ms`)
+  - `q=512 kv=262144 g=6`: `62.96x` slower (`385.454 ms` vs `6.122 ms`)
+  - `q=512 kv=131072 g=6`: `56.68x` slower (`175.811 ms` vs `3.102 ms`)
+  - `q=128 kv=32768 g=6`: `45.92x` slower (`9.305 ms` vs `0.203 ms`)
+  - `q=512 kv=65536 g=6`: `45.27x` slower (`70.641 ms` vs `1.561 ms`)
+- Gemma sliding:
+  - `q=2048 kv=8192 g=2`: `193.01x` slower (`12.050 ms` vs `0.062 ms`)
+  - `q=512 kv=8192 g=2`: `96.76x` slower (`3.226 ms` vs `0.033 ms`)
+  - `q=2048 kv=1024 g=2`: `27.12x` slower (`1.635 ms` vs `0.060 ms`)
+  - `q=1024 kv=1024 g=2`: `25.78x` slower (`1.094 ms` vs `0.042 ms`)
+  - `q=1 kv=8192 g=2`: `20.80x` slower (`0.557 ms` vs `0.027 ms`)
+- Gemma global:
+  - `q=1 kv=262144 g=8`: `47.70x` slower (`17.166 ms` vs `0.360 ms`)
+  - `q=1 kv=65536 g=8`: `40.01x` slower (`4.501 ms` vs `0.113 ms`)
+  - `q=1 kv=16384 g=8`: `18.76x` slower (`1.383 ms` vs `0.074 ms`)
+  - `q=1 kv=4096 g=8`: `18.49x` slower (`1.298 ms` vs `0.070 ms`)
+  - `q=512 kv=262144 g=8`: `17.15x` slower (`645.914 ms` vs `37.653 ms`)
+
+Conclusion:
+
+- The benchmark harness is now measuring the intended SM120 device and no
+  longer has the earlier false-flat reference timings or dense decode padding
+  failures.
+- The SM120 production wrapper path is correct/finite on the focused cells but
+  not competitive. The gap is still in the paged kernel path, not Python wrapper
+  orchestration: paged-PV is roughly `10-11x` dense and paged-linear is roughly
+  `14-17x` dense across the focused reports.
+- Linear-V adds a consistent `1.4-1.5x` over paged-PV, but the larger problem is
+  common to both layouts. Further work needs to target the paged producer /
+  launch geometry rather than report generation or device selection.
