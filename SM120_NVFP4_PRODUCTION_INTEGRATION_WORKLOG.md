@@ -4662,3 +4662,20 @@ D256 sliding output-span change result:
   - D256 Qwen no-SWA q=512 kv=65536 g=6 paged-PV split `3072`: `2.550 ms`, `output_group_span=2`.
   - D256 dense sliding q=512 kv=1024 g=2: `0.103 ms`, `output_group_span=2`.
 - Decision: keep the conditional default. It captures the Gemma sliding fixed-floor win while preserving the no-SWA Qwen path and the dense benchmark ABI.
+
+D256 stage-kernel profile and page-cache plan:
+- Nsight Systems on D256 Qwen q=512 kv=65536 g=6 paged-PV split `3072` shows the stage kernel itself is the gap: paged stage avg `2.491 ms`, split-combine avg `0.040 ms`, Q quantize avg `0.004 ms`. The matching dense stage avg is `1.221 ms`.
+- `stage_paged_k_tile` still reaches `effective_block_table[logical_page]` through `sm120_nvfp4_paged_k_word_ptr` for every 32-bit K word and again for every K scale. `stage_paged_v_tile` repeats the same per-word/page lookup pattern for V data and V scales.
+- A 128-token KV tile contains exactly eight 16-token pages in the supported paged layout. What I am about to change: add an eight-entry shared-memory physical-page cache to D128/D256/D512 storage, populate it once per `kv_tile`, and use it in K/V data and scale producers.
+- Decision criterion: keep the change if the focused NVFP4 test passes and the D256 Qwen paged-PV reference cell improves without regressing D512 long-prefill or D256 Gemma sliding.
+
+Paged producer page-cache result:
+- Added an eight-entry `physical_page_cache` to the D128/D256/D512 paged stage storage. K data, K scales, V data, and V scales now use the cached physical page for the current 128-token `kv_tile`; `effective_block_table[...]` is reached only by the cache fill.
+- Test status: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 292.78s`).
+- D256 Qwen q=512 kv=65536 g=6 paged-PV split `3072`: `2.403 ms` versus prior `2.550 ms`.
+- D256 Qwen q=512 kv=65536 g=6 paged-linear split `3072`: `3.270 ms` versus earlier `~3.56 ms`.
+- D512 Gemma global q=512 kv=65536 g=8 paged-PV split `3072`: `6.980 ms`, no regression versus the prior `~7.32 ms` range.
+- D256 Gemma sliding q=512 kv=1024 g=2 paged-PV split `1024`: `0.158 ms` versus prior post-span-change `0.186 ms`.
+- D128 q=512 kv=65536 g=4 paged-PV split `3072`: `1.229 ms` versus earlier `~1.48 ms`.
+- Nsight post-change on the D256 Qwen paged-PV cell: stage kernel avg `2.335 ms`, split-combine avg `0.040 ms`, Q quantize avg `0.004 ms`. The gain is inside the stage kernel, as intended.
+- Decision: keep the page-cache change. It is not the full remaining D256 gap, but it removes a repeated block-table lookup class across all D-size producers and improves every guard cell measured.

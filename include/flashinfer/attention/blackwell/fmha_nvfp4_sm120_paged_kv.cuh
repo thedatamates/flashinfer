@@ -483,6 +483,32 @@ __device__ __forceinline__ const uint32_t* sm120_nvfp4_paged_k_word_ptr(
   return reinterpret_cast<const uint32_t*>(params.k_pages + src);
 }
 
+__device__ __forceinline__ int64_t sm120_nvfp4_paged_k_data_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int kv_head,
+    int physical_page) {
+  return params.kv_layout_hnd
+             ? (static_cast<int64_t>(physical_page) * params.k_stride_page +
+                static_cast<int64_t>(kv_head) * params.k_stride_dim1)
+             : (static_cast<int64_t>(physical_page) * params.k_stride_page +
+                static_cast<int64_t>(kv_head) * params.k_stride_dim2);
+}
+
+__device__ __forceinline__ const uint32_t* sm120_nvfp4_paged_k_word_ptr_from_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int64_t page_base,
+    int page_offset,
+    int dim) {
+  const int packed_col = dim >> 1;
+  const int64_t src =
+      page_base +
+      static_cast<int64_t>(page_offset) *
+          (params.kv_layout_hnd ? params.k_stride_dim2
+                                : params.k_stride_dim1) +
+      static_cast<int64_t>(packed_col) * params.k_stride_dim3;
+  return reinterpret_cast<const uint32_t*>(params.k_pages + src);
+}
+
 __device__ __forceinline__ const uint32_t* sm120_nvfp4_paged_k_word_ptr(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int logical_token,

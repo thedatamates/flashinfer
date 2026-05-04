@@ -304,6 +304,7 @@ struct Sm120Nvfp4QkvLoadCollectiveStorage {
   alignas(16) float global_m[kCutlassTileM];
   alignas(16) float global_l[kCutlassTileM];
   alignas(16) float old_scale_stage[2][kCutlassTileM];
+  alignas(16) int32_t physical_page_cache[kCutlassTileN / 16];
 };
 
 static_assert(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage) <= (99u << 10),
@@ -766,8 +767,24 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         barrier, cute::block_rank_in_cluster(), transaction_bytes);
   };
 
+  auto cache_paged_physical_pages = [&](int kv_tile) {
+    if constexpr (kUsePagedKv) {
+      constexpr int kPagedPageSize = 16;
+      constexpr int kPagesPerKvTile = kCutlassTileN / kPagedPageSize;
+      if (load_thread_idx < kPagesPerKvTile) {
+        const int local_page = load_thread_idx;
+        const int token = kv_tile * kCutlassTileN + local_page * kPagedPageSize;
+        const int logical_page = token / kPagedPageSize;
+        storage.physical_page_cache[local_page] =
+            token < kv_len_tokens ? effective_block_table[logical_page] : 0;
+      }
+      load_group_sync();
+    }
+  };
+
   auto stage_paged_k_tile = [&](int kv_tile, int k_outer, int write_stage) {
     if constexpr (kUsePagedKv) {
+      cache_paged_physical_pages(kv_tile);
       using QkSmemLayoutB = typename CutlassCollectiveMainloop::SmemLayoutB;
       static_assert(decltype(cute::size<1>(QkSmemLayoutB{}))::value >= 8,
                     "Paged K producer requires an inner-K layout extent large "
@@ -798,12 +815,15 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const int token = kv_tile * kCutlassTileN + row0;
         const int dim0 = k_outer * kCutlassTileK + k0;
         const bool in_bounds = token < kv_len_tokens;
+        const int local_page = row0 >> 4;
+        const int page_offset = row0 & 15;
+        const int physical_page = storage.physical_page_cache[local_page];
+        const int64_t data_page_base = sm120_nvfp4_paged_k_data_page_base(
+            paged_kv_params, effective_kv_head, physical_page);
         const uint32_t* src =
-            in_bounds
-                ? sm120_nvfp4_paged_k_word_ptr(
-                      paged_kv_params, effective_block_table,
-                      effective_kv_head, token, dim0)
-                : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
+            in_bounds ? sm120_nvfp4_paged_k_word_ptr_from_page_base(
+                            paged_kv_params, data_page_base, page_offset, dim0)
+                      : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
         cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
             reinterpret_cast<uint32_t*>(dst0), src, in_bounds);
       }
@@ -819,10 +839,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         const int scale_col = k_outer * kKScaleCols + local_scale_col;
         uint8_t scale = 0x38;
         if (token < kv_len_tokens) {
-          const int logical_page = token / paged_kv_params.page_size;
-          const int page_offset =
-              token - logical_page * paged_kv_params.page_size;
-          const int physical_page = effective_block_table[logical_page];
+          const int local_page = row >> 4;
+          const int page_offset = row & 15;
+          const int physical_page = storage.physical_page_cache[local_page];
           const int64_t scale_page_base =
               sm120_nvfp4_paged_k_scale_page_base(
                   paged_kv_params, effective_kv_head, physical_page);
@@ -842,6 +861,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto stage_paged_v_tile = [&](int kv_tile, int effective_out_group_idx,
                                 int write_stage) {
     if constexpr (kUsePagedKv) {
+      cache_paged_physical_pages(kv_tile);
       auto pv_scale_pair_for = [&](int token_group_start, int dim0,
                                    uint8_t& sf0, uint8_t& sf1) {
         float max_abs0 = 0.0f;
@@ -860,11 +880,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
             }
           }
           if (token_group_start < kv_len_tokens) {
-            const int logical_page =
-                token_group_start / paged_kv_params.page_size;
-            const int page_offset0 =
-                token_group_start - logical_page * paged_kv_params.page_size;
-            const int physical_page = effective_block_table[logical_page];
+            const int local_token_group =
+                token_group_start - kv_tile * kCutlassTileN;
+            const int local_page = local_token_group >> 4;
+            const int page_offset0 = local_token_group & 15;
+            const int physical_page = storage.physical_page_cache[local_page];
             const int64_t data_page_base =
                 sm120_nvfp4_paged_v_data_page_base(
                     paged_kv_params, effective_kv_head, physical_page);
@@ -970,11 +990,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
               effective_out_group_idx * kCutlassTileN + local_dim0;
           uint32_t row_word = 0;
           if (token < kv_len_tokens) {
-            const int logical_page =
-                token / paged_kv_params.page_size;
-            const int page_offset =
-                token - logical_page * paged_kv_params.page_size;
-            const int physical_page = effective_block_table[logical_page];
+            const int local_token = local_k0 + subgroup_lane;
+            const int local_page = local_token >> 4;
+            const int page_offset = local_token & 15;
+            const int physical_page = storage.physical_page_cache[local_page];
             const int64_t data_page_base =
                 sm120_nvfp4_paged_v_data_page_base(
                     paged_kv_params, effective_kv_head, physical_page);
@@ -1050,11 +1069,10 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                   paged_kv_params, batch_idx, effective_kv_head, token,
                   dim_base >> 1);
             } else {
-              const int logical_page =
-                  token / paged_kv_params.page_size;
-              const int page_offset =
-                  token - logical_page * paged_kv_params.page_size;
-              const int physical_page = effective_block_table[logical_page];
+              const int local_token = local_k0 + subgroup_lane;
+              const int local_page = local_token >> 4;
+              const int page_offset = local_token & 15;
+              const int physical_page = storage.physical_page_cache[local_page];
               const int64_t data_page_base =
                   sm120_nvfp4_paged_v_data_page_base(
                       paged_kv_params, effective_kv_head, physical_page);
@@ -1119,8 +1137,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           const int dim = effective_out_group_idx * kCutlassTileN + col;
           uint8_t scale = 0x38;
           if (token < kv_len_tokens) {
-            const int logical_page = token / paged_kv_params.page_size;
-            const int physical_page = effective_block_table[logical_page];
+            const int local_page = k0 >> 4;
+            const int physical_page = storage.physical_page_cache[local_page];
             scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page(
                 paged_kv_params, effective_kv_head, physical_page, dim);
           }
