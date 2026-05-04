@@ -3939,3 +3939,53 @@ Result:
   partition patterned after `hopper/sparse_mainloop.cuh` / fmha_v2
   `Gmem_tile_paged_kv`, not local grouping inside the current CUTLASS
   `SmemCopyAtomB` traversal.
+
+## 2026-05-04 05:05 CDT - Gemma Sliding Split Schedule Check
+
+What I am about to do:
+- Gemma sliding has a fixed effective window of 1024 tokens but was still being
+  benchmarked and planned with the generic `4096` split length.
+- That can make each split stage cover much more KV than the sliding mask can
+  use, especially in the current split-K scheduler.
+- I am sweeping the key Gemma-sliding cell before changing defaults.
+
+Result:
+- Gemma-sliding `q=512 kv=8192 g=2 swa=1024 softcap=30`, PV:
+  - split `128`: `0.569 ms`
+  - split `256`: `0.432 ms`
+  - split `512`: `0.458 ms`
+  - split `1024`: `0.415 ms`
+  - split `1536`: `0.578 ms`
+  - split `2048`: `0.742 ms`
+  - split `3072`: `1.06 ms`
+  - split `4096`: `1.40 ms`
+  - split `6144`: `2.04 ms`
+  - split `8192`: `2.72 ms`
+- Gemma-sliding `q=512 kv=8192 g=2 swa=1024 softcap=30`, linear:
+  - split `128`: `0.676 ms`
+  - split `256`: `0.545 ms`
+  - split `512`: `0.574 ms`
+  - split `1024`: `0.522 ms`
+  - split `1536`: `0.696 ms`
+  - split `2048`: `0.876 ms`
+  - split `3072`: `1.22 ms`
+  - split `4096`: `1.59 ms`
+  - split `6144`: `2.26 ms`
+  - split `8192`: `2.99 ms`
+- Conclusion: Gemma sliding was mostly mis-scheduled. The best tested split is
+  the sliding window length, `1024`; the generic `4096` split burns 3x+ runtime.
+
+Auto-split implementation:
+- Changed wrapper `plan(..., split_kv_len=0)` to mean production auto-selection.
+- SWA selects `round_up(window_left, 128)`, so Gemma sliding picks `1024`.
+- Non-SWA selects from Q tile count with head_dim-specific scaling:
+  - D256 Qwen-full `q=512 g=6` picks `3072`.
+  - D512 Gemma-global `q=512 g=8` picks `12288`.
+- Positive `split_kv_len` still preserves explicit caller control.
+- Benchmark and grid defaults now use auto mode (`0`) so production reports do
+  not accidentally benchmark the stale `4096` split.
+- Smoke results:
+  - Qwen-full D256 linear `q=512 kv=65536`: split `3072`, `5.03 ms`.
+  - Gemma-sliding D256 linear `q=512 kv=8192`: split `1024`, `0.523 ms`.
+  - Gemma-global D512 linear `q=512 kv=65536`: split `12288`, `10.71 ms`.
+  - Gemma-global D512 PV `q=512 kv=65536`: split `12288`, `9.70 ms`.

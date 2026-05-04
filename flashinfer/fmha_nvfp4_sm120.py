@@ -55,6 +55,23 @@ def _round_up(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
 
+def _auto_split_kv_len(
+    *,
+    head_dim: int,
+    max_q_len: int,
+    group_size: int,
+    window_left: int,
+) -> int:
+    if window_left > 0:
+        return _round_up(window_left, 128)
+    tile_m = _paged_tile_m_for_config(head_dim, False)
+    q_tiles = max(1, _round_up(max_q_len * group_size, tile_m) // tile_m)
+    if head_dim == 512:
+        q_tiles *= 3
+    split_tiles = min(max(q_tiles, 8), 96)
+    return split_tiles * 128
+
+
 def _empty_aligned(
     shape: Tuple[int, ...],
     *,
@@ -164,7 +181,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         causal: bool = True,
         window_left: int = -1,
         logits_soft_cap: float = 0.0,
-        split_kv_len: int = 4096,
+        split_kv_len: int = 0,
         output_group_span: Optional[int] = None,
         v_cache_uses_pv_layout: bool = True,
     ) -> None:
@@ -174,8 +191,10 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             raise ValueError("head_dim must be one of {128, 256, 512}.")
         if num_qo_heads % num_kv_heads != 0:
             raise ValueError("num_qo_heads must be divisible by num_kv_heads.")
-        if split_kv_len <= 0 or split_kv_len % 128 != 0:
-            raise ValueError("split_kv_len must be a positive multiple of 128.")
+        if split_kv_len < 0 or split_kv_len % 128 != 0:
+            raise ValueError(
+                "split_kv_len must be 0 for auto-selection or a positive multiple of 128."
+            )
         if window_left < -1 or window_left == 0:
             raise ValueError(
                 "window_left must be -1 to disable SWA or a positive window size."
@@ -264,7 +283,6 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         self._window_left = int(window_left)
         self._logits_soft_cap = float(logits_soft_cap)
         self._v_cache_uses_pv_layout = bool(v_cache_uses_pv_layout)
-        self._split_kv_tiles = int(split_kv_len // 128)
         self._output_group_span = int(output_group_span)
         self._module = _get_sm120_nvfp4_fmha_module(
             self._head_dim,
@@ -275,6 +293,17 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
         )
 
         tile_m = _paged_tile_m_for_config(head_dim, self._window_left > 0)
+        resolved_split_kv_len = (
+            _auto_split_kv_len(
+                head_dim=head_dim,
+                max_q_len=self._max_q_len,
+                group_size=self._group_size,
+                window_left=self._window_left,
+            )
+            if split_kv_len == 0
+            else int(split_kv_len)
+        )
+        self._split_kv_tiles = int(resolved_split_kv_len // 128)
         max_q_rows_per_kv_head = self._max_q_len * self._group_size
         padded_q_rows_per_seq = _round_up(max_q_rows_per_kv_head, tile_m)
         batch_padded_q_rows = (

@@ -59,12 +59,22 @@ def auto_split_kv_len(
         if api == "paged-wrapper"
         else tile_m_for_head_dim(head_dim)
     )
+    if api == "paged-wrapper" and sliding_window > 0:
+        split_kv_len = round_up(sliding_window, 128)
+    else:
+        q_tiles = max(1, round_up(q_len * group, tile_m) // tile_m)
+        if api == "paged-wrapper" and head_dim == 512:
+            q_tiles *= 3
+        split_kv_len = min(max(q_tiles, 8), 96) * 128
     padded_rows = num_kv_heads * round_up(q_len * group, tile_m)
     bytes_per_split = padded_rows * (head_dim * 2 + 2 * 4)
-    max_splits = max(1, max_partial_bytes // max(1, bytes_per_split))
     total_kv_tiles = math.ceil(kv_len / 128)
-    split_kv_tiles = max(1, math.ceil(total_kv_tiles / max_splits))
-    return split_kv_tiles * 128
+    split_kv_tiles = max(1, split_kv_len // 128)
+    while True:
+        num_splits = math.ceil(total_kv_tiles / split_kv_tiles)
+        if num_splits * bytes_per_split <= max_partial_bytes:
+            return split_kv_tiles * 128
+        split_kv_tiles += 1
 
 
 def event_ms(fn, *, warmup: int, repeat: int) -> dict[str, float]:
@@ -137,11 +147,10 @@ def main() -> None:
     parser.add_argument(
         "--split-kv-len",
         type=int,
-        default=4096,
+        default=0,
         help=(
-            "Split length in tokens. Defaults to the production wrapper "
-            "default. Use 0 to auto-select the smallest split that keeps "
-            "partial/split scratch under --max-partial-bytes."
+            "Split length in tokens. Use 0 to follow the production wrapper "
+            "auto-selection while respecting --max-partial-bytes."
         ),
     )
     parser.add_argument(
