@@ -33,7 +33,10 @@ namespace flashinfer::attention::blackwell::sm120_nvfp4::d256 {
 constexpr int kHeadDim = 256;
 constexpr int kTileM = 16;
 constexpr int kTileN = 16;
-constexpr int kCutlassTileM = 64;
+#ifndef FLASHINFER_SM120_NVFP4_D256_TILE_M
+#define FLASHINFER_SM120_NVFP4_D256_TILE_M 64
+#endif
+constexpr int kCutlassTileM = FLASHINFER_SM120_NVFP4_D256_TILE_M;
 constexpr int kCutlassTileN = 128;
 constexpr int kCutlassTileK = 128;
 constexpr int kMinBlocksPerSm = 1;

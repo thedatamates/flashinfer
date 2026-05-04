@@ -33,6 +33,12 @@ def tile_m_for_head_dim(head_dim: int) -> int:
     raise ValueError("head_dim must be one of {128, 256, 512}")
 
 
+def paged_tile_m_for_config(head_dim: int, sliding_window: int) -> int:
+    if head_dim == 256 and sliding_window <= 0:
+        return 128
+    return tile_m_for_head_dim(head_dim)
+
+
 def round_up(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
@@ -45,8 +51,14 @@ def auto_split_kv_len(
     head_dim: int,
     num_kv_heads: int,
     max_partial_bytes: int,
+    api: str,
+    sliding_window: int,
 ) -> int:
-    tile_m = tile_m_for_head_dim(head_dim)
+    tile_m = (
+        paged_tile_m_for_config(head_dim, sliding_window)
+        if api == "paged-wrapper"
+        else tile_m_for_head_dim(head_dim)
+    )
     padded_rows = num_kv_heads * round_up(q_len * group, tile_m)
     bytes_per_split = padded_rows * (head_dim * 2 + 2 * 4)
     max_splits = max(1, max_partial_bytes // max(1, bytes_per_split))
@@ -197,6 +209,8 @@ def main() -> None:
             head_dim=args.head_dim,
             num_kv_heads=args.num_kv_heads,
             max_partial_bytes=args.max_partial_bytes,
+            api=args.mode,
+            sliding_window=args.sliding_window,
         )
         if args.split_kv_len == 0
         else args.split_kv_len

@@ -4,9 +4,14 @@
  * Licensed under the Apache License, Version 2.0 (the "License");
  */
 
+#include "fmha_nvfp4_sm120_config.inc"
+
+#if !SM120_NVFP4_USE_SLIDING_WINDOW_PREPROC
+#define FLASHINFER_SM120_NVFP4_D256_TILE_M 128
+#endif
+
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh>
 
-#include "fmha_nvfp4_sm120_config.inc"
 #include "fmha_nvfp4_sm120_paged_common.cuh"
 
 namespace flashinfer {

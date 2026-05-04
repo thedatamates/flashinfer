@@ -7,6 +7,7 @@
 #pragma once
 
 constexpr bool SM120_NVFP4_CAUSAL = {{ causal }};
+#define SM120_NVFP4_USE_SLIDING_WINDOW_PREPROC {{ 1 if use_sliding_window == "true" else 0 }}
 constexpr bool SM120_NVFP4_USE_SLIDING_WINDOW = {{ use_sliding_window }};
 constexpr bool SM120_NVFP4_USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
 constexpr bool SM120_NVFP4_USE_PV_LAYOUT_V = {{ use_pv_layout_v }};

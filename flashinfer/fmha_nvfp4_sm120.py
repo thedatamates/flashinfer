@@ -35,6 +35,12 @@ def _tile_m_for_head_dim(head_dim: int) -> int:
     raise ValueError("SM120 NVFP4 FMHA supports head_dim in {128, 256, 512}.")
 
 
+def _paged_tile_m_for_config(head_dim: int, use_sliding_window: bool) -> int:
+    if head_dim == 256 and not use_sliding_window:
+        return 128
+    return _tile_m_for_head_dim(head_dim)
+
+
 def _default_output_group_span(head_dim: int) -> int:
     if head_dim == 128:
         return 1
@@ -268,7 +274,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             self._v_cache_uses_pv_layout,
         )
 
-        tile_m = _tile_m_for_head_dim(head_dim)
+        tile_m = _paged_tile_m_for_config(head_dim, self._window_left > 0)
         max_q_rows_per_kv_head = self._max_q_len * self._group_size
         padded_q_rows_per_seq = _round_up(max_q_rows_per_kv_head, tile_m)
         batch_padded_q_rows = (

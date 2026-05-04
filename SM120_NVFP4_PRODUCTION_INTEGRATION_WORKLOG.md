@@ -3746,3 +3746,69 @@ Seven-load-warp D256 follow-up:
 - Decision: keep seven load warps. It recovers another small slice of the
   D256 paged producer gap without reproducing the sequence/state-sensitive
   failures seen at eight load warps.
+
+## 2026-05-04 03:20 CDT - D256 Paged CTA Amortization Check
+
+What I am about to do:
+- D512 uses `kCutlassTileM=128`; D256 uses `kCutlassTileM=64`.
+- The paged producer does manual K/V staging into CUTLASS operand smem, so a
+  smaller M tile doubles the number of producer CTAs for the same Q length.
+- Dense uses TMA and is less sensitive to that per-CTA producer overhead. This
+  is a plausible structural reason D256 paged remains far behind dense while
+  D512 is much closer.
+- I will test a D256 `kCutlassTileM=128` variant as a private kernel-internal
+  experiment. Decision criterion: keep only if correctness holds and the
+  paged/dense ratio improves materially at Qwen-full and Gemma-sliding cells.
+
+Result:
+- Qwen-full `q=512 kv=65536 g=6`, PV, split `4096`:
+  `6.74 ms` -> `5.33 ms`.
+- Qwen-full `q=512 kv=65536 g=6`, linear, split `4096`:
+  prior focused result `8.68 ms` -> `6.28 ms`.
+- Qwen-full dense at the same cell:
+  `2.08 ms` with `M=128`, materially slower than the `M=64` dense-focused
+  baseline.
+- Gemma-sliding `q=512 kv=8192 g=2 swa=1024 softcap=30`, PV:
+  prior focused result around `1.18 ms` after the load-warp change regressed to
+  `1.96 ms`.
+- Gemma-sliding linear at the same cell:
+  `2.12 ms`.
+- Decision: reverted. `M=128` confirms the residual D256 full-attention gap is
+  partly CTA-amortization overhead, but it is not a valid global D256 setting.
+  The right shape is workload-specific: long full-attention Qwen wants a larger
+  Q tile; sliding-window Gemma does not.
+
+Follow-up implementation plan:
+- Do not add a new public API field or JIT axis.
+- Use the existing `SM120_NVFP4_USE_SLIDING_WINDOW` specialization in the D256
+  paged TU: non-SWA D256 paged gets `M=128`; SWA D256 paged stays `M=64`.
+- Keep the D256 dense TU at `M=64`, because the dense baseline regressed under
+  the global `M=128` experiment and dense does not pay the paged producer CTA
+  overhead.
+- Update the Python wrapper's padded-row calculation to match the selected
+  paged module tile. Decision criterion: no-SWA production cells improve while
+  Gemma sliding remains on the prior fast path.
+
+Implementation result:
+- Added a generated preprocessor value for `use_sliding_window` in
+  `fmha_nvfp4_sm120_config.inc`.
+- D256 paged TU defines `FLASHINFER_SM120_NVFP4_D256_TILE_M=128` only when
+  `use_sliding_window=false`; the D256 dense TU keeps the default `M=64`.
+- Wrapper and benchmark padding/split math now use the paged module tile for
+  paged runs and the dense tile for dense runs.
+- Qwen-full `q=512 kv=65536 g=6`, PV:
+  `6.74 ms` -> `5.34 ms`.
+- Qwen-full `q=512 kv=65536 g=6`, linear:
+  `8.68 ms` focused baseline -> `6.34 ms`.
+- Qwen-full dense at the same cell stayed on `M=64`:
+  `1.37 ms`.
+- Gemma-sliding `q=512 kv=8192 g=2 swa=1024 softcap=30`, PV:
+  `1.41 ms`, avoiding the global-`M=128` regression (`1.96 ms` in the
+  experiment).
+- Gemma-sliding linear at the same cell:
+  `1.58 ms`.
+- Full `tests/attention/test_nvfp4_kv_head_dim_512.py -q`:
+  `36 passed in 225.39s`.
+- Conclusion: this is a valid workload-specialized structural win using an
+  existing spec axis. It does not solve the whole paged-vs-dense gap, but it
+  removes one obvious source of excess D256 full-attention producer CTA count.
