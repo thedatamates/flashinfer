@@ -4572,3 +4572,12 @@ D256 geometry overrideability result:
 - This is intended as a diagnostic-enabling patch with no default production behavior change.
 - Test status: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 358.46s`).
 - Next: rerun the D256 geometry sweep with isolated JIT roots now that the macro values actually reach the header.
+
+D256 real geometry sweep result:
+- Reference cell: D256 q=512 kv=65536 g=6 paged-PV, Qwen full spec, fixed split `3072`, isolated JIT roots.
+- Default no-SWA geometry (`TILE_M=128`, `LOAD_WARPS=11`): mean `2.559 ms`.
+- `TILE_M=128`, `LOAD_WARPS=7`: mean `2.676 ms`.
+- `TILE_M=128`, `LOAD_WARPS=9`: mean `2.723 ms`.
+- `TILE_M=128`, `LOAD_WARPS=13`: mean `2.972 ms`.
+- `TILE_M=64`, `LOAD_WARPS=11`: mean `3.080 ms`.
+- Decision: the committed D256 no-SWA geometry is the best tested configuration. The earlier invalidated flat result is superseded by this entry. No geometry default change.
