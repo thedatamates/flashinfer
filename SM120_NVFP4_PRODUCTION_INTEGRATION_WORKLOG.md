@@ -6503,3 +6503,115 @@ Decision:
 - Profile Qwen D256 `q=16384 kv=262144 g=6` next. It is the strongest overlap of the new target criteria: large Q, max KV, production full-attention configuration, and still slower than `nvfp4_fa2`.
 - Start with NSYS paged-PV vs dense to separate stage, combine, and any auxiliary kernels before using NCU source attribution.
 - Use paged-PV for the first profile because linear and PV are equivalent at this scale; PV removes linear-V cache/reblock noise and isolates the paged mainloop overhead.
+
+## 2026-05-04 17:21 CDT - Large-Q D256 Page-Cache Barrier Target
+
+Finding:
+
+- NSYS on Qwen D256 `q=16384 kv=262144 g=6` paged-PV vs dense localized the gap to the stage kernel:
+  - Paged-PV stage: `225.86 ms` average, grid `768 x 1 x 21`, dynamic smem `~92 KiB`.
+  - Dense stage: `130.71 ms` average, grid `1536 x 1 x 21`, dynamic smem `~50 KiB`.
+  - Combine is about `2.1 ms` for both; Q quantization and auxiliary torch kernels are sub-millisecond.
+- NCU high-level comparison shows paged is not DRAM-limited:
+  - Paged: DRAM throughput `4.53%`, L2 hit rate `99.97%`, SM throughput `28.68%`, eligible warps/scheduler `0.39`, `Stall Barrier = 3.54`.
+  - Dense: DRAM throughput `0.50%`, L2 hit rate `99.64%`, SM throughput `31.30%`, eligible warps/scheduler `0.37`, `Stall Barrier = 0.22`.
+- D256 `TILE_M=64` was re-tested on the large-Q/max-KV target with an isolated JIT cache and regressed: `272.82 ms` paged-PV versus the default roughly `234-243 ms`.
+- Split scheduling was swept on the same cell. Valid splits `4096+` cluster near `234-242 ms`, with best measured `12288` at `234.27 ms`; auto `12544` is effectively tied at `234.37 ms`. Small splits `1024/1536/2048/3072` triggered illegal memory access at this large shape and need a separate bounds audit.
+- Lineinfo NCU on Qwen D256 `q=4096 kv=262144` identifies the largest paged-only barrier source at `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh:844`, inside `cache_paged_physical_pages()`.
+- That function uses only `8` load threads to fill `storage.physical_page_cache[]`, then synchronizes the full load group. K and V each call it for the same KV tile, so the entire load group repeatedly waits on a tiny shared cache.
+
+Implementation target:
+
+- Test D256 only first.
+- Remove the shared `physical_page_cache` dependency from the D256 hot paged producer path.
+- Replace it with a direct helper that computes `logical_page` and loads `effective_block_table[logical_page]` at each K/V use site.
+- This trades repeated L2-resident block-table reads for removing the full-load-group page-cache barrier. NCU shows L2 hit rate is already effectively perfect, while barrier stall is paged-specific.
+
+Validation:
+
+- Benchmark Qwen D256 `q=4096 kv=262144` and `q=16384 kv=262144`, paged-PV first.
+- If timing improves, run focused D256 correctness and then apply the same direct-page helper pattern to D128/D512.
+- If timing regresses, revert the D256 diagnostic and keep the NCU finding as evidence that the page-cache barrier is real but not profitably removable by direct reload.
+
+## 2026-05-04 17:26 CDT - Large-Q D256 Page-Cache Barrier Result
+
+Implementation:
+
+- Tested a D256-only diagnostic that removed `cache_paged_physical_pages(kv_tile)` from the hot paged producer.
+- Replaced `storage.physical_page_cache[local_page]` uses with direct block-table reads through a helper keyed by `logical_page`.
+- Left the public API, launch geometry, split heuristic, and K/V data layouts unchanged.
+
+Measured result:
+
+| cell | baseline paged-PV ms | direct-page diagnostic ms | result |
+|:---|---:|---:|:---|
+| D256 Qwen `q=4096 kv=262144 g=6` | `~61.6` | `77.406` | regressed |
+| D256 Qwen `q=16384 kv=262144 g=6` | `~234-242` | `262.760` | regressed |
+
+Decision:
+
+- Reverted the diagnostic. The shared page cache remains the right tradeoff for the current producer despite its barrier cost.
+- The NCU barrier finding is still real, but direct L2-resident block-table reloads increase total work enough to lose.
+- The next target is the NCU lineinfo hot path at `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh:1956`, where `q_token = global_q_row / group_size` dominates issued instructions and contributes substantial wait stalls in the large-Q paged stage kernel.
+
+## 2026-05-04 17:29 CDT - Large-Q Score-Mask Division Target
+
+Finding:
+
+- Lineinfo NCU on Qwen D256 `q=4096 kv=262144 g=6` paged-PV identified the score-mask row division as the top issued-instruction site:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh:1956`: `q_token = global_q_row / group_size`.
+  - The same site also contributes substantial wait samples in the paged stage kernel.
+- The current lambda computes `global_q_row`, checks `global_q_row >= q_len * group_size`, divides by runtime `group_size`, and computes `q_pos` for every score element.
+- `q_pos` is row-only within a CTA. It does not depend on score column or KV tile.
+- The kernel already has a full-CTA shared-memory initialization loop followed by `__syncthreads()`, so row-level mask state can be initialized once per CTA without adding a new synchronization point.
+
+Implementation target:
+
+- Add a shared `q_pos_cache[kCutlassTileM]` to the kernel storage.
+- Initialize it in the existing per-row storage initialization loop:
+  - valid row: `kv_len_tokens - q_len + global_q_row / group_size`.
+  - invalid row: a sentinel that cannot collide with a real sequence position.
+- Replace the per-score division inside `score_is_valid()` with a read from `q_pos_cache[row]`.
+- Test D256 first because the NCU source attribution came from D256. If it improves or is neutral, port the same row-cache pattern to D128 and D512.
+
+Validation:
+
+- Build/JIT D256 paged-PV and run a focused correctness smoke before benchmarking.
+- Benchmark Qwen D256 `q=4096 kv=262144` and `q=16384 kv=262144`, paged-PV.
+- If the D256 result is positive or neutral, apply the same change to D128/D512 and run focused NVFP4 correctness before committing.
+
+## 2026-05-04 17:46 CDT - Large-Q Score-Mask Division Result
+
+Implementation variants:
+
+- Shared row cache:
+  - Added `q_pos_cache[kCutlassTileM]` to the D256 kernel storage.
+  - Initialized it once per CTA in the existing storage-init loop and replaced per-score row division with a shared read.
+- No-smem row-run cache:
+  - Reverted the shared storage change.
+  - Cached `q_pos` only across consecutive identical rows in the QK accumulator store loop, without changing shared-memory layout.
+
+Measured result:
+
+| variant | cell | paged-PV mean ms | paged-linear mean ms | correctness |
+|:---|:---|---:|---:|:---|
+| baseline | D256 Qwen `q=4096 kv=262144 g=6` | `~61.6` | not rerun | prior green |
+| shared row cache | D256 Qwen `q=4096 kv=262144 g=6` | `51.514` | not rerun | failed D256 focused tests |
+| shared row cache | D256 Qwen `q=16384 kv=262144 g=6` | `203.501` | `202.892` | failed D256 focused tests |
+| no-smem row-run cache | D256 Qwen `q=4096 kv=262144 g=6` | `77.182` | not rerun | focused failures fixed |
+| no-smem row-run cache | D256 Qwen `q=16384 kv=262144 g=6` | `296.980` | `308.635` | focused failures fixed |
+
+Correctness detail:
+
+- Shared row cache failed D256 multi-KV/ragged focused tests:
+  - `test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x[256-6]`
+  - `test_sm120_nvfp4_wrapper_scratch_poison_does_not_affect_output_sm12x`
+  - `test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x[256-6]`
+  - `test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x[256-6]`
+- No-smem row-run cache passed the same focused selection: `10 passed, 26 deselected`.
+
+Decision:
+
+- Reverted both code variants. The shared row cache proves that the score-mask division is a real cost, but its naive storage placement perturbs D256 correctness.
+- The no-smem cache is correctness-safe but regresses the large-Q target, likely by adding loop-carried state and branch pressure without removing enough runtime divisions.
+- Do not reattempt score-mask caching without first identifying a safe lifetime/alias location or using NCU to show the division remains the dominant source after other changes.
