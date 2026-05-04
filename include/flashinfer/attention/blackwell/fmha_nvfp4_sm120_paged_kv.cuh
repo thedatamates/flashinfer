@@ -63,7 +63,7 @@ struct Sm120Nvfp4PagedKvLoadParams {
   const uint8_t* v_linear_data_cache = nullptr;
   int64_t v_linear_data_cache_head_stride = 0;
   int64_t v_linear_data_cache_batch_stride = 0;
-  int64_t v_linear_data_cache_token_stride = 0;
+  int64_t v_linear_data_cache_physical_kv_len = 0;
 
   __device__ __forceinline__ bool enabled() const {
     return block_table != nullptr;
@@ -90,34 +90,54 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_v_linear_scale_from_page_ba
     int page_offset,
     int scale_col);
 
+template <bool kCoalescedLayout>
 __device__ __forceinline__ uint8_t sm120_nvfp4_linear_v_scale_cache_load(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int batch_idx,
     int kv_head,
     int dim,
     int token_group) {
-  const int64_t idx =
+  int64_t idx =
       static_cast<int64_t>(batch_idx) * params.v_linear_scale_cache_batch_stride +
-      static_cast<int64_t>(kv_head) * params.v_linear_scale_cache_head_stride +
-      static_cast<int64_t>(dim) * params.v_linear_scale_cache_groups +
-      token_group;
+      static_cast<int64_t>(kv_head) * params.v_linear_scale_cache_head_stride;
+  if constexpr (kCoalescedLayout) {
+    idx += static_cast<int64_t>(token_group) * params.packed_dim * 2 + dim;
+  } else {
+    idx += static_cast<int64_t>(dim) * params.v_linear_scale_cache_groups +
+           token_group;
+  }
   return params.v_linear_scale_cache[idx];
 }
 
+template <bool kCoalescedLayout>
 __device__ __forceinline__ uint32_t sm120_nvfp4_linear_v_data_cache_word(
     const Sm120Nvfp4PagedKvLoadParams& params,
     int batch_idx,
     int kv_head,
     int token,
     int packed_col) {
-  const int64_t idx =
+#if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
+  if ((packed_col & 3) != 0) {
+    SM120_NVFP4_DEBUG_TRAP();
+  }
+#endif
+  int64_t idx =
       static_cast<int64_t>(batch_idx) * params.v_linear_data_cache_batch_stride +
-      static_cast<int64_t>(kv_head) * params.v_linear_data_cache_head_stride +
-      static_cast<int64_t>(token) * params.v_linear_data_cache_token_stride +
-      packed_col;
+      static_cast<int64_t>(kv_head) * params.v_linear_data_cache_head_stride;
+  if constexpr (kCoalescedLayout) {
+    const int word_col = packed_col >> 2;
+    idx +=
+        (static_cast<int64_t>(word_col) *
+             params.v_linear_data_cache_physical_kv_len +
+         token) *
+        4;
+  } else {
+    idx += static_cast<int64_t>(token) * params.packed_dim + packed_col;
+  }
   return *reinterpret_cast<const uint32_t*>(params.v_linear_data_cache + idx);
 }
 
+template <bool kCoalescedLayout>
 static __global__ void sm120_nvfp4_linear_v_scale_cache_kernel(
     Sm120Nvfp4PagedKvLoadParams params,
     uint8_t* cache,
@@ -136,10 +156,19 @@ static __global__ void sm120_nvfp4_linear_v_scale_cache_kernel(
        idx < total;
        idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     int64_t t = idx;
-    const int token_group = static_cast<int>(t % token_groups);
-    t /= token_groups;
-    const int dim_pair = static_cast<int>(t % dim_pairs);
-    t /= dim_pairs;
+    int token_group;
+    int dim_pair;
+    if constexpr (kCoalescedLayout) {
+      dim_pair = static_cast<int>(t % dim_pairs);
+      t /= dim_pairs;
+      token_group = static_cast<int>(t % token_groups);
+      t /= token_groups;
+    } else {
+      token_group = static_cast<int>(t % token_groups);
+      t /= token_groups;
+      dim_pair = static_cast<int>(t % dim_pairs);
+      t /= dim_pairs;
+    }
     const int kv_head = static_cast<int>(t % num_kv_heads);
     const int batch_idx = static_cast<int>(t / num_kv_heads);
 
@@ -201,13 +230,18 @@ static __global__ void sm120_nvfp4_linear_v_scale_cache_kernel(
       sf1 = fp32_to_e4m3_byte(max_abs1 > 0.0f ? max_abs1 / 6.0f : 1.0f);
     }
 
-    const int64_t cache_base =
+    const int64_t head_base =
         static_cast<int64_t>(batch_idx) *
             static_cast<int64_t>(num_kv_heads) * head_dim * token_groups +
-        static_cast<int64_t>(kv_head) * head_dim * token_groups +
-        static_cast<int64_t>(dim_pair * 2) * token_groups + token_group;
+        static_cast<int64_t>(kv_head) * head_dim * token_groups;
+    const int64_t cache_base =
+        kCoalescedLayout
+            ? head_base + static_cast<int64_t>(token_group) * head_dim +
+                  dim_pair * 2
+            : head_base + static_cast<int64_t>(dim_pair * 2) * token_groups +
+                  token_group;
     cache[cache_base] = sf0;
-    cache[cache_base + static_cast<int64_t>(token_groups)] = sf1;
+    cache[cache_base + (kCoalescedLayout ? 1 : token_groups)] = sf1;
   }
 }
 
@@ -241,17 +275,27 @@ inline cudaError_t sm120_nvfp4_prepare_linear_v_scale_cache(
   const int64_t total_pairs =
       static_cast<int64_t>(batch_size) * num_kv_heads * (head_dim / 2) *
       token_groups;
+  const bool coalesced_layout = (head_dim == 256);
   constexpr int kThreads = 256;
   int blocks = static_cast<int>((total_pairs + kThreads - 1) / kThreads);
   if (blocks > 65535) {
     blocks = 65535;
   }
-  sm120_nvfp4_linear_v_scale_cache_kernel<<<blocks, kThreads, 0, stream>>>(
-      params, cache, kv_lens, batch_size, num_kv_heads, head_dim,
-      physical_kv_len);
+  if (coalesced_layout) {
+    sm120_nvfp4_linear_v_scale_cache_kernel<true>
+        <<<blocks, kThreads, 0, stream>>>(params, cache, kv_lens, batch_size,
+                                          num_kv_heads, head_dim,
+                                          physical_kv_len);
+  } else {
+    sm120_nvfp4_linear_v_scale_cache_kernel<false>
+        <<<blocks, kThreads, 0, stream>>>(params, cache, kv_lens, batch_size,
+                                          num_kv_heads, head_dim,
+                                          physical_kv_len);
+  }
   return cudaGetLastError();
 }
 
+template <bool kCoalescedLayout>
 static __global__ void sm120_nvfp4_linear_v_data_cache_kernel(
     Sm120Nvfp4PagedKvLoadParams params,
     uint8_t* cache,
@@ -261,18 +305,31 @@ static __global__ void sm120_nvfp4_linear_v_data_cache_kernel(
     int head_dim,
     int physical_kv_len) {
   const int packed_dim = head_dim / 2;
+  const int packed_word_cols = packed_dim / 4;
   const int64_t total =
-      static_cast<int64_t>(batch_size) * num_kv_heads * physical_kv_len *
-      packed_dim;
+      static_cast<int64_t>(batch_size) * num_kv_heads * packed_word_cols *
+      physical_kv_len * 4;
   for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x +
                      threadIdx.x;
        idx < total;
        idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     int64_t t = idx;
-    const int packed_col = static_cast<int>(t % packed_dim);
-    t /= packed_dim;
-    const int token = static_cast<int>(t % physical_kv_len);
-    t /= physical_kv_len;
+    int token;
+    int packed_col;
+    if constexpr (kCoalescedLayout) {
+      const int byte_in_word = static_cast<int>(t & 3);
+      t >>= 2;
+      token = static_cast<int>(t % physical_kv_len);
+      t /= physical_kv_len;
+      const int packed_word_col = static_cast<int>(t % packed_word_cols);
+      t /= packed_word_cols;
+      packed_col = packed_word_col * 4 + byte_in_word;
+    } else {
+      packed_col = static_cast<int>(t % packed_dim);
+      t /= packed_dim;
+      token = static_cast<int>(t % physical_kv_len);
+      t /= physical_kv_len;
+    }
     const int kv_head = static_cast<int>(t % num_kv_heads);
     const int batch_idx = static_cast<int>(t / num_kv_heads);
 
@@ -302,10 +359,12 @@ static __global__ void sm120_nvfp4_linear_v_data_cache_kernel(
               local, scale_page_base, page_offset, scale_col);
       const float input_scale = e4m3_byte_to_fp32(input_scale_byte);
       const int token_group = token >> 4;
-      const uint8_t sf0_byte = sm120_nvfp4_linear_v_scale_cache_load(
-          params, batch_idx, kv_head, dim0, token_group);
-      const uint8_t sf1_byte = sm120_nvfp4_linear_v_scale_cache_load(
-          params, batch_idx, kv_head, dim0 + 1, token_group);
+      const uint8_t sf0_byte =
+          sm120_nvfp4_linear_v_scale_cache_load<kCoalescedLayout>(
+              params, batch_idx, kv_head, dim0, token_group);
+      const uint8_t sf1_byte =
+          sm120_nvfp4_linear_v_scale_cache_load<kCoalescedLayout>(
+              params, batch_idx, kv_head, dim0 + 1, token_group);
       const float inv_sf0 = 1.0f / fmaxf(e4m3_byte_to_fp32(sf0_byte), 1.0e-8f);
       const float inv_sf1 = 1.0f / fmaxf(e4m3_byte_to_fp32(sf1_byte), 1.0e-8f);
       const float x0 =
@@ -340,8 +399,12 @@ inline cudaError_t sm120_nvfp4_prepare_linear_v_data_cache(
     int physical_kv_len,
     cudaStream_t stream) {
   const int packed_dim = head_dim / 2;
+  const bool coalesced_layout = (head_dim == 256);
+  if ((packed_dim & 3) != 0) {
+    return cudaErrorInvalidValue;
+  }
   params.v_linear_data_cache = cache;
-  params.v_linear_data_cache_token_stride = packed_dim;
+  params.v_linear_data_cache_physical_kv_len = physical_kv_len;
   params.v_linear_data_cache_head_stride =
       static_cast<int64_t>(physical_kv_len) * packed_dim;
   params.v_linear_data_cache_batch_stride =
@@ -355,9 +418,17 @@ inline cudaError_t sm120_nvfp4_prepare_linear_v_data_cache(
   if (blocks > 65535) {
     blocks = 65535;
   }
-  sm120_nvfp4_linear_v_data_cache_kernel<<<blocks, kThreads, 0, stream>>>(
-      params, cache, kv_lens, batch_size, num_kv_heads, head_dim,
-      physical_kv_len);
+  if (coalesced_layout) {
+    sm120_nvfp4_linear_v_data_cache_kernel<true>
+        <<<blocks, kThreads, 0, stream>>>(params, cache, kv_lens, batch_size,
+                                          num_kv_heads, head_dim,
+                                          physical_kv_len);
+  } else {
+    sm120_nvfp4_linear_v_data_cache_kernel<false>
+        <<<blocks, kThreads, 0, stream>>>(params, cache, kv_lens, batch_size,
+                                          num_kv_heads, head_dim,
+                                          physical_kv_len);
+  }
   return cudaGetLastError();
 }
 

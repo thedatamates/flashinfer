@@ -47,6 +47,7 @@ constexpr int kOutputTileN = 128;
 constexpr int kCutlassTileK128 = 128;
 constexpr int kFusedWarpsPerCta = 8;
 constexpr int kColumnGroups = kHeadDim / (kTileN * kFusedWarpsPerCta);
+constexpr bool kLinearVCacheCoalesced = (kHeadDim == 256);
 constexpr float kProbGlobalScale = 6.0f * 448.0f;
 
 enum class Sm120Nvfp4FmhaRole : int {
@@ -936,10 +937,12 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           if (paged_kv_params.v_linear_scale_cache != nullptr) {
             const int token_group = token_group_start >> 4;
             if (token_group < paged_kv_params.v_linear_scale_cache_groups) {
-              sf0 = sm120_nvfp4_linear_v_scale_cache_load(
+              sf0 = sm120_nvfp4_linear_v_scale_cache_load<
+                  kLinearVCacheCoalesced>(
                   paged_kv_params, batch_idx, effective_kv_head, dim0,
                   token_group);
-              sf1 = sm120_nvfp4_linear_v_scale_cache_load(
+              sf1 = sm120_nvfp4_linear_v_scale_cache_load<
+                  kLinearVCacheCoalesced>(
                   paged_kv_params, batch_idx, effective_kv_head,
                   dim0 + 1, token_group);
               return;
@@ -1140,7 +1143,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           uint32_t row_scale_byte = 0x38u;
           if (token < kv_len_tokens) {
             if (paged_kv_params.v_linear_data_cache != nullptr) {
-              row_word = sm120_nvfp4_linear_v_data_cache_word(
+              row_word = sm120_nvfp4_linear_v_data_cache_word<
+                  kLinearVCacheCoalesced>(
                   paged_kv_params, batch_idx, effective_kv_head, token,
                   dim_base >> 1);
             } else {

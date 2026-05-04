@@ -5469,3 +5469,282 @@ Next profiling target:
 
 - Local producer tweaks are now producing small or negative deltas while the remaining gap is architectural.
 - The next NCU-driven high-risk direction should compare the current CUTLASS-operand V path against a non-CUTLASS V staging/fragment-construction path, because both failed store-local attempts point at the smem layout contract rather than address arithmetic.
+
+## 2026-05-04 14:08 CDT - Runtime Group Divide Specialization Target
+
+Finding:
+
+- Current reference timings after the committed scale-store cleanup:
+  - D256 Qwen dense: `1.263 ms`; paged-PV: about `2.235 ms`; paged-linear: `3.238 ms`.
+  - D512 Gemma dense: `5.167 ms`; paged-PV: `6.494 ms`; paged-linear: `7.921 ms`.
+- D512 is now in the right regime (`1.26x` PV over dense, `1.53x` linear over dense). D256 remains the larger relative gap.
+- The D256 lineinfo NCU report identifies `fmha_nvfp4_sm120_d256.cuh:1905`, `global_q_row / group_size`, as the top instruction source.
+- The shared `q_pos` cache removed the divide but broke correctness, so shared-memory caching is not safe in the current aliased storage layout.
+- The divide denominator is one of a small set of production group sizes (`2`, `4`, `6`, `8` in the current benchmark/deployment cells), but the kernel currently treats it as an arbitrary runtime integer.
+
+Implementation target:
+
+- Add a device helper that specializes common group sizes with literal divisors/shifts:
+  - `1`, `2`, `4`, and `8` use shifts or identity.
+  - `6` uses a literal `/ 6`, allowing ptxas to lower it to a multiply/shift sequence instead of runtime integer division.
+  - Unknown group sizes fall back to `/ group_size`.
+- Replace the per-score `global_q_row / group_size` callsite in D128/D256/D512 with this helper.
+- No new spec axis, no public API change, no shared-memory lifetime change.
+
+Validation:
+
+- Focused D256 correctness.
+- D256 Qwen dense/paged-PV/paged-linear benchmark.
+- If timing improves, run lineinfo NCU again and verify the `global_q_row / group_size` source attribution drops materially.
+- Full NVFP4 test file before committing if the helper is kept.
+
+Decision criteria:
+
+- Keep if correctness passes and D256 timing improves or is neutral with NCU confirming the divide source is reduced.
+- Revert if ptxas still emits runtime division on the hot path or timing regresses.
+
+## 2026-05-04 14:15 CDT - Runtime Group Divide Specialization Result
+
+Finding:
+
+- Implemented a literal-specialized group-size helper for `1`, `2`, `4`, `6`, and `8`, with fallback to runtime division.
+- Focused D256 correctness was not clean:
+  - First focused subset: multi-KV failed by `2` elements, greatest absolute difference `0.00103759765625` with tolerance `0.001`; scratch poison and standard-vs-direct passed.
+  - Rerun of the failing multi-KV test: failed by `1` element, greatest absolute difference `0.0013427734375` with tolerance `0.001`.
+- The helper is mathematically equivalent for integer `q_token`, so the failure is likely a codegen/scheduling perturbation surfacing the existing D256 multi-KV tolerance edge, not a logical predicate error.
+
+Decision:
+
+- Reverted the group-divide helper and restored the original `global_q_row / group_size` expression in D128/D256/D512.
+- Do not keep changes that make the multi-KV tolerance-edge failure more likely, even if the source hotspot is real.
+- Any future work on this predicate should first localize why D256 multi-KV is so close to tolerance, or should change the predicate in a way that can be proven byte-identical through the binary-search diagnostic path.
+
+Next profiling target:
+
+- The obvious local rewrites have now produced one kept win and several rejected perturbations.
+- The next meaningful high-risk work needs either a byte-level correctness diagnostic for the D256 tolerance edge or a larger architecture path that avoids the current CUTLASS operand staging costs rather than rearranging instructions inside them.
+
+## 2026-05-04 14:10 CDT - Linear V Cache Layout Target
+
+Finding:
+
+- Fresh lineinfo NCU on D256 Qwen paged-linear identifies the internal linear-V data cache as the dominant remaining global-memory problem.
+- The report attributes `44,040,192` excessive L2 global sectors to `fmha_nvfp4_sm120_paged_kv.cuh:118`, the 32-bit load in `sm120_nvfp4_linear_v_data_cache_word`.
+- The current internal cache is token-major/dim-contiguous: `idx = token * packed_dim + packed_col`.
+- The stage producer's 8-lane subgroup reads eight consecutive tokens at one `packed_col` word, so adjacent lanes access addresses separated by `packed_dim` bytes. For D256 that is a 128-byte lane stride, which matches the NCU uncoalesced-sector attribution.
+- This cache is internal FFI scratch, not public API. Its physical layout can change without changing the caller's tensor layout, layout names, FFI surface, or tests.
+
+Implementation target:
+
+- Change the internal linear-V data cache layout from `[token][packed_col]` bytes to `[packed_col_word][token][byte_in_word]`.
+- Preserve total byte size. A `uint32_t` cache load at a 4-byte-aligned `packed_col` will still return the same four dim-contiguous bytes for one token, but adjacent subgroup lanes will now load adjacent 4-byte words for adjacent tokens.
+- Keep the producer and public wrapper contracts unchanged; only the cache build kernel and `sm120_nvfp4_linear_v_data_cache_word` address math should change.
+- D128/D256/D512 share the helper and cache build path, so this is a common structural change rather than another per-head-dim patch.
+
+Validation:
+
+- Run focused D256 correctness first because the NCU evidence and current biggest relative gap are D256.
+- Benchmark D256 Qwen paged-linear at `q=512 kv=65536 g=6 softcap=0 split_kv_len=3072`.
+- Re-run lineinfo NCU if wall time improves and verify the `v_linear_data_cache_word` excessive-sector count drops materially.
+- Run the full NVFP4 test file before committing a kept change.
+
+Decision criteria:
+
+- Keep if correctness passes and paged-linear wall time improves or is neutral with clear NCU reduction in the cache-load excessive sectors.
+- Revert if correctness fails, cache build cost dominates, or wall time regresses despite the coalescing improvement.
+
+## 2026-05-04 14:16 CDT - Linear V Data Cache Layout Result
+
+Finding:
+
+- Implemented the internal linear-V data cache reorder from token-major bytes to `[packed_col_word][token][byte_in_word]`.
+- Focused D256 correctness passed:
+  - `3 passed in 44.34s`.
+- D256 Qwen paged-linear wall time improved slightly:
+  - Previous representative mean: `3.238 ms`.
+  - New mean: `3.195 ms` (`min 3.192`, `max 3.200`).
+- Follow-up lineinfo NCU confirms the targeted source was fixed:
+  - Total L2 global excessive sectors dropped from `47,185,920` to `3,145,728`.
+  - `sm120_nvfp4_linear_v_data_cache_word` dropped from `44,040,192` excessive sectors to `0`; the load now reports `6,291,456` total sectors and `6,291,456` ideal sectors.
+- The modest wall-time gain despite the large sector reduction means the old uncoalesced data-cache load was a real memory-efficiency bug but not the only wall-time limiter.
+
+Decision:
+
+- Keep the data-cache layout change unless a wider test exposes correctness or cache-build regressions.
+- The change is internal-only and makes the stage producer's access pattern physically coalesced without public API changes.
+
+Next profiling target:
+
+- The same NCU report now shows the largest remaining global excessive source in the linear path is `sm120_nvfp4_linear_v_scale_cache_load`: `2,359,296` excessive sectors out of `3,145,728` total sectors.
+- The scale cache has the same layout mismatch shape: current physical layout is dim-major (`dim * token_groups + token_group`), while the producer reads adjacent dims for one token group.
+- Apply the same internal layout fix to the linear-V scale cache before moving to non-global bottlenecks.
+
+## 2026-05-04 14:16 CDT - Linear V Scale Cache Layout Target
+
+Finding:
+
+- After the data-cache reorder, lineinfo NCU attributes the remaining linear-path global excessive sectors primarily to `fmha_nvfp4_sm120_paged_kv.cuh:104`, the `v_linear_scale_cache` load.
+- The current scale cache layout is `[dim][token_group]`, so lanes reading adjacent dims for one token group are separated by `token_groups` bytes.
+- The producer access pattern wants `[token_group][dim]`: adjacent lanes read adjacent dims at the same token group.
+- Like the data cache, this is internal FFI scratch and does not affect public tensor layout or wrapper contracts.
+
+Implementation target:
+
+- Change `sm120_nvfp4_linear_v_scale_cache_load` to address `token_group * head_dim + dim` within each batch/head.
+- Change the scale-cache build kernel to write that physical layout directly and iterate `dim_pair` fastest for coalesced cache writes.
+- Keep byte size and host scratch sizing unchanged.
+
+Validation:
+
+- Run the focused D256 correctness subset.
+- Benchmark D256 Qwen paged-linear at the same reference cell.
+- Re-run lineinfo NCU if timing improves and verify the scale-cache excessive sectors drop.
+
+Decision criteria:
+
+- Keep if correctness passes and wall time improves or remains neutral with the NCU source removed.
+- Revert if the scale-cache build reorder regresses wall time or correctness.
+
+## 2026-05-04 14:20 CDT - Linear V Scale Cache Layout Result
+
+Finding:
+
+- Implemented the internal scale-cache reorder from `[dim][token_group]` to `[token_group][dim]`.
+- Focused D256 correctness passed:
+  - `3 passed in 44.16s`.
+- D256 Qwen paged-linear wall time improved:
+  - Before cache-layout work: `3.238 ms`.
+  - After data-cache reorder: `3.195 ms`.
+  - After scale-cache reorder: `3.100 ms` (`min 3.095`, `max 3.105`).
+- Follow-up lineinfo NCU did not remove the source cleanly:
+  - Total L2 global excessive sectors increased from `3,145,728` after the data-cache-only change to `6,291,456`.
+  - `sm120_nvfp4_linear_v_scale_cache_load` now accounts for `5,505,024` excessive sectors.
+- The wall-time direction says the physical layout is better, but the remaining scale loads are byte-granularity and are issued twice per adjacent scale pair.
+
+Decision:
+
+- Keep the scale-cache physical layout for the next experiment because it improved wall time and enables aligned adjacent-pair loads.
+- Do not consider the scale path complete; NCU says byte load granularity is now the source.
+
+Next profiling target:
+
+- Replace the two adjacent `uint8_t` scale-cache loads with one aligned `uint16_t` pair load.
+- The producer and data-cache build both consume `(dim0, dim0 + 1)` pairs, so the pair load matches existing logical access and should reduce instruction count and sector waste.
+
+## 2026-05-04 14:20 CDT - Linear V Scale Pair Load Target
+
+Finding:
+
+- Every callsite that consumes the linear scale cache asks for adjacent scale bytes:
+  - the stage producer's `pv_scale_pair_for(dim0, dim0 + 1)`;
+  - the linear data-cache build kernel's `sf0_byte` / `sf1_byte` pair.
+- With the new `[token_group][dim]` layout, those two bytes are physically adjacent and `dim0` is even.
+- Keeping separate byte loads leaves NCU attributing most remaining global-sector excess to `sm120_nvfp4_linear_v_scale_cache_load`.
+
+Implementation target:
+
+- Add `sm120_nvfp4_linear_v_scale_cache_pair_load` returning a `uint16_t` from the aligned `(dim0, dim0 + 1)` address.
+- Use it in the stage producers for D128/D256/D512 and in the data-cache build kernel.
+- Leave the byte helper in place only if another non-pair callsite remains; otherwise remove it.
+
+Validation:
+
+- Run focused D256 correctness.
+- Benchmark D256 Qwen paged-linear.
+- Re-run lineinfo NCU if timing improves and verify the scale-cache source drops.
+
+Decision criteria:
+
+- Keep if correctness passes and either wall time improves or NCU shows the scale-cache source is materially reduced without a wall-time regression.
+- Revert if the paired load changes rounding/correctness or increases wall time.
+
+## 2026-05-04 14:24 CDT - Linear V Scale Pair Load Result
+
+Finding:
+
+- Implemented the aligned 16-bit scale-pair load in the common helper and the D128/D256/D512 stage producers.
+- Focused D256 correctness passed:
+  - `3 passed in 45.44s`.
+- D256 Qwen paged-linear timing regressed relative to the scale-layout-only state:
+  - Scale-layout-only: `3.100 ms` mean.
+  - Pair-load first run: `3.126 ms` mean.
+  - Pair-load repeat-10 run: `3.128 ms` mean.
+
+Decision:
+
+- Reverted the 16-bit scale-pair load and restored the byte-load helper.
+- Kept the data-cache and scale-cache physical layout reorders, which are the changes with measured wall-time improvement.
+
+Next profiling target:
+
+- Stop spending time on byte-load granularity in the scale cache for now; it is a small source relative to the remaining dense-vs-paged gap.
+- Run a wider validation/benchmark pass on the kept cache-layout changes, then use NCU/NSYS to choose the next structural target from the post-layout baseline.
+
+## 2026-05-04 14:28 CDT - Head-Dim-Specific Linear Cache Layout Target
+
+Finding:
+
+- The common cache-layout reorder improves the D256 Qwen linear reference cell but regresses the D512 Gemma global linear reference cell.
+- D256 Qwen paged-linear:
+  - Before cache layout work: `3.238 ms`.
+  - Data+scale cache layout: `3.100-3.105 ms`.
+- D512 Gemma paged-linear:
+  - Prior reference: `7.921 ms`.
+  - Common data+scale cache layout: `8.197 ms` first run, `8.190 ms` repeat-10.
+- This is an internal scratch-layout choice, not a public API contract. A single physical cache layout does not need to be forced across head dimensions if NCU/timing says the access balance differs.
+
+Implementation target:
+
+- Keep the coalesced internal linear-V cache layout only for D256, where NCU identified and validated the sector problem.
+- Restore the old token-major/dim-major cache layout for D128 and D512 until those head dimensions have their own NCU evidence.
+- Use compile-time helper selection in the D128/D256/D512 producers so the stage hot path does not pay a runtime layout branch.
+- Use the runtime `head_dim == 256` value only inside the cache-build kernels, where the cost is outside the stage hot loop.
+
+Validation:
+
+- Focused D256 correctness after the specialization.
+- Benchmark D256 Qwen paged-linear, D512 Gemma paged-linear, and D128 baseline cell.
+- Full NVFP4 test file before committing.
+
+Decision criteria:
+
+- Keep if D256 retains the cache-layout win and D512 returns to its prior no-regression regime.
+- Revert the specialization if it introduces correctness failures or if D256 loses the NCU-driven gain.
+
+## 2026-05-04 14:44 CDT - Head-Dim-Specific Linear Cache Layout Result
+
+Finding:
+
+- Implemented compile-time producer selection for the linear-V cache layout:
+  - D256 uses the coalesced internal layout validated by NCU.
+  - D128/D512 use the old internal layout unless separately profiled.
+- The cache-build kernels were also split into compile-time `true` / `false` instantiations so D128/D512 do not pay a per-element runtime layout branch.
+- Focused D256 correctness passed after specialization:
+  - `3 passed in 44.17s`.
+- Full NVFP4 test file passed:
+  - `36 passed in 246.13s`.
+
+Benchmark result:
+
+- D256 Qwen reference, `q=512 kv=65536 g=6 softcap=0 split_kv_len=3072`:
+  - Dense: `1.264 ms`.
+  - Paged-PV: `2.227 ms`.
+  - Paged-linear before cache-layout work: `3.238 ms`.
+  - Paged-linear after D256-only cache layout: `3.105 ms`.
+  - Net D256 linear gain: about `4.1%`.
+- D512 Gemma reference, `q=512 kv=65536 g=8 softcap=30 split_kv_len=3072`:
+  - Current dense: `5.291 ms`.
+  - Current paged-PV: `6.685 ms`.
+  - Current paged-linear: `8.135 ms`.
+  - Ratios remain in the same regime as the prior reference (`~1.26x` PV/dense, `~1.54x` linear/dense); the stale absolute `7.921 ms` linear reference was not comparable to the current dense timing.
+
+Decision:
+
+- Keep the D256-only internal cache-layout change.
+- Do not force the coalesced cache layout across D128/D512 without head-dim-specific NCU evidence.
+- The change removes the D256 linear data-cache sector bug and gives a modest but real wall-time win; it does not address the larger D256 paged-vs-dense gap.
+
+Next profiling target:
+
+- Move back to NCU/NSYS on the current D256 post-cache baseline rather than continuing small cache-local rewrites.
+- The useful question is now where the remaining `~2.46x` D256 linear-vs-dense ratio lives: cache prepass launches, stage-kernel local spills, shared-memory wavefront excess, or scheduler/CTA geometry.
