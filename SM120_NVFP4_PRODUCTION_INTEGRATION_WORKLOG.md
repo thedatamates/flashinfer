@@ -3734,3 +3734,15 @@ D512 symmetry check:
   `10.23 ms` -> `10.62 ms`.
 - Decision: reverted. D512 is not improved by more load warps; its current
   eight-load-warp allocation is near the local optimum for this scaffold.
+
+Seven-load-warp D256 follow-up:
+- Changed D256 load warps from the safe `6` setting to `7`.
+- Qwen-full `q=512 kv=65536 g=6`, PV, split `4096`:
+  `6.99 ms` -> `6.74 ms`.
+- Targeted D256 multi-KV correctness:
+  `3 passed in 47.76s`.
+- Full `tests/attention/test_nvfp4_kv_head_dim_512.py -q`:
+  `36 passed in 50.71s`.
+- Decision: keep seven load warps. It recovers another small slice of the
+  D256 paged producer gap without reproducing the sequence/state-sensitive
+  failures seen at eight load warps.
