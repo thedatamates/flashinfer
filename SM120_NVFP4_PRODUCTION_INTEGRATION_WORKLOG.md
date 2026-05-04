@@ -3643,3 +3643,94 @@ Conclusion:
 - After the linear-V cache fixes, the prior `8192` split default is no longer
   optimal. `4096` consistently improves the sampled D512 and D256 production
   cells for both PV and linear layouts.
+
+## 2026-05-04 02:44 CDT - Paged Producer Page-Table Hoist Pass
+
+What I am about to do:
+- The focused production reports show linear-V is no longer the dominant issue:
+  linear tracks PV within roughly `10-20%` on the main prefill cells.
+- Direct wrapper / BF16-Q FFI / prepacked-Q FFI timing shows the residual
+  paged-vs-dense gap is inside the paged stage kernel, not Python wrapper
+  orchestration or fused Q quantization.
+- The hot paged K and PV-V producers still resolve `block_table` at
+  packed-word granularity. That diverges from the in-tree paged attention
+  pattern, where page offsets are computed once per KV row and reused by the
+  vector load.
+- Decision criterion: reduce redundant block-table walks in K and PV-V without
+  changing public tensor layouts, FFI signatures, spec axes, or test contracts.
+
+Reference audit:
+- `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h` paged path computes row pointers
+  before the load. Relevant lines:
+  `paged_kv_block_idx = (row_idx >> paged_kv_log2_block_size_)`,
+  `local_kv_ptr = ... paged_kv_global_block_offsets_[paged_kv_block_idx]`,
+  then `ptrs[ii] = local_kv_ptr + head_col_in_bytes + ...`.
+- `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h` reblocked V uses the same pattern:
+  `get_nvfp4_row_ptrs(...)` returns `kv_row_ptr`, then the load uses
+  `fmha::ldg(original_pair, kv_row_ptr + col0 / 2)`.
+- `include/flashinfer/attention/hopper/sparse_mainloop.cuh` precomputes the
+  paged offset per KV position: `page_idx = kv_indices_ptr[page_iter]` and
+  `my_kv_offset[parity] = page_idx * k_page_stride + entry_idx * k_stride_n`,
+  then load threads use `__shfl_sync` to reuse that offset before issuing
+  `cp_async_zfill`.
+- The pattern I am adopting is the local version of that: compute the page base
+  once per producer row/subgroup, then use from-page-base helpers for each
+  packed-word load. This keeps the current CUTLASS smem partitioning intact but
+  removes redundant page-table math from the hot loops.
+
+Result:
+- Implemented the page-base hoist locally for K and PV-layout V, then measured
+  D256 Qwen-full `q=512 kv=65536 g=6`, PV, split `4096`.
+- Baseline from the focused report: `7.56 ms`.
+- Hoisted version: `7.86 ms`.
+- The change was reverted. In this scaffold the extra cached-base branch and
+  subgroup shuffle cost more than the page-table lookup they remove.
+- Conclusion: page-table lookup granularity is not the current load-bearing
+  bottleneck. The residual gap is the broader manual paged producer path versus
+  dense TMA, not just redundant `block_table` arithmetic.
+
+## 2026-05-04 03:00 CDT - D256 Load-Warp Capacity Check
+
+What I am about to do:
+- D512 uses eight load warps and is about `2x` dense on the key Gemma-global
+  cell after the producer/cache fixes.
+- D256 uses four load warps and is about `5-6x` dense on the key Qwen-full and
+  Gemma-sliding cells.
+- The paged producer is manual K/V movement into CUTLASS operand smem; dense
+  gets the TMA path. If D256 is producer-bound, giving D256 the same load-warp
+  capacity as D512 should reduce the gap without public API changes.
+- Decision criterion: keep the change only if paged PV improves enough to
+  offset any dense regression. If it loses or is neutral, revert before moving
+  on.
+
+Eight-load-warp result:
+- Changed D256 load warps from `4` to `8`.
+- Qwen-full `q=512 kv=65536 g=6`, split `4096`:
+  - PV: `7.56 ms` -> `5.66 ms`.
+  - linear: `8.68 ms` -> `6.66 ms`.
+  - dense: `1.36 ms` -> `1.61 ms`.
+- Gemma-sliding `q=512 kv=8192 g=2 swa=1024 softcap=30`, split `4096`:
+  - PV: `1.61 ms` -> `1.18 ms`.
+  - linear: `1.77 ms` -> `1.34 ms`.
+- Correctness failed: full `tests/attention/test_nvfp4_kv_head_dim_512.py -q`
+  had three D256 failures in multi-KV / scratch-poison / standard-wrapper
+  comparisons. The failures were sequence/state sensitive and therefore
+  treated as a real synchronization or coverage issue, not a tolerance issue.
+
+Six-load-warp result:
+- Changed D256 load warps from `4` to `6`.
+- Qwen-full `q=512 kv=65536 g=6`, PV, split `4096`:
+  `7.56 ms` -> `6.99 ms`.
+- Full `tests/attention/test_nvfp4_kv_head_dim_512.py -q`:
+  `36 passed in 97.77s`.
+- Decision: keep the safe six-warp setting. It is a smaller win than eight
+  load warps, but it preserves correctness and still confirms D256 was
+  under-provisioned on producer load capacity relative to the manual paged K/V
+  copy work.
+
+D512 symmetry check:
+- Tried increasing D512 load warps from `8` to `12`.
+- Gemma-global `q=512 kv=65536 g=8 softcap=30`, PV, split `4096`:
+  `10.23 ms` -> `10.62 ms`.
+- Decision: reverted. D512 is not improved by more load warps; its current
+  eight-load-warp allocation is near the local optimum for this scaffold.
