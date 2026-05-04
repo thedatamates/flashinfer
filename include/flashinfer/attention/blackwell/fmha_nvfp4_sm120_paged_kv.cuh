@@ -60,6 +60,10 @@ struct Sm120Nvfp4PagedKvLoadParams {
   int v_linear_scale_cache_groups = 0;
   int64_t v_linear_scale_cache_head_stride = 0;
   int64_t v_linear_scale_cache_batch_stride = 0;
+  const uint8_t* v_linear_data_cache = nullptr;
+  int64_t v_linear_data_cache_head_stride = 0;
+  int64_t v_linear_data_cache_batch_stride = 0;
+  int64_t v_linear_data_cache_token_stride = 0;
 
   __device__ __forceinline__ bool enabled() const {
     return block_table != nullptr;
@@ -98,6 +102,20 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_linear_v_scale_cache_load(
       static_cast<int64_t>(dim) * params.v_linear_scale_cache_groups +
       token_group;
   return params.v_linear_scale_cache[idx];
+}
+
+__device__ __forceinline__ uint32_t sm120_nvfp4_linear_v_data_cache_word(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int batch_idx,
+    int kv_head,
+    int token,
+    int packed_col) {
+  const int64_t idx =
+      static_cast<int64_t>(batch_idx) * params.v_linear_data_cache_batch_stride +
+      static_cast<int64_t>(kv_head) * params.v_linear_data_cache_head_stride +
+      static_cast<int64_t>(token) * params.v_linear_data_cache_token_stride +
+      packed_col;
+  return *reinterpret_cast<const uint32_t*>(params.v_linear_data_cache + idx);
 }
 
 static __global__ void sm120_nvfp4_linear_v_scale_cache_kernel(
@@ -229,6 +247,115 @@ inline cudaError_t sm120_nvfp4_prepare_linear_v_scale_cache(
     blocks = 65535;
   }
   sm120_nvfp4_linear_v_scale_cache_kernel<<<blocks, kThreads, 0, stream>>>(
+      params, cache, kv_lens, batch_size, num_kv_heads, head_dim,
+      physical_kv_len);
+  return cudaGetLastError();
+}
+
+static __global__ void sm120_nvfp4_linear_v_data_cache_kernel(
+    Sm120Nvfp4PagedKvLoadParams params,
+    uint8_t* cache,
+    const int32_t* kv_lens,
+    int batch_size,
+    int num_kv_heads,
+    int head_dim,
+    int physical_kv_len) {
+  const int packed_dim = head_dim / 2;
+  const int64_t total =
+      static_cast<int64_t>(batch_size) * num_kv_heads * physical_kv_len *
+      packed_dim;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x;
+       idx < total;
+       idx += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    int64_t t = idx;
+    const int packed_col = static_cast<int>(t % packed_dim);
+    t /= packed_dim;
+    const int token = static_cast<int>(t % physical_kv_len);
+    t /= physical_kv_len;
+    const int kv_head = static_cast<int>(t % num_kv_heads);
+    const int batch_idx = static_cast<int>(t / num_kv_heads);
+
+    uint8_t packed_out = 0u;
+    const int kv_len_tokens =
+        kv_lens != nullptr ? kv_lens[batch_idx] : physical_kv_len;
+    if (token < kv_len_tokens) {
+      Sm120Nvfp4PagedKvLoadParams local = params;
+      local.block_table =
+          params.block_table +
+          static_cast<int64_t>(batch_idx) * params.block_table_stride;
+      local.kv_head = kv_head;
+      const int logical_page = token >> 4;
+      const int page_offset = token & 15;
+      const int physical_page = local.block_table[logical_page];
+      const int64_t data_page_base =
+          sm120_nvfp4_paged_v_data_page_base(local, physical_page);
+      const int64_t scale_page_base =
+          sm120_nvfp4_paged_v_scale_page_base(local, physical_page);
+      const int dim0 = packed_col * 2;
+      const int scale_col = dim0 >> 4;
+      const uint8_t packed_in =
+          sm120_nvfp4_paged_v_code_pair_from_page_base(
+              local, data_page_base, page_offset, packed_col);
+      const uint8_t input_scale_byte =
+          sm120_nvfp4_paged_v_linear_scale_from_page_base(
+              local, scale_page_base, page_offset, scale_col);
+      const float input_scale = e4m3_byte_to_fp32(input_scale_byte);
+      const int token_group = token >> 4;
+      const uint8_t sf0_byte = sm120_nvfp4_linear_v_scale_cache_load(
+          params, batch_idx, kv_head, dim0, token_group);
+      const uint8_t sf1_byte = sm120_nvfp4_linear_v_scale_cache_load(
+          params, batch_idx, kv_head, dim0 + 1, token_group);
+      const float inv_sf0 = 1.0f / fmaxf(e4m3_byte_to_fp32(sf0_byte), 1.0e-8f);
+      const float inv_sf1 = 1.0f / fmaxf(e4m3_byte_to_fp32(sf1_byte), 1.0e-8f);
+      const float x0 =
+          e2m1_code_to_fp32(static_cast<uint8_t>(packed_in & 0x0fu)) *
+          input_scale * inv_sf0;
+      const float x1 =
+          e2m1_code_to_fp32(static_cast<uint8_t>((packed_in >> 4) & 0x0fu)) *
+          input_scale * inv_sf1;
+      packed_out = fp32_pair_to_e2m1_byte(x0, x1);
+    }
+    cache[idx] = packed_out;
+  }
+}
+
+inline size_t sm120_nvfp4_linear_v_data_cache_bytes(
+    int batch_size,
+    int num_kv_heads,
+    int head_dim,
+    int physical_kv_len) {
+  return static_cast<size_t>(batch_size) * static_cast<size_t>(num_kv_heads) *
+         static_cast<size_t>(physical_kv_len) *
+         static_cast<size_t>(head_dim / 2);
+}
+
+inline cudaError_t sm120_nvfp4_prepare_linear_v_data_cache(
+    Sm120Nvfp4PagedKvLoadParams& params,
+    uint8_t* cache,
+    const int32_t* kv_lens,
+    int batch_size,
+    int num_kv_heads,
+    int head_dim,
+    int physical_kv_len,
+    cudaStream_t stream) {
+  const int packed_dim = head_dim / 2;
+  params.v_linear_data_cache = cache;
+  params.v_linear_data_cache_token_stride = packed_dim;
+  params.v_linear_data_cache_head_stride =
+      static_cast<int64_t>(physical_kv_len) * packed_dim;
+  params.v_linear_data_cache_batch_stride =
+      static_cast<int64_t>(num_kv_heads) *
+      params.v_linear_data_cache_head_stride;
+  const int64_t total =
+      static_cast<int64_t>(batch_size) * num_kv_heads * physical_kv_len *
+      packed_dim;
+  constexpr int kThreads = 256;
+  int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+  if (blocks > 65535) {
+    blocks = 65535;
+  }
+  sm120_nvfp4_linear_v_data_cache_kernel<<<blocks, kThreads, 0, stream>>>(
       params, cache, kv_lens, batch_size, num_kv_heads, head_dim,
       physical_kv_len);
   return cudaGetLastError();

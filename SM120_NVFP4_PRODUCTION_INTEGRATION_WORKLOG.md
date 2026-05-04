@@ -3565,3 +3565,46 @@ Conclusion:
 - Remaining linear-V overhead is the data dequant/requant path. At D512
   reference, linear is still `2.45x` PV, so further work needs to attack data
   requant reuse or reduce the per-Q-tile data conversion itself.
+
+## 2026-05-04 02:06 CDT - Private Linear-V Data Cache
+
+What changed:
+- Added an internal linear-V data cache in `Sm120Nvfp4PagedKvLoadParams`.
+- For `kPvLayoutV=false`, the paged launcher now computes both:
+  - reblock scale cache: one byte per `(batch, kv_head, dim, 16-token group)`.
+  - reblocked PV data cache: one packed byte per
+    `(batch, kv_head, token, dim-pair)`.
+- Both caches live in the existing workspace after the CUTLASS QK/PV
+  workspaces. No public tensor shape, layout name, FFI argument, or Python API
+  changed.
+- The stage kernel's linear-V data path now reads the private PV-data cache and
+  uses the same 8-lane transpose/store pattern as the public PV-layout path.
+  The old in-CTA dequant/requant path remains only as a null-cache fallback.
+
+Validation:
+- Full `tests/attention/test_nvfp4_kv_head_dim_512.py -q`:
+  `36 passed in 322.93s`.
+
+Reference cells, production split `8192`:
+- D512 Gemma-global `q=512 kv=65536 g=8 softcap=30`:
+  - PV: `12.397 ms`.
+  - linear: `28.552 ms` -> `13.594 ms`.
+  - Original pre-cache linear before both cache fixes was `47.738 ms`.
+- D256 Qwen-full `q=512 kv=65536 g=6`:
+  - PV: `8.862 ms`.
+  - linear: `17.140 ms` -> `10.056 ms`.
+  - Original pre-cache linear before both cache fixes was `31.610 ms`.
+- D128 baseline `q=512 kv=65536 g=8`:
+  - PV: `3.794 ms`.
+  - linear: `10.346 ms` -> `4.467 ms`.
+
+Conclusion:
+- Stock vLLM linear-V is now within about `10-18%` of PV-layout at these
+  reference cells instead of `2.5-3x` slower.
+- The remaining gap is the one-time private cache generation cost plus extra
+  workspace bandwidth. It no longer scales with Q tiles inside the fused stage
+  kernel.
+- This matches the intended production architecture: stock vLLM linear cache is
+  the production input path, and the wrapper/FFI performs the necessary
+  one-call internal conversion without exposing a bridge tensor or adding a
+  second Python-visible step.

@@ -1125,36 +1125,54 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           const int dim_base =
               effective_out_group_idx * kOutputTileN + local_dim0;
           const int scale_col = dim_base >> 4;
-          uint32_t row_word = 0;
-          uint32_t row_scale_byte = 0x38u;
-          if (token < kv_len_tokens) {
-            const int logical_page =
-                token / paged_kv_params.page_size;
-            const int page_offset =
-                token - logical_page * paged_kv_params.page_size;
-            const int physical_page =
-                paged_kv_params.block_table[logical_page];
-            const int64_t data_page_base =
-                sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
-                                                    physical_page);
-            const int64_t scale_page_base =
-                sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
-                                                     physical_page);
-            row_word = sm120_nvfp4_paged_v_word_from_page_base(
-                paged_kv_params, data_page_base, page_offset, dim_base >> 1);
-            row_scale_byte = sm120_nvfp4_paged_v_linear_scale_from_page_base(
-                paged_kv_params, scale_page_base, page_offset, scale_col);
-          }
-
           const int local_col = local_dim0 + subgroup_lane;
           const int dim = effective_out_group_idx * kOutputTileN + local_col;
           const int token0 = kv_tile * kCutlassTileN + local_k0;
+          uint32_t row_word = 0;
+          uint32_t row_scale_byte = 0x38u;
+          if (token < kv_len_tokens) {
+            if (paged_kv_params.v_linear_data_cache != nullptr) {
+              row_word = sm120_nvfp4_linear_v_data_cache_word(
+                  paged_kv_params, batch_idx, paged_kv_params.kv_head, token,
+                  dim_base >> 1);
+            } else {
+              const int logical_page =
+                  token / paged_kv_params.page_size;
+              const int page_offset =
+                  token - logical_page * paged_kv_params.page_size;
+              const int physical_page =
+                  paged_kv_params.block_table[logical_page];
+              const int64_t data_page_base =
+                  sm120_nvfp4_paged_v_data_page_base(paged_kv_params,
+                                                      physical_page);
+              const int64_t scale_page_base =
+                  sm120_nvfp4_paged_v_scale_page_base(paged_kv_params,
+                                                       physical_page);
+              row_word = sm120_nvfp4_paged_v_word_from_page_base(
+                  paged_kv_params, data_page_base, page_offset, dim_base >> 1);
+              row_scale_byte = sm120_nvfp4_paged_v_linear_scale_from_page_base(
+                  paged_kv_params, scale_page_base, page_offset, scale_col);
+            }
+          }
+
           const uint8_t output_scale =
               token0 < kv_len_tokens ? pv_scale_for(token0, dim) : 0x38;
-          const uint32_t packed_word =
-              sm120_nvfp4_linear_v_requant_transposed_word(
-                  row_word, row_scale_byte, output_scale, subgroup_mask,
-                  subgroup_base_lane, subgroup_lane);
+          uint32_t packed_word = 0;
+          if (paged_kv_params.v_linear_data_cache != nullptr) {
+#pragma unroll
+            for (int src_lane = 0; src_lane < 8; ++src_lane) {
+              const uint32_t peer_word =
+                  __shfl_sync(subgroup_mask, row_word,
+                              subgroup_base_lane + src_lane);
+              const uint8_t code = static_cast<uint8_t>(
+                  (peer_word >> (4 * subgroup_lane)) & 0x0f);
+              packed_word |= static_cast<uint32_t>(code) << (4 * src_lane);
+            }
+          } else {
+            packed_word = sm120_nvfp4_linear_v_requant_transposed_word(
+                row_word, row_scale_byte, output_scale, subgroup_mask,
+                subgroup_base_lane, subgroup_lane);
+          }
 
           auto ref0 = pv_sB(local_col, local_k0, write_stage);
           uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
@@ -2301,8 +2319,15 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
           ? sm120_nvfp4_linear_v_scale_cache_bytes(batch_size, num_kv_heads,
                                                    head_dim, kv_len)
           : 0;
+  const size_t linear_data_cache_offset =
+      align_workspace(linear_scale_cache_offset + linear_scale_cache_bytes);
+  const size_t linear_data_cache_bytes =
+      (kUsePagedKv && !kPvLayoutV)
+          ? sm120_nvfp4_linear_v_data_cache_bytes(batch_size, num_kv_heads,
+                                                  head_dim, kv_len)
+          : 0;
   const size_t required_workspace_bytes =
-      linear_scale_cache_offset + linear_scale_cache_bytes;
+      linear_data_cache_offset + linear_data_cache_bytes;
   if (workspace_bytes < required_workspace_bytes) {
     return cudaErrorInvalidValue;
   }
@@ -2311,9 +2336,9 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
       workspace_bytes < kWorkspaceClearBytes ? workspace_bytes
                                              : kWorkspaceClearBytes;
   const size_t workspace_zero_bytes =
-      workspace_clear_bytes > required_workspace_bytes
+      workspace_clear_bytes > base_required_workspace_bytes
           ? workspace_clear_bytes
-          : required_workspace_bytes;
+          : base_required_workspace_bytes;
   // CUTLASS persistent scheduler state is sensitive to allocator residue.
   // Clear a bounded prefix before building the QK/PV argument objects.
   auto workspace_zero_status =
@@ -2344,6 +2369,14 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
         num_kv_heads, head_dim, kv_len, stream);
     if (scale_cache_status != cudaSuccess) {
       return scale_cache_status;
+    }
+    uint8_t* linear_data_cache = reinterpret_cast<uint8_t*>(
+        workspace_base + linear_data_cache_offset);
+    auto data_cache_status = sm120_nvfp4_prepare_linear_v_data_cache(
+        paged_kv_params, linear_data_cache, kv_lens, batch_size,
+        num_kv_heads, head_dim, kv_len, stream);
+    if (data_cache_status != cudaSuccess) {
+      return data_cache_status;
     }
   }
 
