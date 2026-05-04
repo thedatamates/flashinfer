@@ -458,6 +458,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             check_shape_dtype_device(out, q.shape, torch.bfloat16, q.device, "out")
 
         stream = torch.cuda.current_stream(q.device).cuda_stream
+        run_kv_head = -1 if self._num_kv_heads > 1 else 0
         self._module.paged_run_bf16_q(
             q,
             self._q_packed,
@@ -480,7 +481,7 @@ class BatchPrefillWithPagedKVCacheSM120Nvfp4Wrapper:
             self._physical_kv_len,
             float(k_scale),
             float(v_scale),
-            -1,
+            run_kv_head,
             self._split_kv_tiles,
             self._group_size,
             self._causal,

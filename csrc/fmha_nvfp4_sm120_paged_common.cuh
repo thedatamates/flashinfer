@@ -64,7 +64,9 @@ static __global__ void QuantizeQToPaddedBatchKernel(
     const __nv_bfloat16* q, const int32_t* qo_indptr,
     uint8_t* q_packed_scratch, uint8_t* q_scales_scratch, int batch_size,
     int group_size, int num_kv_heads, bool all_kv_heads,
-    int padded_q_rows_per_seq, int head_dim, int packed_dim, int scale_dim) {
+    int padded_q_rows_per_seq, int head_dim, int packed_dim, int scale_dim,
+    bool q_is_3d, int64_t q_stride_token, int64_t q_stride_head,
+    int64_t q_stride_dim, int64_t q_stride_row) {
   const int global_row = static_cast<int>(blockIdx.x);
   const int scale_col = static_cast<int>(threadIdx.x);
   if (padded_q_rows_per_seq <= 0 || scale_col >= scale_dim) {
@@ -94,7 +96,17 @@ static __global__ void QuantizeQToPaddedBatchKernel(
           ? (q_begin + token_offset) * num_qo_heads + kv_head * group_size +
                 group_offset
           : q_begin * group_size + local_row;
-  const int src_base = src_row * head_dim + scale_col * 16;
+  const int dim_base = scale_col * 16;
+  const int token = all_kv_heads ? q_begin + token_offset : src_row / group_size;
+  const int head =
+      all_kv_heads ? kv_head * group_size + group_offset : src_row % group_size;
+  const int64_t src_base =
+      q_is_3d
+          ? static_cast<int64_t>(token) * q_stride_token +
+                static_cast<int64_t>(head) * q_stride_head +
+                static_cast<int64_t>(dim_base) * q_stride_dim
+          : static_cast<int64_t>(src_row) * q_stride_row +
+                static_cast<int64_t>(dim_base) * q_stride_dim;
   const int dst_scale_idx = global_row * scale_dim + scale_col;
   const int dst_packed_base = global_row * packed_dim + scale_col * 8;
 
@@ -102,7 +114,10 @@ static __global__ void QuantizeQToPaddedBatchKernel(
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
     const float value =
-        valid_row ? __bfloat162float(q[src_base + i]) : 0.0f;
+        valid_row
+            ? __bfloat162float(
+                  q[src_base + static_cast<int64_t>(i) * q_stride_dim])
+            : 0.0f;
     max_abs = fmaxf(max_abs, fabsf(value));
   }
 
@@ -115,9 +130,16 @@ static __global__ void QuantizeQToPaddedBatchKernel(
 #pragma unroll
   for (int pair = 0; pair < 8; ++pair) {
     const float x0 =
-        valid_row ? __bfloat162float(q[src_base + 2 * pair]) / scale : 0.0f;
+        valid_row
+            ? __bfloat162float(
+                  q[src_base + static_cast<int64_t>(2 * pair) * q_stride_dim]) /
+                  scale
+            : 0.0f;
     const float x1 = valid_row
-                         ? __bfloat162float(q[src_base + 2 * pair + 1]) / scale
+                         ? __bfloat162float(
+                               q[src_base + static_cast<int64_t>(2 * pair + 1) *
+                                                q_stride_dim]) /
+                               scale
                          : 0.0f;
     q_packed_scratch[dst_packed_base + pair] =
         sm120::fp32_pair_to_e2m1_byte(x0, x1);
@@ -770,6 +792,25 @@ static void RunPagedBatchBf16QImpl(
         << "BF16 Q head count does not match active KV heads and group_size";
   }
 
+  QuantizeQToPaddedBatchKernel<<<
+      static_cast<unsigned>(q_packed_scratch.size(0)),
+      static_cast<unsigned>(head_dim / 16), 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(q.data_ptr()),
+      static_cast<const int32_t*>(qo_indptr.data_ptr()),
+      static_cast<uint8_t*>(q_packed_scratch.data_ptr()),
+      static_cast<uint8_t*>(q_scales_scratch.data_ptr()),
+      static_cast<int>(batch), static_cast<int>(group_size),
+      static_cast<int>(num_kv_heads), all_kv_heads,
+      static_cast<int>(padded_q_rows_per_seq), static_cast<int>(head_dim),
+      static_cast<int>(head_dim / 2), static_cast<int>(head_dim / 16),
+      q.ndim() == 3, q.ndim() == 3 ? q.stride(0) : 0,
+      q.ndim() == 3 ? q.stride(1) : 0, q.stride(q.ndim() - 1),
+      q.ndim() == 2 ? q.stride(0) : 0);
+  auto status = cudaGetLastError();
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+      << "SM120 NVFP4 BF16 Q padded quantization failed: "
+      << cudaGetErrorString(status);
+
   RunPagedBatchImpl(kernel, q_packed, q_scales, k_pages, k_sf_pages,
                     v_pages_pv, v_sf_pages_pv, block_tables, qo_indptr,
                     kv_lens, q_packed_scratch, q_scales_scratch, partial,
@@ -777,12 +818,7 @@ static void RunPagedBatchBf16QImpl(
                     max_physical_kv_len, qk_alpha, pv_alpha, kv_head,
                     split_kv_tiles, group_size, causal, sliding_window,
                     logits_soft_cap, output_group_span, kv_layout_hnd,
-                    v_scale_layout, stream_handle, true,
-                    static_cast<const __nv_bfloat16*>(q.data_ptr()),
-                    q.ndim() == 3, q.ndim() == 3 ? q.stride(0) : 0,
-                    q.ndim() == 3 ? q.stride(1) : 0,
-                    q.stride(q.ndim() - 1),
-                    q.ndim() == 2 ? q.stride(0) : 0);
+                    v_scale_layout, stream_handle, true);
 }
 
 }  // namespace sm120_nvfp4_paged

@@ -3989,3 +3989,86 @@ Auto-split implementation:
   - Gemma-sliding D256 linear `q=512 kv=8192`: split `1024`, `0.523 ms`.
   - Gemma-global D512 linear `q=512 kv=65536`: split `12288`, `10.71 ms`.
   - Gemma-global D512 PV `q=512 kv=65536`: split `12288`, `9.70 ms`.
+
+## 2026-05-04 05:55 CDT - Compact Production Autosplit Report
+
+What I measured:
+- Ran the existing grid reporter with explicit production cells after the auto-split change, using logical device `0` under `CUDA_VISIBLE_DEVICES=2`.
+- Reports written:
+  - `reports/prod_qwen_full_d256_g6_autosplit_20260504.*`
+  - `reports/prod_gemma_sliding_d256_g2_autosplit_20260504.*`
+  - `reports/prod_gemma_global_d512_g8_autosplit_20260504.*`
+- Each report includes paged-linear, paged-PV, dense, NVFP4 FA2, and BF16 FA2 where the reference backend supports the configuration.
+
+Key cells:
+- Qwen full D256 g6 q=512 kv=65536 softcap=30:
+  dense `1.320 ms`, paged-PV `4.293 ms`, paged-linear `5.159 ms`, NVFP4 FA2 `1.565 ms`.
+  Paged-PV is `3.25x` dense; linear reblock adds only `20.2%` over PV.
+- Qwen full D256 g6 q=2048 kv=65536 softcap=30:
+  dense `4.998 ms`, paged-PV `16.231 ms`, paged-linear `17.570 ms`, NVFP4 FA2 `9.644 ms`.
+  Paged-PV is `3.25x` dense; linear reblock adds `8.2%`.
+- Gemma sliding D256 g2 q=512 kv=8192 swa=1024 softcap=30:
+  dense `0.173 ms`, paged-PV `0.410 ms`, paged-linear `0.517 ms`, NVFP4 FA2 `0.035 ms`.
+  Auto split fixed the stale 4096-split mis-schedule, but a fixed paged tax remains.
+- Gemma global D512 g8 q=512 kv=65536 softcap=30:
+  dense `5.152 ms`, paged-PV `9.674 ms`, paged-linear `10.683 ms`, NVFP4 FA2 `9.381 ms`.
+  Paged-PV is `1.88x` dense; linear reblock adds `10.4%`.
+- Gemma global D512 g8 q=2048 kv=65536 softcap=30:
+  dense `19.525 ms`, paged-PV `36.548 ms`, paged-linear `38.541 ms`, NVFP4 FA2 `45.301 ms`.
+  Paged-linear beats NVFP4 FA2 at this large-Q cell, but is still `1.97x` dense.
+
+Conclusion:
+- The remaining prefill gap is not primarily the linear-V reblock path. For q>=512, linear over PV is usually `5-20%`.
+- The dominant structural issue is paged-PV versus dense: D256 full attention is still `~3.25x` dense, D512 global is `~1.88x` dense.
+- Decode/short-Q has a separate fixed-floor problem: D256 q=1 paged-PV is `0.50-0.54 ms` vs dense `0.086-0.120 ms`; D512 q=1 paged-PV is `0.74-0.81 ms` vs dense `0.38-0.43 ms`.
+- Next target is paged launch/schedule/mainloop geometry, not another linear-V-only micro-optimization.
+
+## 2026-05-04 06:05 CDT - D256 Qwen Paged-PV Profile
+
+Profiled one measured call after warmup:
+- Command: `nsys profile --stats=true ... bench_sm120_nvfp4_attention.py --mode paged-wrapper --q-len 512 --kv-len 65536 --head-dim 256 --group 6 --split-kv-len 0 --v-layout pv --causal --logits-soft-cap 30`.
+- Measured wall/event result: `4.308 ms`.
+
+GPU kernel summary:
+- SM120 NVFP4 D256 stage kernel: 3 instances, average `4.223 ms`, `93.3%` of GPU kernel time.
+- Q quantize kernel: 2 instances, average `0.121 ms`, `1.8%`.
+- Split-KV combine kernel: 3 instances, average `0.044 ms`, `1.0%`.
+- Output copy / torch elementwise noise: sub-`0.13 ms` total.
+- CUDA memset: 6 calls, total GPU memset time `0.032 ms`; not load-bearing.
+
+Conclusion:
+- The remaining D256 Qwen gap is inside `sm120_nvfp4_qkv_online_register_q_stage_kernel`, not Python, FFI, Q quantization, combine, output copy, or workspace zeroing.
+- Dense and paged at the same cell have comparable split/CTA counts after auto-split; the stage kernel itself is slower in the paged specialization.
+
+## 2026-05-04 06:15 CDT - Move BF16 Q Quantize Out of Split Stage
+
+What I am about to do:
+- `stage_bf16_q_tile` quantizes BF16 Q inside `sm120_nvfp4_qkv_online_register_q_stage_kernel`.
+- In split-KV, that repeats identical Q quantization once per split CTA. At Qwen D256 q=512 kv=65536 auto split, the same Q tile is quantized across ~22 split CTAs.
+- The paged common FFI file already has `QuantizeQToPaddedBatchKernel`, which quantizes Q directly into the padded scratch layout the stage kernel consumes.
+- I will launch that once in `RunPagedBatchBf16QImpl`, then call the existing paged stage with `q_bf16=nullptr` so it uses prepacked Q through the same producer path as dense. Decision criterion: D256 Qwen paged-PV improves materially and tests remain green.
+
+Result:
+- D256 Qwen-full q=512 kv=65536 PV before this change: `4.293 ms`.
+- Moving BF16 Q quantization to one pre-stage padded-Q kernel: `4.181 ms`.
+- Passing `kv_head=0` for single-KV-head wrappers instead of the all-head sentinel is effectively neutral: PV `4.171 ms`, linear `5.015 ms`.
+- Conclusion: repeated Q quantization was real structural waste and is worth removing, but it is not the dominant 3x stage gap.
+- Next: split scheduling for short-Q/decode. Current auto split has a minimum of 8 KV tiles, causing q=1 to run at least 8 splits plus combine even though reference decode kernels use a decode-shaped schedule.
+
+## 2026-05-04 06:35 CDT - Decode Split and D256 Output Span Checks
+
+Decode/short-Q split check:
+- D256 q=1 kv=65536 PV:
+  split 1024 `0.508 ms`, 2048 `0.914 ms`, 4096 `1.739 ms`, 8192 `3.409 ms`, 16384 `6.666 ms`, 32768 `13.178 ms`, 65536 `25.607 ms`.
+- D256 q=1 kv=65536 linear:
+  split 1024 `1.216 ms`, 2048 `1.645 ms`, 4096 `2.527 ms`, 8192 `4.293 ms`, 16384 `7.732 ms`, 32768 `14.603 ms`, 65536 `27.823 ms`.
+- D512 q=1 kv=65536 PV:
+  split 1024 `0.778 ms`, 2048 `1.343 ms`, 4096 `2.517 ms`, 8192 `4.940 ms`, 16384 `9.569 ms`, 32768 `18.895 ms`, 65536 `36.106 ms`.
+- D512 q=1 kv=65536 linear:
+  split 1024 `2.219 ms`, 2048 `2.817 ms`, 4096 `4.094 ms`, 8192 `6.677 ms`, 16384 `11.714 ms`, 32768 `21.755 ms`, 65536 `40.118 ms`.
+- Conclusion: q=1 is fastest at the smallest tested split. Larger split makes each CTA loop over more masked/serialized KV work. Auto already selects 1024, so the q=1 floor is the cost of using this prefill-stage kernel as a decode path, not a simple auto-split bug.
+
+D256 output-group-span check:
+- D256 Qwen q=512 kv=65536 PV with production span=2: `~4.17 ms` after Q-prequant change.
+- Same cell with paged kernel compiled for output_group_span=1: `6.94 ms` PV, `7.72 ms` linear.
+- Decision: reverted. Span=2 is the correct D256 paged schedule among these two.
