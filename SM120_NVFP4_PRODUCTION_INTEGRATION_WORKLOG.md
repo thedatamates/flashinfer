@@ -3854,3 +3854,59 @@ Refined split sweep below `2048`:
   linear. Very small splits lose to split/combine overhead, while large splits
   lose to per-stage work. The optimum is a real schedule balance, not a
   monotonic "more splits" answer.
+
+## 2026-05-04 04:10 CDT - D512 Split Schedule Check
+
+What I am about to do:
+- D512 Gemma-global is already much closer to dense than D256, but still about
+  `2x` at the key `q=512 kv=65536 g=8` cell.
+- Before changing the producer again, I am rechecking split geometry under the
+  current kernel because split-K affects how much work each paged CTA does and
+  how much split-combine overhead is paid.
+
+Result:
+- Gemma-global `q=512 kv=65536 g=8 softcap=30`, PV:
+  - split `1024`: `11.39 ms`
+  - split `1536`: `10.41 ms`
+  - split `2048`: `10.06 ms`
+  - split `3072`: `9.65 ms`
+  - split `4096`: `10.25 ms`
+  - split `6144`: `9.99 ms`
+  - split `8192`: `12.42 ms`
+  - split `12288`: `9.64 ms`
+- Gemma-global `q=512 kv=65536 g=8 softcap=30`, linear:
+  - split `1024`: `12.27 ms`
+  - split `1536`: `12.19 ms`
+  - split `2048`: `12.30 ms`
+  - split `3072`: `11.58 ms`
+  - split `4096`: `11.31 ms`
+  - split `6144`: `11.00 ms`
+  - split `8192`: `13.60 ms`
+  - split `12288`: `10.70 ms`
+- Conclusion: split geometry is only a modest D512 factor. PV improves from
+  roughly `10.25 ms` at split `4096` to `9.64 ms`; linear improves from
+  `11.31 ms` to `10.70 ms`. The remaining D512 gap is in the stage kernel path,
+  not the split scheduler.
+
+## 2026-05-04 04:25 CDT - D512 Paged Output-Group Span Check
+
+What I am about to do:
+- D512 paged currently compiles `kOutputGroupSpan=4`, so one CTA carries four
+  PV accumulators and stages four 128-column V groups.
+- The D512 code already reuses the P stage across those groups for non-final
+  tiles, but the register footprint and V-stage scheduling may still be worse
+  than two CTAs with `kOutputGroupSpan=2`.
+- I will test a D512 paged-only `kOutputGroupSpan=2` launch surface. Dense stays
+  at span 4 for this experiment. Decision criterion: keep only if paged improves
+  materially and correctness holds.
+
+Result:
+- Gemma-global `q=512 kv=65536 g=8 softcap=30`, PV:
+  span `2`, split `3072`: `13.81 ms`.
+  Current span `4`, split `3072`: `9.65 ms`.
+- Gemma-global `q=512 kv=65536 g=8 softcap=30`, linear:
+  span `2`, split `12288`: `15.84 ms`.
+  Current span `4`, split `12288`: `10.70 ms`.
+- Decision: reverted. The D512 span-4 path is the correct amortization point;
+  halving the span increases CTAs and loses more than it saves in register
+  pressure.
