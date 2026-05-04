@@ -3238,3 +3238,88 @@ Conclusion:
 - Linear-V adds a consistent `1.4-1.5x` over paged-PV, but the larger problem is
   common to both layouts. Further work needs to target the paged producer /
   launch geometry rather than report generation or device selection.
+
+## 2026-05-04 02:25 CDT - Multi-Warp Paged Producer Plan
+
+Finding:
+
+- The remaining dense-vs-paged gap is structurally consistent with load-warp
+  under-participation.
+- Dense mode uses the load warp as a TMA descriptor issuer: one warp is enough
+  because TMA hardware moves the tile.
+- Paged mode currently reuses that same one load warp to perform the actual
+  paged K/V/Q staging work in software. The V path in particular performs the
+  dim-contiguous to token-contiguous transpose/repack inside a single warp.
+- This is not how the in-tree paged kernels are structured. `fmha_v2` and the
+  Hopper sparse producer distribute paged loads across CTA threads; block-table
+  indirection is amortized across a tiled load group, not serialized through one
+  descriptor-issuer warp.
+
+Implementation target:
+
+- Convert the SM120 paged producer from one load warp to a load warpgroup.
+- Keep the MMA warpgroup unchanged (`8` MMA warps) and add load warps rather
+  than stealing MMA lanes. The kernel is already smem-limited to one CTA/SM, so
+  increasing CTA threads is the right first tradeoff.
+- Use one load leader (`load_thread_idx == 0`) for pipeline acquire/complete.
+  All load threads participate in staging loops.
+- Replace single-warp producer synchronization with a named barrier scoped to
+  the load warpgroup. This keeps the TMA/dense leader path single-issued while
+  allowing paged software loads to use multiple warps.
+
+Done criteria:
+
+- D512 paged-PV at `q=512 kv=65536 g=8 softcap=30` moves materially toward
+  dense (`6.04 ms`) from the current `87.99 ms`.
+- D512 paged-linear follows the same direction from the current `153.68 ms`.
+- Correctness tests still pass without tolerance changes.
+
+## 2026-05-04 03:20 CDT - Multi-Warp Producer Result
+
+Implemented and validated:
+
+- D512 paged producer now uses `8` load warps with a load-group named barrier.
+  The load leader owns pipeline acquire/complete; all load threads advance the
+  producer pipeline state after completion. `load_tail` remains restricted to
+  the first load warp because CUTLASS tail code uses warp election.
+- D128 uses the same widened producer pattern and passes the shared head-dim
+  test coverage.
+- D256 was attempted with the same pattern but reverted before commit. The
+  widened D256 variant introduced small PV-layout multi-KV drift and
+  scratch-poison sensitivity. Forcing D256 back to one load warp fixed the
+  multi-KV/standard-wrapper cases; restoring warp-synchronous producer handoff
+  fixed scratch-poison. Conclusion: D256 needs a separate producer restructure
+  and should not receive the D128/D512 load-warpgroup change by mechanical port.
+
+Validation:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py -q`: `36 passed`.
+- D256 failed-port diagnostic subset after reverting D256 producer changes:
+  `test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x[256-6]`,
+  `test_sm120_nvfp4_wrapper_scratch_poison_does_not_affect_output_sm12x`, and
+  `test_standard_prefill_wrapper_sm120_nvfp4_backend_matches_direct_wrapper_sm12x[256-6]`
+  all passed.
+
+Reference measurements on GPU 2 via `CUDA_VISIBLE_DEVICES=2 --device 0`:
+
+- D512 Gemma-global cell `q=512 kv=65536 g=8 softcap=30`:
+  - dense: `7.922 ms`
+  - paged-PV: `15.851 ms`
+  - paged-linear: `43.212 ms`
+  - Start of pass was dense `7.69 ms`, paged-PV `899 ms`, paged-linear
+    `1883 ms`; the D512 PV path is now about `2.0x` dense instead of
+    `117x` dense on this cell.
+- D128 reference cell `q=512 kv=65536 g=8`:
+  - dense: `5.043 ms`
+  - paged-PV: `9.904 ms`
+  - D128 PV is also about `2.0x` dense after widening.
+
+Remaining cost:
+
+- D512 linear-V is still `43.212 ms` versus `15.851 ms` paged-PV. The remaining
+  linear gap is the in-kernel V reblock path, not the common paged producer
+  geometry. It still needs a fmha_v2-style reblock structure or a vLLM PV writer
+  path to close.
+- D256 remains on the known-correct one-load-warp producer. Its broad gap is
+  still open and should be attacked as a D256-specific scheduling/reblock issue,
+  not by reapplying the D512 load-warpgroup patch unchanged.

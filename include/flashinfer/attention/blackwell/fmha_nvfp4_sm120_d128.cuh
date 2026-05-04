@@ -60,7 +60,7 @@ constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax0 = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsSoftmax1 = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsCorrection = 0;
 constexpr int kSm120Nvfp4FmhaNumWarpsMma = 8;
-constexpr int kSm120Nvfp4FmhaNumWarpsLoad = 1;
+constexpr int kSm120Nvfp4FmhaNumWarpsLoad = 8;
 constexpr int kSm120Nvfp4FmhaNumWarpsEpilogue = 1;
 constexpr int kSm120Nvfp4FmhaWarpSoftmax0Begin = 0;
 constexpr int kSm120Nvfp4FmhaWarpSoftmax1Begin =
@@ -79,11 +79,15 @@ constexpr int kSm120Nvfp4FmhaThreadCount =
     kSm120Nvfp4FmhaNumWarps * cutlass::NumThreadsPerWarp;
 constexpr int kSm120Nvfp4FmhaOutputThreadCount =
     kSm120Nvfp4FmhaNumWarpsEpilogue * cutlass::NumThreadsPerWarp;
+constexpr int kSm120Nvfp4FmhaLoadThreadCount =
+    kSm120Nvfp4FmhaNumWarpsLoad * cutlass::NumThreadsPerWarp;
 constexpr int kSm120Nvfp4FmhaMmaSoftmaxThreadCount =
     kSm120Nvfp4FmhaNumWarpsMma * cutlass::NumThreadsPerWarp;
 constexpr int kSm120Nvfp4FmhaMmaSoftmaxLoadThreadCount =
     kSm120Nvfp4FmhaMmaSoftmaxThreadCount +
     kSm120Nvfp4FmhaNumWarpsLoad * cutlass::NumThreadsPerWarp;
+constexpr uint32_t kSm120Nvfp4BarrierLoadGroup =
+    static_cast<uint32_t>(cutlass::arch::ReservedNamedBarriers::FirstUserBarrier);
 __host__ __device__ constexpr Sm120Nvfp4FmhaRole
 sm120_nvfp4_fmha_role_for_warp(int warp_idx) {
   if (warp_idx >= kSm120Nvfp4FmhaWarpSoftmax0Begin &&
@@ -102,7 +106,8 @@ sm120_nvfp4_fmha_role_for_warp(int warp_idx) {
       warp_idx < kSm120Nvfp4FmhaWarpLoad) {
     return Sm120Nvfp4FmhaRole::Mma;
   }
-  if (warp_idx == kSm120Nvfp4FmhaWarpLoad) {
+  if (warp_idx >= kSm120Nvfp4FmhaWarpLoad &&
+      warp_idx < kSm120Nvfp4FmhaWarpEpilogue) {
     return Sm120Nvfp4FmhaRole::Load;
   }
   if (warp_idx == kSm120Nvfp4FmhaWarpEpilogue) {
@@ -568,11 +573,19 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
   const int thread_idx = int(threadIdx.x);
   const int warp_idx = thread_idx / cutlass::NumThreadsPerWarp;
   const int lane_idx = thread_idx % cutlass::NumThreadsPerWarp;
-  const bool lane_predicate = lane_idx == 0;
   const Sm120Nvfp4FmhaRole role = sm120_nvfp4_fmha_role_for_warp(warp_idx);
   const bool is_load = role == Sm120Nvfp4FmhaRole::Load;
   const bool is_mma = role == Sm120Nvfp4FmhaRole::Mma;
   const bool is_epilogue = role == Sm120Nvfp4FmhaRole::Epilogue;
+  const int load_thread_idx =
+      is_load ? thread_idx - kSm120Nvfp4FmhaWarpLoad * cutlass::NumThreadsPerWarp
+              : 0;
+  const bool load_leader = is_load && load_thread_idx == 0;
+  const bool first_load_warp = is_load && load_thread_idx < cutlass::NumThreadsPerWarp;
+  auto load_group_sync = [&]() {
+    cutlass::arch::NamedBarrier::sync(kSm120Nvfp4FmhaLoadThreadCount,
+                                      kSm120Nvfp4BarrierLoadGroup);
+  };
   const int qk_mma_thread_idx =
       is_mma ? sm120_nvfp4_fmha_mma_thread_idx(thread_idx) : 0;
   const int pv_mma_thread_idx = qk_mma_thread_idx;
@@ -612,7 +625,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
       cutlass::make_producer_start_state<Sm120Nvfp4PipelineE>();
   typename Sm120Nvfp4PipelineE::PipelineState pipeline_corr_epi_consumer_state;
 
-  if (is_load && lane_predicate) {
+  if (load_leader) {
     CutlassCollectiveMainloop::prefetch_tma_descriptors(qk_params.mainloop);
     CutlassCollectiveMainloopK128Stage2::prefetch_tma_descriptors(
         pv_params.mainloop);
@@ -635,12 +648,9 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
   }
   const bool mma_warpgroup_leader =
       is_mma && (qk_mma_thread_idx % cutlass::NumThreadsPerWarpGroup) == 0;
-  q_pipeline_params.is_leader =
-      (is_load && lane_predicate) || mma_warpgroup_leader;
-  k_pipeline_params.is_leader =
-      (is_load && lane_predicate) || mma_warpgroup_leader;
-  v_pipeline_params.is_leader =
-      (is_load && lane_predicate) || mma_warpgroup_leader;
+  q_pipeline_params.is_leader = load_leader || mma_warpgroup_leader;
+  k_pipeline_params.is_leader = load_leader || mma_warpgroup_leader;
+  v_pipeline_params.is_leader = load_leader || mma_warpgroup_leader;
   q_pipeline_params.num_consumers = CutlassCollectiveMainloop::ThreadCount;
   k_pipeline_params.num_consumers = CutlassCollectiveMainloop::ThreadCount;
   v_pipeline_params.num_consumers =
@@ -799,9 +809,9 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
           cute::make_shape(cute::Int<kCutlassTileN>{},
                            cute::Int<kCutlassTileK>{}, cute::Int<1>{}));
 
-      for (int copy_thread = lane_idx;
+      for (int copy_thread = load_thread_idx;
            copy_thread < CutlassCollectiveMainloop::ThreadCount;
-           copy_thread += cutlass::NumThreadsPerWarp) {
+           copy_thread += kSm120Nvfp4FmhaLoadThreadCount) {
         auto smem_thr_copy_B =
             smem_tiled_copy_B.get_thread_slice(copy_thread);
         auto tBsB_prod = smem_thr_copy_B.partition_D(qk_sB);
@@ -856,8 +866,8 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
       cp_async::commit_group();
 
       constexpr int kKScaleCols = kCutlassTileK / 16;
-      for (int idx = lane_idx; idx < kCutlassTileN * kKScaleCols;
-           idx += cutlass::NumThreadsPerWarp) {
+      for (int idx = load_thread_idx; idx < kCutlassTileN * kKScaleCols;
+           idx += kSm120Nvfp4FmhaLoadThreadCount) {
         const int row = idx / kKScaleCols;
         const int local_scale_col = idx - row * kKScaleCols;
         const int token = kv_tile * kCutlassTileN + row;
@@ -953,9 +963,9 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
 
       if constexpr (!kPvLayoutV) {
         constexpr int kTokenScaleGroups = kCutlassTileN / 16;
-        for (int idx = lane_idx;
+        for (int idx = load_thread_idx;
              idx < (kOutputTileN / 2) * kTokenScaleGroups;
-             idx += cutlass::NumThreadsPerWarp) {
+             idx += kSm120Nvfp4FmhaLoadThreadCount) {
           const int col_pair = idx / kTokenScaleGroups;
           const int token_group = idx - col_pair * kTokenScaleGroups;
           const int col0 = 2 * col_pair;
@@ -973,7 +983,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                 make_ue4m3_raw(sf1);
           }
         }
-        __syncwarp();
+        load_group_sync();
       }
 
       if constexpr (kPvLayoutV) {
@@ -984,12 +994,14 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
         constexpr int kTransposeDims = 8;
         constexpr int kTokenGroups = kCutlassTileN / kTransposeTokens;
         constexpr int kDimGroups = kOutputTileN / kTransposeDims;
-        constexpr int kWarpTransposeGroups = cutlass::NumThreadsPerWarp / 8;
+        constexpr int kWarpTransposeGroups = kSm120Nvfp4FmhaLoadThreadCount / 8;
+        const int load_subgroup = load_thread_idx >> 3;
         const int subgroup = lane_idx >> 3;
         const int subgroup_lane = lane_idx & 7;
+        const int subgroup_base_lane = lane_idx & ~7;
         const unsigned subgroup_mask =
             static_cast<unsigned>(0xffu << (subgroup * 8));
-        for (int tile = subgroup; tile < kTokenGroups * kDimGroups;
+        for (int tile = load_subgroup; tile < kTokenGroups * kDimGroups;
              tile += kWarpTransposeGroups) {
           const int token_group = tile % kTokenGroups;
           const int dim_group = tile / kTokenGroups;
@@ -1018,7 +1030,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
 #pragma unroll
           for (int src_lane = 0; src_lane < 8; ++src_lane) {
             const uint32_t peer_word =
-                __shfl_sync(subgroup_mask, row_word, subgroup * 8 + src_lane);
+                __shfl_sync(subgroup_mask, row_word, subgroup_base_lane + src_lane);
             const uint8_t code = static_cast<uint8_t>(
                 (peer_word >> (4 * subgroup_lane)) & 0x0f);
             packed_word |= static_cast<uint32_t>(code) << (4 * src_lane);
@@ -1053,12 +1065,14 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
         constexpr int kTransposeDims = 8;
         constexpr int kTokenGroups = kCutlassTileN / kTransposeTokens;
         constexpr int kDimGroups = kOutputTileN / kTransposeDims;
-        constexpr int kWarpTransposeGroups = cutlass::NumThreadsPerWarp / 8;
+        constexpr int kWarpTransposeGroups = kSm120Nvfp4FmhaLoadThreadCount / 8;
+        const int load_subgroup = load_thread_idx >> 3;
         const int subgroup = lane_idx >> 3;
         const int subgroup_lane = lane_idx & 7;
+        const int subgroup_base_lane = lane_idx & ~7;
         const unsigned subgroup_mask =
             static_cast<unsigned>(0xffu << (subgroup * 8));
-        for (int tile = subgroup; tile < kTokenGroups * kDimGroups;
+        for (int tile = load_subgroup; tile < kTokenGroups * kDimGroups;
              tile += kWarpTransposeGroups) {
           const int token_group = tile % kTokenGroups;
           const int dim_group = tile / kTokenGroups;
@@ -1098,7 +1112,7 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
           const uint32_t packed_word =
               sm120_nvfp4_linear_v_requant_transposed_word(
                   row_word, row_scale_byte, output_scale, subgroup_mask,
-                  subgroup * 8, subgroup_lane);
+                  subgroup_base_lane, subgroup_lane);
 
           auto ref0 = pv_sB(local_col, local_k0, write_stage);
           uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
@@ -1123,8 +1137,8 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
 
       if constexpr (kPvLayoutV) {
         constexpr int kTokenScaleGroups = kCutlassTileN / 16;
-        for (int idx = lane_idx; idx < kOutputTileN * kTokenScaleGroups;
-             idx += cutlass::NumThreadsPerWarp) {
+        for (int idx = load_thread_idx; idx < kOutputTileN * kTokenScaleGroups;
+             idx += kSm120Nvfp4FmhaLoadThreadCount) {
           const int col = idx / kTokenScaleGroups;
           const int token_group = idx - col * kTokenScaleGroups;
           const int k0 = token_group * 16;
@@ -1187,9 +1201,9 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
       auto cA = cute::make_identity_tensor(
           cute::make_shape(cute::Int<kCutlassTileM>{},
                            cute::Int<kCutlassTileK>{}, cute::Int<1>{}));
-      for (int copy_thread = lane_idx;
+      for (int copy_thread = load_thread_idx;
            copy_thread < CutlassCollectiveMainloop::ThreadCount;
-           copy_thread += cutlass::NumThreadsPerWarp) {
+           copy_thread += kSm120Nvfp4FmhaLoadThreadCount) {
         auto smem_thr_copy_A =
             smem_tiled_copy_A.get_thread_slice(copy_thread);
         auto tAsA_prod = smem_thr_copy_A.partition_D(qk_sA);
@@ -1244,8 +1258,8 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
         });
       }
 
-      for (int idx = lane_idx; idx < kCutlassTileM * kCutlassTileK / 16;
-           idx += cutlass::NumThreadsPerWarp) {
+      for (int idx = load_thread_idx; idx < kCutlassTileM * kCutlassTileK / 16;
+           idx += kSm120Nvfp4FmhaLoadThreadCount) {
         const int row = idx / (kCutlassTileK / 16);
         const int local_scale_col = idx - row * (kCutlassTileK / 16);
         const int k0 = local_scale_col * 16;
@@ -1264,25 +1278,26 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
     if constexpr (kUsePagedKv) {
       if (paged_kv_params.q_bf16 != nullptr) {
         if (is_load) {
-          if (lane_predicate) {
+          if (load_leader) {
             q_pipeline.producer_acquire(q_pipe_write);
           }
-          __syncwarp();
+          load_group_sync();
           const int write_stage = q_pipe_write.index();
           stage_bf16_q_tile(k_outer, write_stage);
           cutlass::arch::fence_view_shared();
-          __syncwarp();
-          if (lane_predicate) {
+          load_group_sync();
+          if (load_leader) {
             complete_manual_tma_pipeline_stage(
                 q_pipeline, q_pipe_write,
                 qk_params.mainloop.tma_transaction_bytes_mk);
-            ++q_pipe_write;
           }
+          load_group_sync();
+          ++q_pipe_write;
         }
         return;
       }
     }
-    if (is_load && lane_predicate) {
+    if (load_leader) {
       auto gA = qk_gA_mkl(_, _, effective_q_tile, _, 0);
       auto broadcast_m = cute::make_layout(
           cute::make_shape(
@@ -1315,22 +1330,23 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
   auto load_k_chunk = [&](int kv_tile, int k_outer) {
     if constexpr (kUsePagedKv) {
       if (is_load) {
-        if (lane_predicate) {
+        if (load_leader) {
           k_pipeline.producer_acquire(k_pipe_write);
         }
-        __syncwarp();
+        load_group_sync();
         const int write_stage = k_pipe_write.index();
         stage_paged_k_tile(kv_tile, k_outer, write_stage);
         cutlass::arch::fence_view_shared();
-        __syncwarp();
-        if (lane_predicate) {
+        load_group_sync();
+        if (load_leader) {
           complete_manual_tma_pipeline_stage(
               k_pipeline, k_pipe_write,
               qk_params.mainloop.tma_transaction_bytes_nk);
-          ++k_pipe_write;
         }
+        load_group_sync();
+        ++k_pipe_write;
       }
-    } else if (is_load && lane_predicate) {
+    } else if (load_leader) {
       auto gB = qk_gB_nkl(_, _, kv_tile, _, 0);
       auto gSFB = qk_gSFB_nkl(_, _, kv_tile, _, 0);
       auto tBgB = qk_block_tma_b.partition_S(gB);
@@ -1358,22 +1374,23 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
         effective_out_group_base + group_offset;
     if constexpr (kUsePagedKv) {
       if (is_load) {
-        if (lane_predicate) {
+        if (load_leader) {
           v_pipeline.producer_acquire(v_pipe_write);
         }
-        __syncwarp();
+        load_group_sync();
         const int write_stage = v_pipe_write.index();
         stage_paged_v_tile(kv_tile, effective_out_group_idx, write_stage);
         cutlass::arch::fence_view_shared();
-        __syncwarp();
-        if (lane_predicate) {
+        load_group_sync();
+        if (load_leader) {
           complete_manual_tma_pipeline_stage(
               v_pipeline, v_pipe_write,
               pv_params.mainloop.tma_transaction_bytes_nk);
-          ++v_pipe_write;
         }
+        load_group_sync();
+        ++v_pipe_write;
       }
-    } else if (is_load && lane_predicate) {
+    } else if (load_leader) {
       auto gB = pv_gB_nkl(_, _, effective_out_group_idx, _, 0);
       auto gSFB = pv_gSFB_nkl(_, _, effective_out_group_idx, _, 0);
       auto tBgB = pv_block_tma_b.partition_S(gB);
@@ -1480,7 +1497,9 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
     if (qk_head_chunks > 1) {
       load_k_chunk(effective_kv_tile_start, 1);
     }
-    qk_collective.load_tail(q_pipeline, q_pipe_write);
+    if (first_load_warp) {
+      qk_collective.load_tail(q_pipeline, q_pipe_write);
+    }
 
     for (int tile = 0; tile < effective_num_kv_tiles; ++tile) {
       if (tile + 1 < effective_num_kv_tiles) {
@@ -1493,8 +1512,10 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
       }
     }
 
-    qk_collective.load_tail(k_pipeline, k_pipe_write);
-    pv_collective.load_tail(v_pipeline, v_pipe_write);
+    if (first_load_warp) {
+      qk_collective.load_tail(k_pipeline, k_pipe_write);
+      pv_collective.load_tail(v_pipeline, v_pipe_write);
+    }
   } else if (is_mma) {
     auto q_frag0 =
         qk_thread_mma.partition_fragment_A(qk_sA(_, _, cute::Int<0>{}));
