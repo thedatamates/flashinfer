@@ -4360,3 +4360,50 @@ Qwen full D256 g=6 patched-vLLM PV focused report:
 - Decode remains structurally bad even without linear-V reblock: q=1 kv=4096 was sm120 `0.287 ms` versus nvfp4_fa2 `0.0272 ms` (`10.6x` slower), q=1 kv=262144 was sm120 `0.710 ms` versus nvfp4_fa2 `0.0851 ms` (`8.34x` slower). This is generic prefill-shaped paged-stage overhead, not the linear reblock path.
 - Paired linear/PV comparison across the 14 cells: linear is `1.46x` slower geomean than PV. The largest extra linear tax is decode long context: q=1 kv=262144 linear `3.439 ms` versus PV `0.710 ms` (`4.85x`), q=1 kv=65536 linear `1.012 ms` versus PV `0.320 ms` (`3.16x`). For q=512 long-context prefill, linear/PV is about `1.28x`; this is the in-kernel reblock cost on top of the paged stage.
 - Decision: keep measuring the production specs before further code changes. Current Qwen result says there are two separate issues: (1) linear-V reblock tax for stock-vLLM, and (2) a decode-shape mismatch where this prefill kernel is not competitive even on PV.
+
+Gemma sliding D256 g=2 SWA=1024 softcap=30 focused reports:
+- Linear report prefix: `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_linear_20260504`.
+- PV report prefix: `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_pv_20260504`.
+- Ran 8 production cells with kernels `sm120_fused,nvfp4_fa2,bf16_fa2` for each layout; all sm120 rows were finite and all rows completed.
+- Linear geomean sm120 speedup versus nvfp4_fa2: `0.121x`; versus bf16_fa2: `0.0895x`.
+- PV geomean sm120 speedup versus nvfp4_fa2: `0.141x`; versus bf16_fa2: `0.104x`.
+- PV sm120 time is roughly fixed at `0.221-0.244 ms` for the 1024-token window cells and `0.666 ms` for q=2048 kv=8192. Linear is `1.17x` slower geomean than PV. The extra linear tax is small in absolute terms (`~0.02 ms` for kv=1024 cells, `~0.09 ms` for kv=8192 cells).
+- Decision: for Gemma sliding, the remaining gap is not primarily linear-V reblock. It is the fixed launch/stage overhead of using this prefill-shaped paged kernel on very small window-bounded work. Further V producer work cannot close an 8-11x gap on these cells.
+
+Gemma global D512 g=8 softcap=30 focused reports:
+- Linear report prefix: `reports/prod_gemma_global_d512_g8_softcap30_linear_20260504`.
+- PV report prefix: `reports/prod_gemma_global_d512_g8_softcap30_pv_20260504`.
+- Linear run used kernels `sm120_fused,nvfp4_fa2,bf16_fa2`. BF16 FA2 failed every D512 g=8 cell with the existing FlashInfer dispatched prefill invalid configuration (`NUM_MMA_D_QK=32 NUM_MMA_D_VO=32 ...`); I did not patch that reference backend. PV run used `sm120_fused,nvfp4_fa2` to avoid repeating known-invalid BF16 rows.
+- All sm120 rows were finite and all nvfp4_fa2 rows completed.
+- Linear geomean sm120 speedup versus nvfp4_fa2: `0.360x`, with `5/11` cells faster than nvfp4_fa2.
+- PV geomean sm120 speedup versus nvfp4_fa2: `0.502x`, with `5/11` cells faster than nvfp4_fa2.
+- D512 global is competitive on large prefill:
+  - Linear q=512 kv=65536: sm120 `8.235 ms` versus nvfp4_fa2 `9.282 ms` (`1.13x` faster).
+  - Linear q=512 kv=262144: sm120 `33.439 ms` versus nvfp4_fa2 `37.289 ms` (`1.12x` faster).
+  - Linear q=2048 kv=16384/65536/262144: sm120 `7.394/29.304/122.248 ms` versus nvfp4_fa2 `10.954/45.026/184.959 ms` (`1.48-1.54x` faster).
+  - PV q=512 kv=65536/262144: sm120 `7.355/29.189 ms` versus nvfp4_fa2 `9.301/37.162 ms` (`1.26-1.27x` faster).
+  - PV q=2048 kv=16384/65536/262144: sm120 `7.523/28.804/120.773 ms` versus nvfp4_fa2 `11.057/44.698/185.042 ms` (`1.47-1.55x` faster).
+- D512 global still loses short-context and decode:
+  - PV q=512 kv=4096: sm120 `2.108 ms` versus nvfp4_fa2 `0.647 ms` (`0.307x`).
+  - PV q=1 kv=4096/16384/65536/262144: sm120 `0.561/0.574/0.607/1.450 ms` versus nvfp4_fa2 `0.0703/0.0737/0.1119/0.3596 ms` (`0.125-0.248x`).
+- Paired linear/PV comparison across the 11 cells: linear is `1.39x` slower geomean than PV. The largest extra linear tax is decode long context: q=1 kv=262144 linear `7.095 ms` versus PV `1.450 ms` (`4.89x`), q=1 kv=65536 linear `1.952 ms` versus PV `0.607 ms` (`3.21x`). For large prefill, linear/PV is much closer: q=2048 long-context cells are within about `1.01x`.
+
+Production-focused matrix conclusion:
+- Reports completed:
+  - `reports/prod_qwen_full_d256_g6_linear_20260504`
+  - `reports/prod_qwen_full_d256_g6_pv_20260504`
+  - `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_linear_20260504`
+  - `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_pv_20260504`
+  - `reports/prod_gemma_global_d512_g8_softcap30_linear_20260504`
+  - `reports/prod_gemma_global_d512_g8_softcap30_pv_20260504`
+- Compact geomean sm120 speedup versus nvfp4_fa2:
+  - Qwen D256 g=6 linear: `0.220x`, `0/14` wins.
+  - Qwen D256 g=6 PV: `0.321x`, `1/14` wins.
+  - Gemma sliding D256 g=2 linear: `0.121x`, `0/8` wins.
+  - Gemma sliding D256 g=2 PV: `0.141x`, `0/8` wins.
+  - Gemma global D512 g=8 linear: `0.360x`, `5/11` wins.
+  - Gemma global D512 g=8 PV: `0.502x`, `5/11` wins.
+- The earlier "paged is always 200x slower" diagnosis is obsolete after the producer fixes. The current result is not a uniform producer catastrophe. It is three regimes:
+  1. Large D512 global prefill: sm120 paged is faster than nvfp4_fa2 on the important long-context cells.
+  2. D256 Qwen long prefill: PV can reach parity at the largest q/kv cells, but stock linear-V remains behind due to reblock overhead.
+  3. Decode and Gemma sliding window: the prefill-shaped paged kernel has a fixed overhead floor that dominates small work. This needs a decode/window-specialized path or routing to an existing backend; more V producer micro-optimization will not close an order-of-magnitude fixed-overhead gap.
