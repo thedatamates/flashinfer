@@ -5052,3 +5052,56 @@ Next profiling target:
   - K scale shared-wavefront excess at `d256.cuh:922`.
   - Paged producer reconvergence around cache/page setup at `d256.cuh:843`.
 - The next change should either remove one of those stores entirely from the hot loop or change the staging architecture; simple lane reorders are now suspect unless NCU shows the target counter dominates and timing moves with it.
+
+## 2026-05-04 12:52 CDT - Paged Physical-Page Cache Dedup Target
+
+Finding:
+
+- The lineinfo paged-vs-dense comparison shows the largest paged-only barrier/reconvergence source at `d256.cuh:843`, the page-cache fill predicate `if (load_thread_idx < kPagesPerKvTile)`.
+- The committed page cache is filled inside every K and V staging helper. On D256 Qwen with `qk_head_chunks == 2` and `output_group_span == 2`, the same `kv_tile` is cached four times: K chunk 0, K chunk 1, V group 0, V group 1.
+- The earlier page-cache barrier refinement did not remove this duplicate work; it moved the fill relative to the existing pre-stage barrier and removed the helper-local barrier for every chunk. That was neutral/slightly worse.
+- The new target is different: keep the stage synchronization shape, but fill the physical-page cache only when the staged `kv_tile` changes.
+
+Implementation target:
+
+- Start D256-only.
+- Split page-cache fill from synchronization.
+- Track the currently cached `kv_tile` in the load-thread control flow.
+- Call the fill before the existing pre-stage `load_group_sync()` only when `kv_tile` changes; keep all existing producer acquire/complete/fence synchronization unchanged.
+
+Validation:
+
+- Run the focused D256 correctness subset.
+- Benchmark D256 Qwen paged-PV `q=512 kv=65536 g=6 split=3072`.
+- If timing improves, run NCU and check that barrier/reconvergence samples attributed to `d256.cuh:843` and page-cache instructions drop.
+- If D256 improves cleanly, propagate to D128/D512 and run the full NVFP4 test file.
+
+Decision criteria:
+
+- Keep and propagate only if D256 correctness passes and the reference cell improves materially.
+- Revert if it repeats the previous barrier-refinement result or introduces ordering instability.
+
+## 2026-05-04 12:55 CDT - Paged Physical-Page Cache Dedup Result
+
+Finding:
+
+- Implemented the D256-only schedule-level page-cache dedup:
+  - Split cache fill from the helper-local synchronization.
+  - Tracked the currently cached `kv_tile` in load-thread control flow.
+  - Filled the eight physical-page entries only when `kv_tile` changed while preserving the existing pre-stage `load_group_sync()` and producer acquire/complete sequence.
+- Focused D256 correctness passed: `3 passed in 44.38s`.
+- D256 Qwen paged-PV timing was neutral/noisy:
+  - Run 1: `2.274 ms` mean.
+  - Run 2: `2.268 ms` mean.
+  - Committed coalesced-load baseline: `2.271 ms` mean.
+
+Decision:
+
+- Reverted the D256 code.
+- Do not propagate page-cache dedup to D128/D512. The duplicate cache fill is visible in NCU reconvergence attribution, but it is not load-bearing for wall time at this cell.
+
+Next profiling target:
+
+- Stop spending effort on page-cache branch shape unless a different cell shows it as a wall-time limiter.
+- The remaining wall-time gap is more likely in the larger shared-store/MMA/softmax pipeline balance than in page-cache fill overhead.
+- Use NCU/NSYS next to choose between two architectural targets: reducing shared-store wavefront excess in V/K scale staging, or changing split/tile scheduling to reduce total stage work.
