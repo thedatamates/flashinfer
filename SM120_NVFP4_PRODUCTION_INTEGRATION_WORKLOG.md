@@ -6664,3 +6664,52 @@ Decision:
 
 - Keep the static PV-scale helper. The win is modest, but it directly removes an NCU-identified runtime division from the PV-scale hot path and does not affect public layout/API.
 - Re-run NCU source sampling before the next change; the previous source ranking is now stale because one of the top helper instructions changed.
+
+## 2026-05-04 17:58 CDT - Score-Mask FastDivmod Target
+
+Finding:
+
+- Fresh lineinfo NCU after the static PV-scale change still shows score-mask division as the largest source-level instruction site:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d256.cuh:1957`: `5.24B` instructions.
+  - Same line is the top short-scoreboard source and a major wait-stall source.
+- The shared `q_pos_cache` variant proved the division is load-bearing, but its storage placement failed D256 multi-KV/ragged correctness.
+- FlashInfer already uses fast-divmod utilities for group-size and page-size decomposition in production attention kernels (`include/flashinfer/attention/prefill.cuh`, `csrc/batch_prefill.cu`, `csrc/single_prefill.cu`).
+- CUTLASS provides `cutlass::FastDivmod`, which can be constructed once on the host in the internal launcher and passed to the device kernel without changing the public Python/TVM-FFI signature.
+
+Implementation target:
+
+- Add an internal `cutlass::FastDivmod group_size_divmod` argument to the stage kernel launch, while keeping the existing integer `group_size` argument for stride/index arithmetic.
+- Replace only the hot `global_q_row / group_size` in `score_is_valid()` with `group_size_divmod.divide(global_q_row)`.
+- Apply to D128/D256/D512 consistently.
+- Do not change the public wrapper API, exported FFI function signature, tensor layouts, or test tolerances.
+
+Validation:
+
+- Benchmark D256 Qwen `q=4096 kv=262144` and `q=16384 kv=262144`, paged-PV.
+- Run the focused NVFP4 correctness selection, then the full NVFP4 test file if timing is positive or neutral.
+
+## 2026-05-04 18:06 CDT - Score-Mask FastDivmod Result
+
+Implementation:
+
+- Added an internal `cutlass::FastDivmod group_size_divmod` argument to the D128/D256/D512 stage kernels.
+- Constructed the fast divisor in the host-side launcher with `cutlass::FastDivmod(group_size)`.
+- Replaced the hot score-mask `global_q_row / group_size` with `group_size_divmod.divide(global_q_row)`.
+- Kept the existing integer `group_size` argument for all stride and shape arithmetic.
+- Public Python API, TVM-FFI exports, tensor layouts, and tolerances are unchanged.
+
+Measured result:
+
+| cell | prior paged-PV ms | FastDivmod paged-PV ms | FastDivmod paged-linear ms | result |
+|:---|---:|---:|---:|:---|
+| D256 Qwen `q=4096 kv=262144 g=6` | `59.627` | `52.510` | not rerun | improved |
+| D256 Qwen `q=16384 kv=262144 g=6` | `230.881` | `204.991` | `205.450` | improved |
+
+Correctness:
+
+- `tests/attention/test_nvfp4_kv_head_dim_512.py`: `36 passed in 288.18s`.
+
+Decision:
+
+- Keep FastDivmod. It recovers most of the benefit that the shared row cache hinted at, without changing shared-memory layout or failing D256 multi-KV/ragged correctness.
+- Re-run NCU source sampling before the next producer change. The prior top instruction site should no longer be a runtime integer division, so the next target needs fresh attribution.

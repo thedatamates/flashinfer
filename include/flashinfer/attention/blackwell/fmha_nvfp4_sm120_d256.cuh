@@ -13,6 +13,7 @@
 #include <cute/atom/mma_traits_sm120.hpp>
 #include <cutlass/device_kernel.h>
 #include <cutlass/epilogue/collective/collective_builder.hpp>
+#include <cutlass/fast_math.h>
 #include <cutlass/float8.h>
 #include <cutlass/float_subbyte.h>
 #include <cutlass/gemm/gemm.h>
@@ -508,6 +509,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     int total_kv_tiles,
     int q_len,
     int group_size,
+    cutlass::FastDivmod group_size_divmod,
     int kv_len_tokens,
     int causal,
     int sliding_window,
@@ -1954,7 +1956,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       if (global_q_row >= q_len * group_size) {
         return false;
       }
-      const int q_token = global_q_row / group_size;
+      const int q_token = group_size_divmod.divide(global_q_row);
       const int q_pos = kv_len_tokens - q_len + q_token;
       const int kv_pos =
           (effective_kv_tile_start + tile) * kCutlassTileN + col;
@@ -2472,11 +2474,11 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
                       num_splits),
                  kSm120Nvfp4FmhaThreadCount, kSmemBytes, stream>>>(
       qk_params, pv_params, stage_out, qk_alpha, pv_alpha, 0, 0,
-      split_kv_tiles, total_kv_tiles, q_len, group_size, kv_len_tokens,
-      causal ? 1 : 0, sliding_window, logits_soft_cap, 0, head_dim,
-      stage_split_m, stage_split_l, q_rows, stage_output_stride,
-      paged_kv_params, qo_indptr, kv_lens, batch_size, q_tiles_per_sequence,
-      num_kv_heads, all_kv_heads);
+      split_kv_tiles, total_kv_tiles, q_len, group_size,
+      cutlass::FastDivmod(group_size), kv_len_tokens, causal ? 1 : 0,
+      sliding_window, logits_soft_cap, 0, head_dim, stage_split_m, stage_split_l,
+      q_rows, stage_output_stride, paged_kv_params, qo_indptr, kv_lens,
+      batch_size, q_tiles_per_sequence, num_kv_heads, all_kv_heads);
   status = cudaGetLastError();
   return status;
 }
