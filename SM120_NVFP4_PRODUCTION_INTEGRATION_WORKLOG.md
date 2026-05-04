@@ -2402,3 +2402,64 @@ Cell sets:
   `kv={1024,8192}`, causal, sliding window `1024`, softcap `30`.
 - Gemma global: `D=512`, `group=8`, `q={1,128,512,2048}`,
   `kv={4096,16384,65536,262144}`, causal, no sliding window, softcap `30`.
+
+## 2026-05-03 20:12 CDT - P5 Production Matrix Result
+
+Reports produced:
+
+- `reports/prod_qwen_full_d256_g6_p4_20260503.{jsonl,csv,summary.csv,production.csv,md,run.log}`
+- `reports/prod_gemma_sliding_d256_g2_swa1024_softcap30_p4_20260503.{jsonl,csv,summary.csv,production.csv,md,run.log}`
+- `reports/prod_gemma_global_d512_g8_softcap30_p4_20260503.{jsonl,csv,summary.csv,production.csv,md,run.log}`
+
+Completion status:
+
+| spec | rows ok | rows error | error cause |
+| --- | ---: | ---: | --- |
+| Qwen full D256 g6 | 60 | 4 | dense q=1 rejected by dense_run tile_m=64 contract |
+| Gemma sliding D256 g2 | 32 | 0 | none |
+| Gemma global D512 g8 | 60 | 4 | dense q=1 rejected by dense_run tile_m=128 contract |
+
+All paged-linear, paged-PV, and q>=128 dense rows reported
+`output_finite=True`. The dense q=1 rows are not kernel correctness failures;
+the direct dense binding intentionally requires Q rows to be a positive multiple
+of the D-specialization tile M. Decode coverage comes from the paged rows and
+NVFP4 FA2 baseline rows.
+
+Geomean speedups vs NVFP4 FA2 (`baseline_ms / fused_ms`):
+
+| spec | dense | paged-PV | paged-linear |
+| --- | ---: | ---: | ---: |
+| Qwen full D256 g6 | 0.956x | 0.00373x | 0.00150x |
+| Gemma sliding D256 g2 | 0.217x | 0.00173x | 0.000695x |
+| Gemma global D512 g8 | 0.970x | 0.00453x | 0.00189x |
+
+Wrapper/reblock deltas:
+
+| spec | paged-PV / dense geomean | paged-linear / paged-PV geomean |
+| --- | ---: | ---: |
+| Qwen full D256 g6 | 152.9x | 2.492x |
+| Gemma sliding D256 g2 | 125.7x | 2.490x |
+| Gemma global D512 g8 | 89.8x | 2.392x |
+
+Worst underperforming cells vs NVFP4 FA2:
+
+| spec | path | q | kv | fused ms | nvfp4_fa2 ms | speedup |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Gemma global D512 g8 | paged-linear | 1 | 65536 | 1718.472 | 0.114 | 0.000066x |
+| Gemma global D512 g8 | paged-linear | 1 | 16384 | 858.617 | 0.073 | 0.000085x |
+| Gemma global D512 g8 | paged-PV | 1 | 65536 | 706.124 | 0.114 | 0.000162x |
+| Qwen full D256 g6 | paged-linear | 1 | 16384 | 155.648 | 0.031 | 0.000202x |
+| Gemma global D512 g8 | paged-PV | 1 | 16384 | 352.708 | 0.073 | 0.000206x |
+
+Characterization:
+
+- Dense remains roughly comparable to NVFP4 FA2 on the full-attention D256 and
+  D512 global geomeans, but direct dense is not the production path and does not
+  support q=1 without padding.
+- Paged-PV is still roughly `90x-153x` slower than dense on the production
+  cells. Paged-linear is another `2.39x-2.49x` slower than paged-PV.
+- The dominant production gap is not Q quantization or scale staging anymore.
+  It is the paged V data path plus launch/schedule geometry around split-KV and
+  page traversal. The D512 q=2048 kv=262144 stock-vLLM production cell is
+  `10290.048 ms` paged-linear vs `4403.373 ms` paged-PV vs `53.862 ms` dense vs
+  `188.973 ms` NVFP4 FA2.
