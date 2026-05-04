@@ -6914,3 +6914,108 @@ Decision:
 - Keep and commit the old-scale rescale-loop change.
 - The gain is NCU-aligned and shows up on both D256 and D512 large-Q/max-KV production rows.
 - The remaining large-Q gap is still paged-vs-dense. After this change, D256 `q=16384 kv=262144` paged-PV is at FA2 parity but still `~1.69x` over dense, so the next profiler pass should compare current paged-PV vs dense again and use fresh source attribution; previous line rankings are now stale.
+
+## 2026-05-04 18:34 CDT - Post-Rescale Large-Q NCU Target
+
+Finding:
+
+- The old-scale accumulator rescale change moved the current D256 large-Q/max-KV rows enough that prior source rankings are stale.
+- Current D256 Qwen max-KV rows are now:
+  - `q=4096`: dense `27.084 ms`, paged-PV `49.785 ms`, paged-linear `52.323 ms`.
+  - `q=16384`: dense `118.144 ms`, paged-PV `199.961 ms`, paged-linear `204.656 ms`.
+- The remaining target is paged-PV versus dense; linear-V reblock is not the large-Q blocker.
+
+Profiling target:
+
+- Run NCU source attribution on D256 Qwen `q=4096 kv=262144 g=6` paged-PV after commit `dd3f0bb`.
+- Use `q=4096` rather than `q=16384` for the first source pass because it keeps NCU overhead lower while preserving the max-KV paged stage shape.
+- Collect warp-state sampling and source counters for `sm120_nvfp4_qkv_online_register_q_stage_kernel`.
+
+Decision criteria:
+
+- Pick the next code change only from the post-rescale NCU top source/stall sites.
+- Do not reuse pre-rescale line rankings except as before/after context.
+
+## 2026-05-04 18:40 CDT - Post-Rescale Large-Q NCU Result
+
+Profiling setup:
+
+- Re-ran NCU on D256 Qwen `q=4096 kv=262144 g=6` paged-PV after commit `dd3f0bb`.
+- The first NCU run used the production JIT cache and had no CUDA lineinfo; it was useful only for SASS classes.
+- Re-ran in an isolated JIT workspace with `FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_lineinfo_oldscale_base`, `FLASHINFER_JIT_LINEINFO=1`, and `FLASHINFER_JIT_DEBUG=0` so the profile stayed optimized but source-attributable.
+
+Top source findings:
+
+| metric | top source site | value |
+|:---|:---|---:|
+| `# Samples` | `d256.cuh:846`, `if (load_thread_idx < kPagesPerKvTile)` | `796,097` |
+| `stall_barrier` | `d256.cuh:846`, page-cache fill predicate | `793,019` |
+| `Instructions Executed` | `cute/layout.hpp:340`, generic `a / b, a % b` | `1,497,803,520` |
+| `Instructions Executed` | `d256.cuh:590`, split tile start arithmetic | `1,192,433,664` |
+| `Instructions Executed` | `d256.cuh:2185`, `transform_score(...)` | `802,160,640` |
+| `L2 Global Excessive` | `paged_kv.cuh:904`, `return params.v_scales[src]` | `176,160,768` |
+| `L2 Global` | `paged_kv.cuh:738`, V data word load | `201,326,592` |
+| `L2 Global` | `paged_kv.cuh:904`, V scale byte load | `201,326,592` |
+| `L1 Shared Excessive` | `d256.cuh:1109`, V operand packed-word store | `352,321,536` |
+| `L1 Shared Excessive` | `d256.cuh:2186`, logits store | `201,326,592` |
+| `stall_long_sb` | `d256.cuh:2252`, `pv_accum(i) *= cached_old_scale` | `185,387` |
+| `stall_long_sb` | `d256.cuh:1277`, PV scale smem store | `122,621` |
+
+Interpretation:
+
+- The page-cache barrier is still the largest sampled barrier site, but both direct block-table reload and schedule-level cache reuse were already measured and reverted. Do not retry those variants without a materially different design.
+- The V-scale load still has large excessive global sectors, but the simple token-group-major loop remap regressed. Do not retry loop-order-only scale coalescing.
+- The old-scale rescale optimization improved timing but did not eliminate the rescale site; it remains visible as long-scoreboard because the accumulator multiply itself is still on the hot PV path.
+- The next viable source-driven targets are the repeated split/tile arithmetic around `d256.cuh:590` and the score transform/mask path around `d256.cuh:2185/1956/1963`, because they are high-instruction sites and have not yet had a successful source-level reduction other than the group-size FastDivmod.
+
+## 2026-05-04 18:42 CDT - Score-Mask Invariant Hoist Target
+
+Finding:
+
+- Post-rescale lineinfo NCU still shows high instruction and wait attribution in the score transform/mask path:
+  - `d256.cuh:2185`, `transform_score(...)`: `802,160,640` instructions and top wait samples.
+  - `d256.cuh:1956`, `global_q_row >= q_len * group_size`: `622,854,144` instructions and short-scoreboard samples.
+  - `d256.cuh:1963`, `kv_pos >= kv_len_tokens`: high wait attribution.
+- The previous shared `q_pos_cache` and no-smem row-run cache variants are off-limits without a new design because they already failed correctness or regressed timing.
+- There are still simple invariants inside the per-score path that do not require shared storage:
+  - `q_len * group_size` is CTA-invariant.
+  - `kv_len_tokens - q_len` is CTA-invariant.
+  - `(effective_kv_tile_start + tile) * kCutlassTileN` is tile-invariant.
+
+Implementation target:
+
+- D256 first.
+- Precompute `total_q_rows` and `q_position_base` before `score_is_valid()`.
+- Precompute `kv_position_base` once per `run_qk_tile(tile)` and pass it into `transform_score()`.
+- Keep `FastDivmod` for `global_q_row / group_size`.
+- Do not add shared-memory caches, public API changes, or tolerance changes.
+
+Validation:
+
+- Benchmark D256 Qwen max-KV paged-PV at `q=4096` and `q=16384`.
+- If timing is positive or neutral, run focused correctness and port to D128/D512.
+- If timing regresses, revert the diagnostic and do not try another score-cache variant without fresh NCU evidence.
+
+## 2026-05-04 18:45 CDT - Score-Mask Invariant Hoist Result
+
+Implementation:
+
+- Tested a D256-only diagnostic that hoisted simple score-mask invariants:
+  - `total_q_rows = q_len * group_size`.
+  - `q_position_base = kv_len_tokens - q_len`.
+  - `kv_position_base = (effective_kv_tile_start + tile) * kCutlassTileN` once per QK tile.
+- Kept `FastDivmod` for `global_q_row / group_size`.
+- Did not add shared memory, row caches, public API changes, or tolerance changes.
+
+Measured result:
+
+| cell | old-scale baseline paged-PV ms | invariant-hoist paged-PV ms | result |
+|:---|---:|---:|:---|
+| D256 Qwen `q=4096 kv=262144 g=6` | `50.524` | `50.917` | neutral/slower |
+| D256 Qwen `q=16384 kv=262144 g=6` | `200.354` | `200.804` | neutral/slower |
+
+Decision:
+
+- Reverted the diagnostic and did not port it to D128/D512.
+- The compiler appears to already handle enough of these scalar invariants that changing the lambda shape and argument flow does not reduce wall time.
+- Do not revisit score-mask arithmetic without a stronger change than scalar invariant hoisting.
