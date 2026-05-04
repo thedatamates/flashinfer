@@ -4679,3 +4679,16 @@ Paged producer page-cache result:
 - D128 q=512 kv=65536 g=4 paged-PV split `3072`: `1.229 ms` versus earlier `~1.48 ms`.
 - Nsight post-change on the D256 Qwen paged-PV cell: stage kernel avg `2.335 ms`, split-combine avg `0.040 ms`, Q quantize avg `0.004 ms`. The gain is inside the stage kernel, as intended.
 - Decision: keep the page-cache change. It is not the full remaining D256 gap, but it removes a repeated block-table lookup class across all D-size producers and improves every guard cell measured.
+
+Paged page-cache barrier refinement plan:
+- The first page-cache implementation is correct but adds an internal `load_group_sync()` inside each K/V staging helper. `load_k_chunk` and `load_v_chunk` already synchronize the load group immediately before calling those helpers.
+- What I am about to change: make `cache_paged_physical_pages(kv_tile)` fill only, call it immediately before the existing pre-stage `load_group_sync()`, and remove the extra internal barrier plus the helper calls inside `stage_paged_k_tile` / `stage_paged_v_tile`.
+- Decision criterion: keep the refinement if focused tests pass and the same D256/D512/D128 guard cells do not regress.
+
+Paged page-cache barrier refinement result:
+- Test status for the refinement: `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed (`36 passed in 287.15s`).
+- Guard benches with the refinement:
+  - D256 Qwen q=512 kv=65536 g=6 paged-PV split `3072`: `2.436 ms` mean, `2.399 ms` min.
+  - D512 Gemma global q=512 kv=65536 g=8 paged-PV split `3072`: `7.007 ms` mean, `6.956 ms` min.
+  - D256 Gemma sliding q=512 kv=1024 g=2 paged-PV split `1024`: `0.162 ms` mean, `0.158 ms` min.
+- Decision: do not keep the refinement. It was neutral to slightly worse on mean and only matched the prior page-cache result on min. Restored the safer in-helper cache fill plus barrier before committing the page-cache optimization.
