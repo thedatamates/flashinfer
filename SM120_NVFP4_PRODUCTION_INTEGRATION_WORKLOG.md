@@ -7131,3 +7131,181 @@ Decision:
 
 - The next profiler target for Mistral should be D128/g12 `q=16384 kv=262144` paged-PV versus dense, then versus `nvfp4_fa2` if needed.
 - Start with NCU lineinfo on the SM120 paged-PV stage, because the issue is inside SM120 paged rather than the report/wrapper or linear-V path.
+
+## 2026-05-04 20:03 CDT - Largest-Q Largest-KV Target Loop Baseline
+
+Scope:
+
+- Stop optimizing smaller cells for the next loop.
+- Focus on the three production max-Q/max-KV rows: D128/g12 Mistral, D256/g6 Qwen full, and D512/g8 Gemma global at `q=16384 kv=262144`.
+- Use profiler-gated changes only: NCU `SourceCounters` plus warp-state sampling before any implementation.
+
+Fresh HEAD baseline:
+
+- Commit: `ead9254`.
+- Reports:
+  - `reports/target_largeq_q16384_kv262144_d128_g12_current_20260504.*`
+  - `reports/target_largeq_q16384_kv262144_d256_g6_current_20260504.*`
+  - `reports/target_largeq_q16384_kv262144_d512_g8_current_20260504.*`
+
+Measured result:
+
+| cell | dense ms | paged-PV ms | paged-linear ms | nvfp4_fa2 ms | PV/dense | linear/dense | linear/PV | linear speedup vs nvfp4 |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| D128/g12 Mistral `q=16384 kv=262144` | `182.846` | `292.599` | `334.818` | `148.606` | `1.600x` | `1.831x` | `1.144x` | `0.444x` |
+| D256/g6 Qwen `q=16384 kv=262144` | `117.982` | `199.546` | `202.745` | `201.827` | `1.691x` | `1.718x` | `1.016x` | `0.995x` |
+| D512/g8 Gemma `q=16384 kv=262144` | `623.362` | `791.689` | `845.025` | `1138.441` | `1.270x` | `1.356x` | `1.067x` | `1.347x` |
+
+Priority decision:
+
+- D128 is the first target. It has the worst production-cell paged-linear/dense ratio and is the only target row still substantially slower than `nvfp4_fa2`.
+- D256 is at `nvfp4_fa2` parity but still has dense slack.
+- D512 is already materially faster than `nvfp4_fa2`; defer until D128/D256 profiler evidence says otherwise.
+
+Next profiling target:
+
+- NCU lineinfo on D128/g12 Mistral `q=16384 kv=262144`, first paged-PV, then paged-linear.
+- Sections: `PmSampling_WarpStates` and `SourceCounters`.
+- Kernel filter: `sm120_nvfp4_qkv_online_register_q_stage_kernel`.
+- The first implementation target must be the largest paged-only attributed source line/counter not already closed by prior worklog diagnostics.
+
+## 2026-05-04 20:10 CDT - D128 Max-Q NCU Source Attribution
+
+Profiler setup:
+
+- Cell: D128/g12 Mistral `q=16384 kv=262144`, causal, no SWA, `logits_soft_cap=0.0`.
+- Reports:
+  - `/tmp/sm120_d128_mistral_q16384_kv262144_paged_pv_lineinfo.ncu-rep`
+  - `/tmp/sm120_d128_mistral_q16384_kv262144_paged_linear_lineinfo.ncu-rep`
+- Sections: `PmSampling_WarpStates` and `SourceCounters`.
+- JIT lineinfo workspace: `/tmp/flashinfer_lineinfo_mistral_d128_maxq`.
+
+Measured profile timing:
+
+- Paged-PV profiled stage: `290.416 ms`.
+- Paged-linear profiled stage: `341.438 ms`.
+
+Paged-PV findings:
+
+- NCU reports an estimated `27.3%` speedup opportunity from uncoalesced global accesses: `1,409,286,144` excessive sectors.
+- The dominant excessive global sectors are at `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:904`, the PV V-scale byte load.
+- Top SASS PCs for that source line are `LDG.E.U8` loads:
+  - `0x7100c374c940`: `697,761,792` excessive sectors.
+  - `0x7100c374cd50`: `697,761,792` excessive sectors.
+- V data at `paged_kv.cuh:738` has high total sectors but is not the excessive-sector leader after the prior coalescing work.
+- The largest barrier samples remain `d128.cuh:810`, the shared page-cache fill predicate. Prior page-cache replacement variants already regressed and are closed; do not repeat that hypothesis without new profiler evidence.
+
+Paged-linear findings:
+
+- NCU reports an estimated `74.58%` speedup opportunity from uncoalesced global accesses: `11,878,268,928` excessive sectors.
+- The largest linear source is `paged_kv.cuh:137`, the `v_linear_data_cache` 32-bit word load.
+- Linear remains a separate target after the PV-scale issue because D128 paged-PV itself is already below `nvfp4_fa2`.
+
+Hypothesis:
+
+- The current PV-scale producer maps consecutive load threads through `col` outer / `token_group` inner. For a fixed column, adjacent lanes walk different logical pages and issue strided `LDG.E.U8` scale loads.
+- PV scale layout stores adjacent scale columns contiguously within a physical page. Loading four adjacent scale bytes at a time and then storing four `pv_sSFB` entries should reduce sector waste without changing public tensor layouts.
+
+Implementation target:
+
+- Add a 4-byte PV-scale load helper in `fmha_nvfp4_sm120_paged_kv.cuh`.
+- Replace the PV-layout V-scale staging loop in D128/D256/D512 with a `col0 += 4` word-load loop.
+- Keep the change internal to `kPvLayoutV`; no public layout/API changes, no new spec axes.
+
+Validation:
+
+- Build and run focused NVFP4 correctness first.
+- Benchmark all three target cells before deciding:
+  - D128/g12 `q=16384 kv=262144`, no softcap.
+  - D256/g6 `q=16384 kv=262144`, no softcap.
+  - D512/g8 `q=16384 kv=262144`, softcap `30.0`.
+- Ship only if the target-cell timing improves without correctness regressions; otherwise revert and record the negative result.
+
+## 2026-05-04 20:18 CDT - PV-Scale Word-Load Experiment Reverted
+
+Implementation attempted:
+
+- Added an internal helper to load four adjacent PV V-scale bytes as a `uint32_t`.
+- Replaced the PV-layout V-scale staging loops in D128/D256/D512 with `col0 += 4` word loads followed by four scalar `pv_sSFB` stores.
+- Scope stayed internal to the producer; no public tensor layout/API changes.
+
+Validation result:
+
+- Focused test command: `python -m pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q`.
+- Result: `35 passed`, `1 failed` in `285.17s`.
+- Failure: `test_sm120_nvfp4_wrapper_scratch_poison_does_not_affect_output_sm12x`.
+- Failure mode: output drift between two poisoned-scratch runs, `407 / 688128` mismatched elements, max absolute diff `0.00048828125`.
+
+Decision:
+
+- Reverted the code experiment completely. The worktree code is back to the committed producer baseline; only this append-only worklog changed.
+- Do not ship vectorized PV-scale word loads in this form.
+
+Finding:
+
+- The NCU target remains valid: D128 paged-PV scale loads are the largest excessive-sector source.
+- The failed implementation likely assumed a contiguity/alignment contract for PV scale storage that is not guaranteed by the current public tensor strides in all tested paths.
+- Any future attempt must first prove the stride/alignment invariant from runtime parameters or use an addressing pattern that preserves arbitrary `v_scale_stride_dim3`.
+
+## 2026-05-04 20:18 CDT - Linear-V Cache Coalescing Target
+
+Profiler finding:
+
+- D128 paged-linear NCU reports an estimated `74.58%` speedup opportunity from uncoalesced global accesses.
+- The dominant source line is `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:137`, the `sm120_nvfp4_linear_v_data_cache_word` 32-bit load.
+- Source attribution shows `11,274,289,152` excessive global sectors and `12,884,901,888` total global sectors at the non-coalesced cache load.
+
+Code finding:
+
+- D256 already sets `kLinearVCacheCoalesced = true`.
+- D128 and D512 set `kLinearVCacheCoalesced = (kHeadDim == 256)`, which is false for both D128 and D512.
+- The cache preparation helper also selects `coalesced_layout = (head_dim == 256)`, so D128/D512 are written in token-major cache layout and then read by lane groups as strided 32-bit words.
+- The existing coalesced cache layout stores 4-byte packed words as `(word_col, token)`, matching the producer's lane mapping: adjacent lanes load adjacent tokens at the same word column.
+
+Hypothesis:
+
+- Enable the existing coalesced linear-V cache layout for all supported SM120 head dims, not just D256.
+- This should directly reduce D128/D512 paged-linear excessive sectors without changing public tensor layouts or the attention kernel ABI.
+- D256 should remain unchanged because it already uses this path.
+
+Implementation target:
+
+- Set `kLinearVCacheCoalesced = true` in D128/D256/D512 headers for consistency.
+- Change the linear-V scale/data cache preparation dispatch in `fmha_nvfp4_sm120_paged_kv.cuh` to use the coalesced layout for all supported head dims.
+
+Validation:
+
+- Run the focused NVFP4 test file.
+- Benchmark all three target cells in paged-linear and paged-PV. Paged-PV should be unchanged; paged-linear should improve on D128 and D512 and be neutral on D256.
+- Commit only if correctness passes and target-cell timing is non-regressive overall.
+
+## 2026-05-04 20:30 CDT - Linear-V Cache Coalescing Experiment Reverted
+
+Implementation attempted:
+
+- Set `kLinearVCacheCoalesced = true` in D128/D256/D512.
+- Changed linear V scale/data cache preparation to use the coalesced layout for all supported head dims.
+- This reused the existing D256 cache layout and did not change public input tensor layouts.
+
+Correctness:
+
+- Focused test command: `python -m pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q`.
+- Result: `36 passed in 285.13s`.
+
+Measured result:
+
+| cell | baseline paged-PV ms | coalesced paged-PV ms | baseline paged-linear ms | coalesced paged-linear ms | decision |
+|:---|---:|---:|---:|---:|:---|
+| D128/g12 Mistral `q=16384 kv=262144` | `292.599` | `293.467` | `334.818` | `345.503` | regressed |
+| D256/g6 Qwen `q=16384 kv=262144` | `199.546` | `200.371` | `202.745` | `203.235` | regressed/slightly |
+| D512/g8 Gemma `q=16384 kv=262144` | `791.689` | `791.099` | `845.025` | `852.458` | linear regressed |
+
+Decision:
+
+- Reverted the code experiment completely. The worktree code is back to the committed producer baseline; only append-only worklog entries remain.
+- Do not enable the coalesced linear-V cache layout globally.
+
+Finding:
+
+- D128 linear's uncoalesced cache-load source is real, but simply changing the cache layout increases total runtime. The separate cache-preparation kernels and changed producer access pattern cost more than the reduced sector count saves on the target rows.
+- Future linear-V work should profile both the cache-preparation kernels and the stage kernel, not only the stage kernel source line. The current NCU pass only captured the stage kernel and missed the end-to-end cost shift from cache layout changes.
