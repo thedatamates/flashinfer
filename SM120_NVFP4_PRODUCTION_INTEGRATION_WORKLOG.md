@@ -7949,3 +7949,77 @@ Decision:
 
 - Keep and commit. The change directly removes the measured D128 linear-V excessive-sector source without repeating the closed cache-layout rewrite.
 - Remaining D128 linear source is now scale-cache byte loading, not data-cache word loading.
+
+## 2026-05-04 22:47 CDT - D256 Max-Q Linear-V Profiling Target
+
+Profiler setup:
+
+- Cell: D256/g6 Qwen `q=16384 kv=262144`, paged-linear, causal, no SWA, no softcap, after commit `3c2c2ef`.
+- Reason for targeting: D256 is now the worst large-Q paged-vs-dense ratio. Current max-Q timings are dense `117.982 ms`, paged-PV `192.344 ms`, and paged-linear `188.875 ms`.
+- D256 paged-PV has already been profiled after the K-wide and D128/D512 linear changes. Its largest remaining paged-only source is PV V-scale global load (`paged_kv.cuh:904`) plus operand-smem store pressure (`d256.cuh:1140`), but local PV-scale variants have several closed regressions in this worklog.
+- The D256 paged-linear path has not been reprofiled at the max-Q target after the D128/D512 cached-linear stage change. It uses a different cached-linear layout choice than D128/D512, so its source attribution may expose a cleaner target than repeating closed PV-scale experiments.
+
+Hypothesis:
+
+- If D256 linear still shows excessive sectors at `sm120_nvfp4_linear_v_data_cache_word` or scale-cache loads, the D256 cached-linear cache/stage mapping is the next target.
+- If D256 linear matches the D256 PV profile and is dominated by the same scale/operand-store family, then the current D256 gap is no longer a linear-specific producer issue and the next optimization needs to address the shared V-scale or operand-store path with a materially different design from the reverted loop-reorder/word-load attempts.
+
+Validation:
+
+- Collect NCU `SourceCounters` and `PmSampling_WarpStates` with lineinfo enabled for the D256 max-Q paged-linear cell.
+- Compare source lines against the D256 paged-PV profile from the previous pass.
+- Do not write kernel code until the linear profile identifies the largest paged-only source that is not already closed by prior experiments.
+
+## 2026-05-04 22:55 CDT - D256 Linear Cache Layout Experiment
+
+Profiler result:
+
+- NCU report: `/tmp/sm120_d256_qwen_q16384_kv262144_paged_linear_after_kwide.ncu-rep`.
+- Cell: D256/g6 Qwen `q=16384 kv=262144`, paged-linear, causal, no SWA, no softcap.
+- Benchmark row inside NCU: `180.495 ms`; NCU kernel duration: `183.20 ms`.
+- Dominant excessive global source:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:137`
+  - `return *reinterpret_cast<const uint32_t*>(params.v_linear_data_cache + idx);`
+  - `5,637,144,576` excessive global sectors and `6,442,450,944` total global sectors.
+- Secondary excessive global source:
+  - `paged_kv.cuh:109`, linear scale-cache byte load, `704,643,072` excessive sectors.
+- This differs from D256 paged-PV, whose largest global excessive source is PV V-scale (`paged_kv.cuh:904`) at `704,643,072`; D256 linear has a distinct data-cache coalescing problem.
+
+Hypothesis:
+
+- D256 currently prepares the linear V data cache with `kCoalescedLayout=true`, where `sm120_nvfp4_linear_v_data_cache_word<true>` indexes `(word_col * physical_kv_len + token) * 4`.
+- The D256 cached-linear stage producer now uses the same PV-style mapping as D128/D512: lanes in an 8-lane subgroup vary dimension word for one token.
+- Those two choices conflict. With the true layout, neighboring lanes access different `word_col` values separated by `physical_kv_len * 4`, producing the measured excessive sectors.
+- The D128/D512 token-major cache layout (`kCoalescedLayout=false`) matches this stage mapping: neighboring lanes load adjacent 32-bit words for one token.
+
+Implementation target:
+
+- Change the linear V cache preparation policy to token-major for all head_dims, including D256.
+- Change D256's cached-linear stage branch to `static_assert(!kLinearVCacheCoalesced)` and call `sm120_nvfp4_linear_v_data_cache_word<false>`, matching D128/D512.
+- This is different from the reverted cache-layout rewrite: the stage mapping is already PV-style and proven on D128/D512. The experiment only makes D256's internal cache physical layout match that mapping.
+
+Validation:
+
+- Run focused D512 correctness tests first because they cover the max-head-dim wrapper path.
+- Benchmark all three max-Q target cells for paged-PV and paged-linear. Expected effect: D256 linear should improve materially; D128/D512 should remain neutral because they already used token-major cache layout.
+- If D256 linear regresses or correctness fails, revert this experiment and keep the NCU diagnosis as closed evidence.
+
+Result:
+
+- Correctness before benchmark: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed, `36 passed in 285.81s`.
+- Benchmark result against commit `3c2c2ef` baseline:
+
+| cell | layout | baseline ms | token-major-D256 experiment ms | delta ms | decision |
+|:---|:---|---:|---:|---:|:---|
+| D128/g12 Mistral `q=16384 kv=262144` | PV | `282.433` | `282.765` | `+0.332` | neutral |
+| D128/g12 Mistral `q=16384 kv=262144` | linear | `275.475` | `275.492` | `+0.017` | neutral |
+| D256/g6 Qwen `q=16384 kv=262144` | PV | `192.344` | `192.259` | `-0.085` | neutral |
+| D256/g6 Qwen `q=16384 kv=262144` | linear | `188.875` | `192.223` | `+3.348` | revert |
+| D512/g8 Gemma `q=16384 kv=262144` | PV | `760.004` | `759.639` | `-0.365` | neutral |
+| D512/g8 Gemma `q=16384 kv=262144` | linear | `714.965` | `715.676` | `+0.711` | neutral |
+
+Decision:
+
+- Reverted the code experiment. The stage-kernel NCU source is real, but changing D256's internal cache physical layout to token-major increases the timed wrapper path.
+- Interpretation: the D256 word-col-major cache layout is likely paying off in the cache-preparation kernels or in another unprofiled part of the wrapper enough to offset the stage-kernel uncoalesced-load source.
+- Do not repeat the simple "make D256 cache token-major" experiment. A viable D256 linear fix must preserve the prep-side benefit while reducing stage-side excessive sectors, or it must be justified by profiling the cache-preparation kernels as well as the stage kernel.
