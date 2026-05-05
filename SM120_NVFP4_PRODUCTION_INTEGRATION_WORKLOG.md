@@ -7358,3 +7358,99 @@ Decision:
 
 - Reverted the D128 loop reorder. It directly regressed the target row it was meant to help.
 - The NCU excessive-sector source remains real, but simple loop remapping is not sufficient; it likely worsens scheduling/instruction balance more than it improves sector locality.
+
+## 2026-05-04 20:45 CDT - D128 Max-Q Split-Length Sweep Target
+
+Profiler finding:
+
+- D128 dense lineinfo at `q=16384 kv=262144` reports a profiled stage time of `170.785 ms` and no excessive global sectors.
+- D128 paged-PV reports `290.416 ms` with large producer-side wait/barrier attribution:
+  - `cutlass/arch/barrier.h:426`: `2,935,532` stall-wait samples.
+  - `d128.cuh:810`: `2,451,550` stall-barrier samples on the page-cache producer region.
+- The paged producer is still the gap, but the failed producer-local scale-load variants did not improve target timing.
+
+Hypothesis:
+
+- Auto split length may be too small for large-Q/max-KV D128. Too many split chunks repeat producer setup/page-cache work and increase combine pressure.
+- Larger split chunks may reduce repeated producer overhead at this high-Q target while preserving enough CTA parallelism.
+
+Experiment:
+
+- Sweep D128/g12 Mistral `q=16384 kv=262144` across explicit `split_kv_len` values.
+- Measure dense, paged-PV, and paged-linear with `warmup=1`, `repeat=3`.
+- If a larger split improves the target rows, change only the internal auto-split heuristic and validate on all three max-Q/max-KV production cells.
+
+## 2026-05-04 20:50 CDT - D128 Max-Q Split-Length Sweep Result
+
+Measured result:
+
+| split_kv_len | dense ms | paged-PV ms | paged-linear ms |
+|---:|---:|---:|---:|
+| auto `13184` | `183.595` | `297.085` | `340.236` |
+| `8192` | `188.544` | `300.400` | `346.525` |
+| `16384` | `183.552` | `297.252` | `343.669` |
+| `32768` | `182.614` | `296.234` | `343.236` |
+| `65536` | `182.709` | `296.952` | `343.732` |
+| `131072` | `183.443` | `298.373` | `345.131` |
+| `262144` | `184.984` | `303.371` | `349.748` |
+
+Decision:
+
+- No auto-split change. The best paged-PV row (`32768`, `296.234 ms`) is only `0.3%` faster than auto and paged-linear is worse than auto.
+- Split length is not the D128 max-Q gap.
+
+Finding:
+
+- The large D128 paged-vs-dense delta is not caused by over-splitting.
+- Return to the producer source lines: PV scale loads, V operand stores, and page-cache/load synchronization remain the paged-only differences.
+
+## 2026-05-04 20:50 CDT - D128 PV-Scale cp.async Target
+
+Profiler finding:
+
+- D128 paged-PV still points at `paged_kv.cuh:904` PV V-scale byte loads for excessive global sectors.
+- Scalar loop reorder regressed; word-load through registers failed correctness when applied broadly.
+
+Hypothesis:
+
+- Use `cp_async::pred_load_32b<kNoFill>` for D128 PV scales only.
+- This keeps the source and destination as a single 4-byte transfer without software scalar loads or register unpack/repack.
+- `kNoFill` preserves the existing `E4M3OneSmemTile` initialization for out-of-bounds scale slots instead of zeroing them.
+
+Implementation target:
+
+- Change only the D128 PV-layout V-scale loop.
+- Use 4-byte groups over columns, verify source/destination alignment under `FLASHINFER_SM120_NVFP4_DEBUG_TRAPS`, issue `cp.async`, then `commit_group()` and `wait_group<0>()` before the existing producer fence/barrier path.
+
+Validation:
+
+- Focused NVFP4 test file.
+- Benchmark D128 target first; then all three target rows if D128 improves.
+- Revert if correctness fails or D128 paged-PV regresses.
+
+## 2026-05-04 20:54 CDT - D128 PV-Scale cp.async Reverted
+
+Implementation attempted:
+
+- Changed only the D128 PV-layout V-scale staging loop.
+- Replaced scalar `sm120_nvfp4_paged_v_pv_scale_from_physical_page_static` byte loads and typed stores with 4-byte `cp_async::pred_load_32b<kNoFill>` transfers from `v_scales` directly into `pv_sSFB`.
+- Grouped four adjacent scale columns per issue and added debug-trap checks for 4-byte source alignment, destination alignment, `v_scale_stride_dim3 == 1`, and destination byte contiguity.
+- Kept the existing `E4M3OneSmemTile` initialization as the out-of-bounds sentinel by using `kNoFill`.
+
+Validation result:
+
+- Focused test command: `python -m pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q`.
+- Result: `10 failed, 26 passed in 44.80s`.
+- First failure: `test_sm120_nvfp4_wrapper_multi_kv_matches_single_kv_sm12x[128-4]`.
+- Failure mode: CUDA illegal memory access after the D128 multi-kv wrapper run; later tests inherited the poisoned CUDA context.
+
+Decision:
+
+- Reverted the D128 code completely to the scalar PV-scale path.
+- Do not use direct `cp.async` into `pv_sSFB` for PV scales with the current CUTLASS SFB layout.
+- The likely issue is the destination SFB physical layout/contiguity or cp.async alignment invariant, not the public source stride alone.
+
+Follow-up:
+
+- D128 PV-scale simple variants are now closed: broad word load, D128 loop reorder, and direct `cp.async` all failed either correctness or target timing.
+- Further D128 work should move to a new NCU-attributed source site rather than continuing to mutate the same PV-scale loop by inspection.
