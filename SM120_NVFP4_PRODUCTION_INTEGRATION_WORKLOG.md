@@ -7068,3 +7068,66 @@ Decision:
   - schedule-level duplicate fill skipping: neutral.
   - per-load-thread register page cache: regressed.
 - The shared page cache remains the least-bad current design. The NCU barrier samples are real, but removing the barrier by duplicating page-table work costs more than it saves.
+
+## 2026-05-04 18:55 CDT - Mistral 3.5 D128 Large-Q Characterization Target
+
+Finding:
+
+- Mistral 3.5 production shape is `head_dim=128`, `group=12`, causal, no sliding window, max context `kv=262144`.
+- This is a new large-Q target distinct from the Qwen D256 and Gemma D512 rows already characterized.
+- The relevant comparison is production paged-linear, future/patched paged-PV, dense, and `nvfp4_fa2`.
+
+Benchmark target:
+
+- Run D128 Mistral 3.5 with `q={4096,8192,16384}`, `kv=262144`, `group=12`, `logits_soft_cap=0.0`, causal, no SWA.
+- Use a fresh report prefix: `reports/prod_mistral35_d128_g12_largeq_maxkv_20260504`.
+- Keep the existing device convention: `CUDA_VISIBLE_DEVICES=2` and benchmark `--device 0`.
+
+Validation:
+
+- All SM120 fused rows must complete with `status=ok` and `output_finite=True`.
+- Report paged-linear vs `nvfp4_fa2`, paged-PV vs `nvfp4_fa2`, and paged-vs-dense overhead.
+
+## 2026-05-04 19:56 CDT - Mistral 3.5 D128 Large-Q Characterization Result
+
+Note:
+
+- The immediately preceding target section header used a stale `18:55 CDT` timestamp. The shell timestamp for that append was `2026-05-04 19:54 CDT`; this result section uses the actual run time.
+
+Report:
+
+- `reports/prod_mistral35_d128_g12_largeq_maxkv_20260504.{jsonl,csv,summary.csv,production.csv,md}`.
+- Shape: `head_dim=128`, `group=12`, `kv=262144`, `q={4096,8192,16384}`, causal, no SWA, `logits_soft_cap=0.0`.
+- Backends: SM120 paged-PV, SM120 paged-linear, SM120 dense, `nvfp4_fa2`.
+
+Validation:
+
+- All SM120 fused rows completed with `status=ok`.
+- All SM120 fused rows reported `output_finite=True`.
+
+Measured result:
+
+| q | dense ms | paged-PV ms | paged-linear ms | nvfp4_fa2 ms | linear/dense | PV/dense | linear/PV | linear speedup vs nvfp4 |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `4096` | `42.583` | `70.833` | `81.617` | `48.227` | `1.917x` | `1.663x` | `1.152x` | `0.591x` |
+| `8192` | `90.421` | `146.013` | `167.168` | `80.105` | `1.849x` | `1.615x` | `1.145x` | `0.479x` |
+| `16384` | `183.293` | `292.589` | `335.024` | `148.051` | `1.828x` | `1.596x` | `1.145x` | `0.442x` |
+
+Geomean over the three max-KV rows:
+
+- `paged-linear / dense`: `1.864x`.
+- `paged-PV / dense`: `1.625x`.
+- `paged-linear / paged-PV`: `1.147x`.
+- `paged-linear speedup vs nvfp4_fa2`: `0.500x`.
+- `paged-PV speedup vs nvfp4_fa2`: `0.574x`.
+
+Finding:
+
+- D128/g12 Mistral is a clear new outlier. Unlike D256 Qwen and D512 Gemma, SM120 paged is substantially slower than `nvfp4_fa2` even in PV layout.
+- Dense is closer to `nvfp4_fa2` than paged is: at `q=16384`, dense is `183.293 ms` versus `nvfp4_fa2` `148.051 ms`, while paged-PV is `292.589 ms` and paged-linear is `335.024 ms`.
+- Linear-V adds a stable `~14.5-15.2%` over PV. The larger blocker is paged-PV itself, not only linear reblock.
+
+Decision:
+
+- The next profiler target for Mistral should be D128/g12 `q=16384 kv=262144` paged-PV versus dense, then versus `nvfp4_fa2` if needed.
+- Start with NCU lineinfo on the SM120 paged-PV stage, because the issue is inside SM120 paged rather than the report/wrapper or linear-V path.
