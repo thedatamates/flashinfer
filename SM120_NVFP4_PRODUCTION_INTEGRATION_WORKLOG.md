@@ -7710,3 +7710,85 @@ Decision:
 
 - Stop repeating small mutations of the current D128 paged producer sites unless a new NCU source identifies a different mechanism.
 - The next viable high-risk direction is to map the FA2 paged producer structure onto the SM120 path: an FA2-style paged smem/register-fragment construction for K/V that eliminates the current excessive-sector producer behavior, or a production-side PV writer if that proves cheaper. Any implementation must be profiler-gated and benchmarked on all three max-Q target cells before commit.
+
+## 2026-05-04 21:51 CDT - D128 Max-Q V Producer Ceiling Diagnostic
+
+Finding:
+
+- The D128 max-Q NCU comparison shows the paged-PV stage at `297.66 ms` under NCU versus dense at `173.99 ms` and FA2 at `144.42 ms`.
+- Kernel-level counters show D128 paged-PV reading far more through the paged path: `5,081,321,472` global sectors observed versus `3,672,035,328` ideal, while dense has `32,440,320` global sectors and FA2 has `1,905,529,008` global sectors with `0` excessive.
+- The largest D128 paged-only sources are still V producer related: PV scale global loads, V operand shared stores, and page-cache/load synchronization.
+- Prior source-local fixes at those sites are closed, so before a larger rewrite I need the wall-time ceiling for removing V data and/or V scale staging at the max-Q production row.
+
+Diagnostic target:
+
+- Add temporary D128-only compile-time diagnostic switches for `stage_paged_v_tile`.
+- Measure current D128/g12 Mistral `q=16384 kv=262144` paged-PV with:
+  - V data staging disabled, scale staging intact.
+  - V scale staging disabled, data staging intact.
+  - Both disabled if the individual results show either path is large.
+- Keep the V pipeline acquire/complete handoff, barriers, QK, softmax, and PV MMA schedule intact so the delta is producer-body work, not wrapper or launch geometry.
+
+Decision criteria:
+
+- If disabling V work removes most of the paged-vs-dense gap, the next architecture target remains the FA2-style V staging/fragment path.
+- If the delta is small, the NCU source magnitude is not translating to wall time and the next target must move to K/QK pipeline or PV consumer scheduling.
+- This is timing-only diagnostic code and must be reverted after measurement.
+
+Result:
+
+| variant | D128/g12 `q=16384 kv=262144` paged-PV ms | delta vs current paged-PV `292.599 ms` |
+|:---|---:|---:|
+| current baseline | `292.599` | `0.000` |
+| PV V data staging disabled | `243.730` | `-48.869` |
+| PV V scale staging disabled | `268.705` | `-23.894` |
+| PV V data + scale staging disabled | `221.642` | `-70.957` |
+
+Finding:
+
+- V producer work is real and large at the D128 max-Q target, but it is not the entire dense/FA2 gap.
+- Removing all PV V data/scale staging leaves the stage at `221.642 ms`, still `38.796 ms` slower than the current dense baseline (`182.846 ms`) and `73.036 ms` slower than the FA2 baseline (`148.606 ms`).
+- This rules out a V-only producer rewrite as sufficient for bringing D128 paged inline.
+
+Next diagnostic:
+
+- Bound the D128 K producer/QK staging contribution at the same max-Q row.
+- Keep pipeline/barriers and schedule intact, disable only K data and/or K scale body work.
+- If K+V together explain the full paged-vs-dense gap, the high-risk rewrite must cover both K and V producer paths, not V alone.
+
+## 2026-05-04 22:00 CDT - D128 Max-Q K Producer Ceiling Diagnostic
+
+Diagnostic setup:
+
+- Same D128/g12 Mistral max-Q row: `q=16384 kv=262144`, paged-PV, causal, no SWA, no softcap.
+- Temporary D128-only compile-time switches disabled K data, K scale, both K paths, then all K+V data/scale producer body work.
+- The pipeline acquire/complete handoff, load-group barriers, QK, softmax, PV MMA, and epilogue stayed intact.
+- Diagnostic code was reverted after measurement; no production source change is kept.
+
+Result:
+
+| variant | D128/g12 `q=16384 kv=262144` paged-PV ms | delta vs current paged-PV `292.599 ms` |
+|:---|---:|---:|
+| current baseline | `292.599` | `0.000` |
+| K data staging disabled | `250.009` | `-42.590` |
+| K scale staging disabled | `275.039` | `-17.560` |
+| K data + scale staging disabled | `227.666` | `-64.933` |
+| K data/scale + PV V data/scale disabled | `166.032` | `-126.567` |
+
+Finding:
+
+- K producer work is the same order as V producer work on the D128 max-Q target.
+- K data contributes about `42.6 ms`; K scale contributes about `17.6 ms`; all K producer body work contributes about `64.9 ms`.
+- K+V producer body work together accounts for about `126.6 ms`, which is larger than the current paged-vs-dense gap (`292.599 - 182.846 = 109.753 ms`).
+- With K+V producer bodies removed, the stage is `166.032 ms`, faster than current dense (`182.846 ms`) and within `17.426 ms` of FA2 (`148.606 ms`).
+
+Interpretation:
+
+- The D128 production gap is now localized: it is the software K/V paged producers plus their scale loops.
+- The remaining fixed schedule after producer removal is not the blocker for paged-vs-dense parity. The blocker is the producer architecture.
+- A V-only rewrite is insufficient. A successful architecture must move both K and V producer traffic toward the FA2 pattern: coalesced/vectorized paged loads, no excessive global sectors, efficient shared/register handoff, and scale loading that does not devolve into byte-wide scattered loads.
+
+Decision:
+
+- Stop treating the D128 issue as a single hot source line. The NCU source lines are symptoms of the same structural producer problem.
+- The next implementation attempt must target K and V together, or it will leave a measured `~65 ms` K producer floor behind.
