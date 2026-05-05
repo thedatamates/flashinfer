@@ -7518,3 +7518,165 @@ Finding:
 - The current PV V producer appears to be on the better side of the global-vs-shared coalescing tradeoff for D128 max-Q.
 - `d128.cuh:1069` remains an NCU-attributed excessive-shared source, but this exact register-transpose/store-coalescing variant is closed.
 - The next D128 hypothesis should not be another V operand store lane remap unless NCU/SASS shows a different mechanism than the one tested here.
+
+## 2026-05-04 21:20 CDT - D256 Max-Q NCU Target
+
+Current target ranking:
+
+- D128 max-Q remains the weakest row against `nvfp4_fa2`, but its currently attributed simple producer sources are closed:
+  - PV-scale byte loads: word load, loop reorder, and direct `cp.async` all failed.
+  - PV V shared store: subgroup store coalescing passed D128 correctness but regressed target timing.
+  - Split length: no material win.
+  - Page-cache variants: prior register/cache/barrier variants regressed or were below keep bar.
+- D256 max-Q is the next target by paged-vs-dense ratio: paged-PV `199.546 ms` vs dense `117.982 ms` (`1.691x`), paged-linear `202.745 ms` (`1.718x`).
+- D256 is at `nvfp4_fa2` parity, so the remaining useful comparison is now dense slack and paged-only NCU attribution.
+
+Profiler target:
+
+- Cell: D256/g6 Qwen full `q=16384 kv=262144`, causal, no SWA, `logits_soft_cap=0.0`.
+- Run lineinfo NCU for paged-PV and paged-linear with `PmSampling_WarpStates` and `SourceCounters`.
+- Compare against current dense where needed, but do not rerun dense first unless the paged profiles show a source shared with dense.
+
+Decision rule:
+
+- Pick the largest D256 paged-only source line or warp-stall class that is not already closed in the worklog.
+- Do not retry page-cache-only changes unless D256 max-Q source attribution differs materially from the prior D256 smaller-cell diagnostics.
+
+## 2026-05-04 21:25 CDT - D256 Max-Q NCU Result
+
+Profiler setup:
+
+- Cell: D256/g6 Qwen full `q=16384 kv=262144`, causal, no SWA, `logits_soft_cap=0.0`.
+- Reports:
+  - `/tmp/sm120_d256_qwen_q16384_kv262144_paged_pv_lineinfo.ncu-rep`
+  - `/tmp/sm120_d256_qwen_q16384_kv262144_paged_linear_lineinfo.ncu-rep`
+  - `/tmp/sm120_d256_qwen_q16384_kv262144_dense_lineinfo.ncu-rep`
+- Source CSVs:
+  - `/tmp/sm120_d256_qwen_pv_source.csv`
+  - `/tmp/sm120_d256_qwen_linear_source.csv`
+  - `/tmp/sm120_d256_qwen_dense_source.csv`
+
+Profiled stage timings:
+
+- Dense: `107.600 ms`.
+- Paged-PV: `194.336 ms`.
+- Paged-linear: `199.848 ms`.
+
+Paged-PV top sources:
+
+| metric | top source | value | status |
+|:---|:---|---:|:---|
+| `L2 Global Excessive` | `paged_kv.cuh:904`, PV V-scale byte load | `704,643,072` | PV-scale word/load/order variants already closed |
+| `L1 Shared Excessive` | `d256.cuh:1109`, PV V packed-word store | `1,409,286,144` | shared-store coalescing failed D256 correctness |
+| `stall_barrier` | `d256.cuh:846`, page-cache fill predicate | `377,821` | direct reload, duplicate-skip, register cache variants already closed |
+| `stall_wait` | `cutlass/arch/barrier.h:426`, pipeline wait | `546,517` | downstream of producer/consumer balance |
+
+Paged-linear top sources:
+
+| metric | top source | value | status |
+|:---|:---|---:|:---|
+| `L2 Global Excessive` | `paged_kv.cuh:137`, linear V data cache word load | `5,637,144,576` | coalesced cache layout passed correctness but regressed end-to-end |
+| `L2 Global Excessive` | `paged_kv.cuh:109`, linear V scale cache byte load | `704,643,072` | covered by same cache-layout experiment; no isolated win yet |
+| `L1 Shared Excessive` | `d256.cuh:1191`, linear V packed-word store | `1,409,286,144` | same store-remap class failed correctness/timing |
+| `stall_barrier` | `d256.cuh:846`, page-cache fill predicate | `1,506,411` | page-cache replacement variants closed |
+
+Dense comparison:
+
+- Dense has no meaningful excessive global sectors; the paged global-sector sources are genuinely paged-only.
+- Dense shares the softmax/logits shared-memory sources at `d256.cuh:2012`, `d256.cuh:2037`, and `d256.cuh:2186`, so those are not first-order paged-only targets.
+- Dense has much lower page-cache/barrier attribution because it uses TMA instead of the paged software producer.
+
+Decision:
+
+- Do not implement a D256 code change from this profile. The top D256 max-Q source classes match variants already measured and reverted or committed.
+- D256 is also effectively at `nvfp4_fa2` parity at max-Q, so the next profiler pass moves to D512 to complete the three target-cell characterization before choosing any broader structural rewrite.
+
+## 2026-05-04 21:25 CDT - D512 Max-Q NCU Target
+
+Current target ranking:
+
+- D512/g8 Gemma global `q=16384 kv=262144` is the healthiest of the three max-Q rows:
+  - dense `623.362 ms`
+  - paged-PV `791.689 ms`
+  - paged-linear `845.025 ms`
+  - `nvfp4_fa2` `1138.441 ms`
+- It is already faster than `nvfp4_fa2`, but it still has a `1.27x-1.36x` paged-vs-dense gap.
+- D128 and D256 top source classes are mostly closed by measurement, so D512 may reveal a different remaining large-Q bottleneck.
+
+Profiler target:
+
+- Cell: D512/g8 Gemma global `q=16384 kv=262144`, causal, no SWA, `logits_soft_cap=30.0`.
+- Run lineinfo NCU for paged-PV and paged-linear with `PmSampling_WarpStates` and `SourceCounters`.
+- Run dense only if the paged profiles point at a source that may be shared with dense.
+
+Decision rule:
+
+- Pick only a D512 source line or stall class that is both paged-attributed and not already closed by D128/D256 diagnostics.
+- If D512 repeats the same closed producer classes, stop local micro-tuning and write the structural conclusion rather than trying another small source mutation.
+
+## 2026-05-04 21:32 CDT - D512 Max-Q Page-Cache Tag Retest Target
+
+Profiler finding:
+
+- D512/g8 Gemma global max-Q lineinfo NCU shows a much larger page-cache barrier signal than the earlier q512 outlier:
+  - Paged-PV profiled stage: `776.496 ms`.
+  - Paged-linear profiled stage: `864.032 ms`.
+  - Paged-PV `stall_barrier`: `d512.cuh:777`, page-cache fill predicate, `9,651,997` samples.
+  - Paged-PV `stall_wait`: `cutlass/arch/barrier.h:426`, `7,414,910` samples.
+- The earlier D512 page-cache tag was tested on `q=512 kv=16384` and was below the keep bar. It was not tested on max-Q/max-KV, where this barrier is now orders of magnitude larger.
+
+Hypothesis:
+
+- Retest the D512 shared page-cache tag at the max-Q/max-KV row only.
+- If repeated K/V staging for the same `kv_tile` is responsible for a meaningful share of the `9.65M` barrier samples, skipping duplicate fills and duplicate load-group barriers should reduce D512 paged-PV wall time.
+- If the result is neutral again, page-cache tag is closed for both small-Q and max-Q.
+
+Implementation target:
+
+- D512 only.
+- Add `physical_page_cache_kv_tile` beside `physical_page_cache`.
+- Initialize it to `-1` at kernel entry.
+- In `cache_paged_physical_pages(kv_tile)`, return immediately when the tag already matches; otherwise fill page entries, set the tag, and run the existing `load_group_sync()`.
+- Keep public APIs, FFI signatures, tensor layouts, split heuristic, and test contracts unchanged.
+
+Validation:
+
+- Focused NVFP4 test file.
+- Benchmark all three max-Q/max-KV target rows for paged-PV and paged-linear. D128/D256 should be unchanged; D512 must improve materially to keep.
+- If D512 improves, re-run D512 paged-PV NCU and confirm the `d512.cuh:777` barrier samples drop.
+
+## 2026-05-04 21:41 CDT - D512 Max-Q Page-Cache Tag Reverted
+
+Implementation:
+
+- Added a D512-only shared `physical_page_cache_kv_tile` tag beside `physical_page_cache`.
+- Initialized the tag to `-1` at kernel entry.
+- Changed `cache_paged_physical_pages(kv_tile)` to skip page-cache refill and `load_group_sync()` when the requested `kv_tile` matched the tag.
+- Kept public APIs, FFI signatures, tensor layouts, split heuristic, and test contracts unchanged.
+
+Correctness:
+
+- Focused NVFP4 test file: `36 passed in 197.35s`.
+
+Measured result:
+
+| cell | baseline paged-PV ms | tag paged-PV ms | baseline paged-linear ms | tag paged-linear ms | decision |
+|:---|---:|---:|---:|---:|:---|
+| D128/g12 Mistral `q=16384 kv=262144` | `292.599` | `296.651` | `334.818` | `340.586` | code unchanged/noise |
+| D256/g6 Qwen `q=16384 kv=262144` | `199.546` | `201.476` | `202.745` | `205.819` | code unchanged/noise |
+| D512/g8 Gemma `q=16384 kv=262144` | `791.689` | `796.605` | `845.025` | `836.310` | PV regressed; reject |
+
+Decision:
+
+- Reverted the D512 page-cache tag code completely.
+- The tag is now closed for both the earlier small-Q D512 outlier and the max-Q/max-KV D512 row.
+- The page-cache barrier samples are real, but skipping duplicate shared-cache fills does not reduce wall time; the barrier likely overlaps with or exposes another producer/consumer dependency rather than standing alone as removable overhead.
+
+Finding:
+
+- Across D128/D256/D512, the obvious page-cache removal family is closed:
+  - direct block-table reload: regressed.
+  - schedule duplicate-skip: neutral.
+  - per-thread register cache: regressed.
+  - shared tag skip: neutral/regressed.
+- Do not retry page-cache variants unless the design changes the producer/consumer schedule itself, not just the page-cache storage policy.
