@@ -7866,3 +7866,86 @@ Decision:
 
 - Keep and commit. The change improves all three production max-Q target cells and preserves correctness.
 - This closes the current K data vectorization opportunity. Remaining producer gap is still V data/scale and K/V scale traffic; K-wide alone is intentionally not the final architecture.
+
+## 2026-05-04 22:30 CDT - D128 Linear-V Stage Coalescing Target
+
+Profiler setup:
+
+- Cell: D128/g12 Mistral `q=16384 kv=262144`, paged-linear, causal, no SWA, no softcap, after K-wide commit `daa0c44`.
+- NCU report with fresh lineinfo workspace: `/tmp/sm120_d128_mistral_q16384_kv262144_paged_linear_after_kwide_lineinfo_fresh.ncu-rep`.
+- Measured stage duration under NCU: `~322 ms`.
+
+Profiler finding:
+
+- Dominant excessive global source:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:137`
+  - `return *reinterpret_cast<const uint32_t*>(params.v_linear_data_cache + idx);`
+  - `11,274,289,152` excessive global sectors and `12,884,901,888` total global sectors.
+- Secondary related sources:
+  - `paged_kv.cuh:109`, linear V scale-cache byte load, `603,979,776` excessive global sectors.
+  - `d128.cuh:1164`, cached-linear transpose `__shfl_sync`, `103,844` long-scoreboard samples.
+- D256 already has a separate cached-linear stage branch that loads cache words in a coalesced per-token/per-dim pattern and avoids this shfl path.
+
+Closed prior attempt:
+
+- The earlier "Linear-V Cache Coalescing" experiment changed the internal cache physical layout for D128/D512 and regressed end-to-end runtime (`334.818 -> 345.503 ms` on D128 linear).
+- Do not repeat that cache-layout rewrite.
+
+Hypothesis:
+
+- Keep the existing D128/D512 token-major linear-V data cache layout.
+- Change only the stage producer lane mapping when `v_linear_data_cache != nullptr`: use the PV-style coalesced pattern where an 8-lane subgroup loads adjacent dim words for one token, accumulates eight token-contiguous packed output words in registers, and writes the existing CUTLASS operand layout.
+- For token-major cache layout, this makes lanes read adjacent 32-bit words at one token without changing cache-preparation kernels or public tensor layouts.
+- This should reduce the `paged_kv.cuh:137` excessive-sector source and remove the cached-linear shfl transpose from D128/D512.
+
+Implementation target:
+
+- D128 and D512 only; D256 already uses the stage-side coalesced cached-linear path.
+- Add a `v_linear_data_cache != nullptr` branch before the existing shfl path in the linear-V producer.
+- Reuse the PV-path register packing and destination invariant checks, but load with `sm120_nvfp4_linear_v_data_cache_word<false>` so the cache layout stays token-major.
+- Leave the non-cache linear path unchanged; it still needs per-codepoint dequant/requant from original paged V.
+
+Validation:
+
+- Focused NVFP4 test file.
+- Benchmark all three max-Q target cells, paged-PV and paged-linear. Expected effect: D128/D512 linear improve; D256 and PV paths remain neutral.
+- If D128/D512 linear regress, revert completely and record the lineinfo result as closed.
+
+## 2026-05-04 22:42 CDT - D128/D512 Linear-V Stage Coalescing Result
+
+Implementation:
+
+- Added a cached-linear stage branch in D128 and D512 when `v_linear_data_cache != nullptr`.
+- Kept the existing token-major internal cache layout and cache-preparation kernels.
+- Changed the stage producer to the PV-style load mapping for token-major cache: one 8-lane subgroup loads adjacent dim words for one token, accumulates eight token-contiguous packed words in registers, and writes the existing CUTLASS operand smem layout.
+- Left the non-cache linear path unchanged; it still performs original paged-V dequant/requant through `sm120_nvfp4_linear_v_requant_transposed_word`.
+- D256 source is unchanged in this commit.
+
+Correctness:
+
+- `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q`
+- Result: `36 passed in 197.90s`.
+
+Max-Q benchmark result:
+
+| cell | layout | K-wide baseline ms | stage-coalesced ms | delta ms | ratio vs K-wide |
+|:---|:---|---:|---:|---:|---:|
+| D128/g12 Mistral `q=16384 kv=262144` | PV | `282.721` | `282.433` | `-0.288` | `0.999x` |
+| D128/g12 Mistral `q=16384 kv=262144` | linear | `321.698` | `275.475` | `-46.223` | `0.856x` |
+| D256/g6 Qwen `q=16384 kv=262144` | PV | `192.400` | `192.344` | `-0.056` | `1.000x` |
+| D256/g6 Qwen `q=16384 kv=262144` | linear | `188.376` | `188.875` | `+0.499` | `1.003x` |
+| D512/g8 Gemma `q=16384 kv=262144` | PV | `763.590` | `760.004` | `-3.586` | `0.995x` |
+| D512/g8 Gemma `q=16384 kv=262144` | linear | `816.849` | `714.965` | `-101.884` | `0.875x` |
+
+Post-change profiler check:
+
+- D128/g12 paged-linear NCU report: `/tmp/sm120_d128_mistral_q16384_kv262144_paged_linear_stage_coalesced.ncu-rep`.
+- Stage duration under NCU moved from `~325.07 ms` before the change to `274.66 ms`.
+- `paged_kv.cuh:137` moved from `11,274,289,152` excessive global sectors to no longer appearing in the excessive-global table.
+- Total global sectors at `paged_kv.cuh:137` dropped to `1,610,612,736`; the remaining excessive global sectors are now dominated by `paged_kv.cuh:109`, the linear scale-cache byte load, at `603,979,776`.
+- The cached-linear `__shfl_sync` long-scoreboard source disappeared from the top stall list; long-scoreboard samples dropped from `2,298,819` to `532,501`.
+
+Decision:
+
+- Keep and commit. The change directly removes the measured D128 linear-V excessive-sector source without repeating the closed cache-layout rewrite.
+- Remaining D128 linear source is now scale-cache byte loading, not data-cache word loading.
