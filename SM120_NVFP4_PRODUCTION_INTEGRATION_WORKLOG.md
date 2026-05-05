@@ -8023,3 +8023,80 @@ Decision:
 - Reverted the code experiment. The stage-kernel NCU source is real, but changing D256's internal cache physical layout to token-major increases the timed wrapper path.
 - Interpretation: the D256 word-col-major cache layout is likely paying off in the cache-preparation kernels or in another unprofiled part of the wrapper enough to offset the stage-kernel uncoalesced-load source.
 - Do not repeat the simple "make D256 cache token-major" experiment. A viable D256 linear fix must preserve the prep-side benefit while reducing stage-side excessive sectors, or it must be justified by profiling the cache-preparation kernels as well as the stage kernel.
+
+## 2026-05-04 23:07 CDT - D256 Linear Full-Wrapper Nsight Target
+
+Profiler setup:
+
+- Cell: D256/g6 Qwen `q=16384 kv=262144`, paged-linear, causal, no SWA, no softcap, after reverting the token-major-D256 experiment.
+- Tool: Nsight Systems CUDA trace first, because the last experiment showed stage-kernel source attribution alone is insufficient. The cache-preparation kernels and the stage kernel must be timed as one wrapper sequence.
+- Workload: one untimed warmup and one measured repeat from `bench_sm120_nvfp4_attention.py`, single process on visible GPU 2.
+
+Finding being tested:
+
+- NCU stage-only attribution says D256 linear stage has a large uncoalesced data-cache load at `paged_kv.cuh:137`.
+- End-to-end timing says changing D256's internal cache to the stage-friendly token-major layout regresses.
+- Therefore the missing piece is likely outside the profiled stage kernel: cache-preparation kernel cost, interaction between prep and stage, or another launch in `wrapper.run()`.
+
+Decision criteria:
+
+- If the cache-preparation kernels dominate the linear wrapper path, optimize their source lines rather than the stage load in isolation.
+- If the stage kernel still dominates the full-wrapper timeline and the prep kernels are small, the next change must preserve the word-col-major cache layout while making the stage load coalesced through a different access pattern.
+- Do not implement another D256 linear change until the full-wrapper kernel sequence is timed.
+
+## 2026-05-04 23:13 CDT - D256 Linear Stage Remap Target
+
+Nsight Systems result:
+
+- Report: `/tmp/sm120_d256_qwen_linear_fullwrapper.nsys-rep`.
+- Benchmark row inside NSYS: `185.407 ms`.
+- Kernel summary across the captured warmup/measurement calls:
+  - D256 attention stage kernel: `521.196 ms` total across 3 instances, average `173.732 ms`, `96.9%` of GPU kernel time.
+  - Linear V data-cache prep kernel: `3.348 ms` total across 3 instances, average `1.116 ms`, `0.6%`.
+  - Linear V scale-cache prep kernel: `3.219 ms` total across 3 instances, average `1.073 ms`, `0.6%`.
+  - Split-KV combine: `6.358 ms` total across 3 instances, average `2.119 ms`, `1.2%`.
+- Cache-preparation cost does not explain the token-major-D256 regression. The stage kernel remains the optimization target.
+
+Hypothesis:
+
+- The word-col-major D256 cache layout should be kept because the end-to-end wrapper prefers it.
+- The current cached-linear stage branch is wrong for that layout: it uses the PV-style mapping where subgroup lanes vary dimension word for one token, causing lanes to stride by `physical_kv_len * 4`.
+- Instead, keep `kCoalescedLayout=true` and remap only the stage load loop so subgroup lanes vary token for one fixed dimension word. This makes `sm120_nvfp4_linear_v_data_cache_word<true>` lanes contiguous in memory.
+- Reconstruct the token-contiguous CUTLASS operand word with the existing 8-lane `__shfl_sync` transpose. This trades the measured global-sector waste for shuffle instructions, without changing cache-prep kernels or public layouts.
+
+Implementation target:
+
+- D256 cached-linear stage branch only.
+- Replace the PV-style coalesced cached-linear branch with a true-layout token-lane branch:
+  - `tile` iterates `kTokenGroups * kDimGroups`.
+  - each lane loads one token at one 8-dim word through `sm120_nvfp4_linear_v_data_cache_word<true>`.
+  - subgroup shuffles assemble the packed token-contiguous word for `pv_sB(local_col, local_k0, write_stage)`.
+- Leave D128/D512 unchanged; their token-major cache layout already matches the PV-style branch.
+
+Validation:
+
+- Run focused D512 correctness tests.
+- Benchmark all three max-Q target cells for paged-PV and paged-linear.
+- Keep only if D256 linear improves without regressing D128/D512 or D256 PV.
+
+Result:
+
+- Correctness before benchmark: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed, `36 passed in 285.80s`.
+- Benchmark result against commit `3c83df5` baseline:
+
+| cell | layout | baseline ms | true-layout token-lane stage ms | delta ms | decision |
+|:---|:---|---:|---:|---:|:---|
+| D128/g12 Mistral `q=16384 kv=262144` | PV | `282.433` | `282.508` | `+0.075` | neutral |
+| D128/g12 Mistral `q=16384 kv=262144` | linear | `275.475` | `275.434` | `-0.041` | neutral |
+| D256/g6 Qwen `q=16384 kv=262144` | PV | `192.344` | `192.154` | `-0.190` | neutral |
+| D256/g6 Qwen `q=16384 kv=262144` | linear | `188.875` | `212.255` | `+23.380` | revert |
+| D512/g8 Gemma `q=16384 kv=262144` | PV | `760.004` | `762.430` | `+2.426` | neutral/noise |
+| D512/g8 Gemma `q=16384 kv=262144` | linear | `714.965` | `713.614` | `-1.351` | neutral/noise |
+
+Decision:
+
+- Reverted the code experiment. Coalescing the D256 true-layout stage load through token-lane mapping loses far more to the 8-lane shuffle transpose than it recovers from global-sector reduction.
+- This closes the two obvious D256 linear data-cache fixes:
+  - make D256 cache token-major: regresses by `+3.348 ms`;
+  - keep true cache layout but restore token-lane shuffle transpose: regresses by `+23.380 ms`.
+- The current D256 linear branch is counterintuitive but empirically best at max-Q: it tolerates uncoalesced cache loads to avoid the shuffle chain.
