@@ -25,6 +25,7 @@
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_covered_smem.cuh>
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh>
 #include <flashinfer/cp_async.cuh>
+#include <flashinfer/math.cuh>
 #include <flashinfer/mma.cuh>
 
 namespace flashinfer::attention::blackwell::sm120_nvfp4::d512 {
@@ -865,13 +866,19 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       cp_async::commit_group();
 
       constexpr int kKScaleCols = kCutlassTileK / 16;
-      for (int idx = load_thread_idx; idx < kCutlassTileN * kKScaleCols;
+      constexpr int kKScaleWords = kKScaleCols / 4;
+      static_assert(kKScaleCols % 4 == 0);
+      if (paged_kv_params.k_scale_stride_dim3 != 1) {
+        SM120_NVFP4_DEBUG_TRAP();
+      }
+      for (int idx = load_thread_idx; idx < kCutlassTileN * kKScaleWords;
            idx += kSm120Nvfp4FmhaLoadThreadCount) {
-        const int row = idx / kKScaleCols;
-        const int local_scale_col = idx - row * kKScaleCols;
+        const int row = idx / kKScaleWords;
+        const int local_scale_word = idx - row * kKScaleWords;
+        const int local_scale_col0 = local_scale_word * 4;
         const int token = kv_tile * kCutlassTileN + row;
-        const int scale_col = k_outer * kKScaleCols + local_scale_col;
-        uint8_t scale = 0x38;
+        const int scale_col = k_outer * kKScaleCols + local_scale_col0;
+        uint32_t scale_word = 0x38383838u;
         if (token < kv_len_tokens) {
           const int local_page = row >> 4;
           const int page_offset = row & 15;
@@ -879,11 +886,18 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
           const int64_t scale_page_base =
               sm120_nvfp4_paged_k_scale_page_base(
                   paged_kv_params, effective_kv_head, physical_page);
-          scale = sm120_nvfp4_paged_k_scale_from_page_base(
-              paged_kv_params, scale_page_base, page_offset, scale_col);
+          scale_word =
+              *sm120_nvfp4_paged_k_scale_word_ptr_from_page_base(
+                  paged_kv_params, scale_page_base, page_offset, scale_col);
         }
-        qk_sSFB(row, local_scale_col * 16, write_stage) =
-            make_ue4m3_raw(scale);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int local_scale_col = local_scale_col0 + i;
+          const uint8_t scale =
+              static_cast<uint8_t>((scale_word >> (8 * i)) & 0xffu);
+          qk_sSFB(row, local_scale_col * 16, write_stage) =
+              make_ue4m3_raw(scale);
+        }
       }
       cp_async::wait_group<0>();
     }
@@ -1004,24 +1018,27 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         constexpr int kDimBlocks = kDimGroups / kCoalescedDimGroups;
         constexpr int kWarpTransposeGroups = kSm120Nvfp4FmhaLoadThreadCount / 8;
         const int load_subgroup = load_thread_idx >> 3;
+        const int subgroup = lane_idx >> 3;
         const int subgroup_lane = lane_idx & 7;
+        const int subgroup_base_lane = lane_idx & ~7;
+        const unsigned subgroup_mask =
+            static_cast<unsigned>(0xffu << (subgroup * 8));
         for (int tile = load_subgroup; tile < kTokenGroups * kDimBlocks;
              tile += kWarpTransposeGroups) {
           const int token_group = tile % kTokenGroups;
           const int dim_block = tile / kTokenGroups;
           const int local_k0 = token_group * kTransposeTokens;
-          const int local_dim0 =
-              dim_block * kCoalescedDimGroups * kTransposeDims +
-              subgroup_lane * kTransposeDims;
+          const int local_dim_block0 =
+              dim_block * kCoalescedDimGroups * kTransposeDims;
+          const int local_dim0 = local_dim_block0 + subgroup_lane * kTransposeDims;
           const int dim_base =
               effective_out_group_idx * kCutlassTileN + local_dim0;
-          uint32_t packed_words[kTransposeDims] = {};
+          uint32_t row_words[kTransposeTokens] = {};
 #pragma unroll
           for (int token_offset = 0; token_offset < kTransposeTokens;
                ++token_offset) {
             const int local_token = local_k0 + token_offset;
             const int token = kv_tile * kCutlassTileN + local_token;
-            uint32_t row_word = 0;
             if (token < kv_len_tokens) {
               const int local_page = local_token >> 4;
               const int page_offset = local_token & 15;
@@ -1029,25 +1046,29 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
               const int64_t data_page_base =
                   sm120_nvfp4_paged_v_data_page_base(
                       paged_kv_params, effective_kv_head, physical_page);
-              row_word = sm120_nvfp4_paged_v_word_from_page_base(
+              row_words[token_offset] = sm120_nvfp4_paged_v_word_from_page_base(
                   paged_kv_params, data_page_base, page_offset,
                   dim_base >> 1);
             }
-#pragma unroll
-            for (int dim_offset = 0; dim_offset < kTransposeDims;
-                 ++dim_offset) {
-              const uint8_t code = static_cast<uint8_t>(
-                  (row_word >> (4 * dim_offset)) & 0x0f);
-              packed_words[dim_offset] |=
-                  static_cast<uint32_t>(code) << (4 * token_offset);
-            }
           }
 
-          const int local_col0 = local_dim0;
 #pragma unroll
-          for (int dim_offset = 0; dim_offset < kTransposeDims;
-               ++dim_offset) {
-            const int local_col = local_col0 + dim_offset;
+          for (int store_group = 0; store_group < kCoalescedDimGroups;
+               ++store_group) {
+            uint32_t packed_word = 0;
+#pragma unroll
+            for (int token_offset = 0; token_offset < kTransposeTokens;
+                 ++token_offset) {
+              const uint32_t peer_word =
+                  __shfl_sync(subgroup_mask, row_words[token_offset],
+                              subgroup_base_lane + store_group);
+              const uint8_t code = static_cast<uint8_t>(
+                  (peer_word >> (4 * subgroup_lane)) & 0x0f);
+              packed_word |=
+                  static_cast<uint32_t>(code) << (4 * token_offset);
+            }
+            const int local_col =
+                local_dim_block0 + store_group * kTransposeDims + subgroup_lane;
             auto ref0 = pv_sB(local_col, local_k0, write_stage);
             uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
             if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
@@ -1065,7 +1086,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                 SM120_NVFP4_DEBUG_TRAP();
               }
             }
-            *reinterpret_cast<uint32_t*>(dst0) = packed_words[dim_offset];
+            *reinterpret_cast<uint32_t*>(dst0) = packed_word;
           }
         }
       } else {
@@ -1213,8 +1234,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         constexpr int kTokenScaleGroups = kCutlassTileN / 16;
         for (int idx = load_thread_idx; idx < kCutlassTileN * kTokenScaleGroups;
              idx += kSm120Nvfp4FmhaLoadThreadCount) {
-          const int col = idx / kTokenScaleGroups;
-          const int token_group = idx - col * kTokenScaleGroups;
+          const int token_group = idx / kCutlassTileN;
+          const int col = idx - token_group * kCutlassTileN;
           const int k0 = token_group * 16;
           const int token = kv_tile * kCutlassTileN + k0;
           const int dim = effective_out_group_idx * kCutlassTileN + col;
@@ -1897,7 +1918,8 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
         return -INFINITY;
       }
       if constexpr (kUseLogitsSoftCap) {
-        logit = logits_soft_cap * tanhf(logit / logits_soft_cap);
+        logit = logits_soft_cap *
+                flashinfer::math::tanh(logit / logits_soft_cap);
       }
       return logit;
     };

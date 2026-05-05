@@ -640,6 +640,21 @@ __device__ __forceinline__ uint8_t sm120_nvfp4_paged_k_scale_from_page_base(
   return params.k_scales[src];
 }
 
+__device__ __forceinline__ const uint32_t*
+sm120_nvfp4_paged_k_scale_word_ptr_from_page_base(
+    const Sm120Nvfp4PagedKvLoadParams& params,
+    int64_t scale_page_base,
+    int page_offset,
+    int scale_col) {
+  const int64_t src =
+      scale_page_base +
+      static_cast<int64_t>(page_offset) *
+          (params.kv_layout_hnd ? params.k_scale_stride_dim2
+                                : params.k_scale_stride_dim1) +
+      static_cast<int64_t>(scale_col) * params.k_scale_stride_dim3;
+  return reinterpret_cast<const uint32_t*>(params.k_scales + src);
+}
+
 __device__ __forceinline__ int sm120_nvfp4_linear_scale_token(
     int token, int scale_col, int scale_dim, int scale_layout) {
   if (scale_layout == 0) {
