@@ -8100,3 +8100,85 @@ Decision:
   - make D256 cache token-major: regresses by `+3.348 ms`;
   - keep true cache layout but restore token-lane shuffle transpose: regresses by `+23.380 ms`.
 - The current D256 linear branch is counterintuitive but empirically best at max-Q: it tolerates uncoalesced cache loads to avoid the shuffle chain.
+
+## 2026-05-04 23:28 CDT - D256 Dense-vs-Paged NCU Target
+
+Profiler setup:
+
+- Cell: D256/g6 Qwen `q=16384 kv=262144`, causal, no SWA, no softcap.
+- Baseline timings at current HEAD: dense `117.982 ms`, paged-PV `192.344 ms`, paged-linear `188.875 ms`.
+- Existing paged-PV NCU report: `/tmp/sm120_d256_qwen_q16384_kv262144_paged_pv_after_kwide.ncu-rep`.
+- Existing paged-linear NCU report: `/tmp/sm120_d256_qwen_q16384_kv262144_paged_linear_after_kwide.ncu-rep`.
+
+Finding so far:
+
+- D256 linear-specific data-cache fixes are closed by negative max-Q measurements.
+- D256 paged-PV and paged-linear now converge around the same runtime, so the remaining gap should be identified by comparing paged-PV against dense at the same cell, not by chasing linear-only sources.
+
+Hypothesis:
+
+- Some of the hottest paged-PV counters are not actually paged-specific; shared operand stores, logits, and PV accumulator work may also appear in dense.
+- The next valid target is the largest source/counter that is materially higher in paged-PV than dense and is not already closed in the worklog.
+
+Validation:
+
+- Collect NCU `SourceCounters` and `PmSampling_WarpStates` with lineinfo enabled for the D256 dense cell.
+- Compare source-level global sectors, shared wavefronts, and warp stalls against D256 paged-PV.
+- Do not edit code until the dense-vs-paged delta names a paged-only source.
+
+## 2026-05-04 23:39 CDT - D256 Paged Tile-M Structural Experiment
+
+Profiler/config finding:
+
+- D256 dense NCU report: `/tmp/sm120_d256_qwen_q16384_kv262144_dense_after_kwide.ncu-rep`.
+- Dense benchmark row inside NCU: `107.075 ms`; dense NCU duration: `109.11 ms`.
+- D256 dense kernel signature instantiates the CUTLASS tile as `M=64, N=128, K=128`.
+- D256 paged kernel signature instantiates the CUTLASS tile as `M=128, N=128, K=128`.
+- This comes from `csrc/fmha_nvfp4_sm120_d256_paged.cu`, which overrides `FLASHINFER_SM120_NVFP4_D256_TILE_M` to `128` for non-SWA paged specs, while dense uses the header default `64`.
+- The Python wrapper and benchmark mirror this through `_paged_tile_m_for_config()` / `paged_tile_m_for_config()`.
+
+Dense-vs-paged profiler delta:
+
+- Dense has zero L2 global excessive sectors and only `33,546,240` total global sectors attributed by SourceCounters.
+- Paged-PV adds the paged software producer traffic:
+  - `paged_kv.cuh:738`, V data word load: `805,306,368` total sectors;
+  - `paged_kv.cuh:904`, PV V-scale byte load: `805,306,368` total and `704,643,072` excessive sectors;
+  - `paged_kv.cuh:640`, K-scale byte load: `201,326,592` total and `100,663,296` excessive sectors.
+- Local PV-scale mutations, V operand-store mutations, page-cache variants, and D256 linear cache remaps are closed by prior measurements. The tile-shape difference is a remaining structural delta that has not been tested at max-Q.
+
+Hypothesis:
+
+- The D256 paged `M=128` override may be a stale integration tradeoff that helps smaller cells or scratch sizing but hurts the large-Q/max-KV production cell by increasing per-CTA work and producer/consumer coupling.
+- Matching dense at `M=64` may improve D256 paged large-Q even if it increases CTA count, because dense already demonstrates that the D256 mainloop is healthy at `M=64`.
+
+Implementation target:
+
+- Change only D256 non-SWA paged tile-M from `128` to `64`.
+- Keep public tensor layouts, FFI signatures, output group span, split scheduling, and spec axes unchanged.
+- Update the wrapper and benchmark tile-M helper so scratch sizing and benchmark split selection agree with the kernel tile shape.
+
+Validation:
+
+- Run focused NVFP4 correctness tests.
+- Benchmark all three max-Q target cells for paged-PV and paged-linear.
+- Keep only if D256 paged improves materially without cross-D regressions.
+
+Result:
+
+- Correctness before benchmark: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed, `36 passed in 90.02s`.
+- Benchmark result against commit `e490023` baseline:
+
+| cell | layout | baseline ms | D256 paged `M=64` experiment ms | delta ms | decision |
+|:---|:---|---:|---:|---:|:---|
+| D128/g12 Mistral `q=16384 kv=262144` | PV | `282.433` | `282.338` | `-0.095` | neutral |
+| D128/g12 Mistral `q=16384 kv=262144` | linear | `275.475` | `275.647` | `+0.172` | neutral |
+| D256/g6 Qwen `q=16384 kv=262144` | PV | `192.344` | `218.134` | `+25.790` | revert |
+| D256/g6 Qwen `q=16384 kv=262144` | linear | `188.875` | `207.254` | `+18.379` | revert |
+| D512/g8 Gemma `q=16384 kv=262144` | PV | `760.004` | `760.483` | `+0.479` | neutral |
+| D512/g8 Gemma `q=16384 kv=262144` | linear | `714.965` | `707.161` | `-7.804` | unrelated/noise; D512 code unchanged |
+
+Decision:
+
+- Reverted the code experiment. Matching dense's D256 `M=64` tile shape makes D256 paged materially slower at max-Q.
+- The D256 paged `M=128` override is not the source of the current large-Q gap; it is better for the paged path even though dense uses `M=64`.
+- Do not retest D256 paged `M=64` without a different scheduler/split design. The isolated tile-shape change is closed.
