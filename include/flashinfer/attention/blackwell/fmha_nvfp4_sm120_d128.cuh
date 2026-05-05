@@ -826,13 +826,25 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
                     "Paged K producer requires an inner-K layout extent large "
                     "enough for byte-packed FP4 writes.");
       constexpr int kPackedWordsPerKRow = kCutlassTileK / 8;
-      constexpr int kPackedKWords = kCutlassTileN * kPackedWordsPerKRow;
-      for (int word_idx = load_thread_idx; word_idx < kPackedKWords;
-           word_idx += kSm120Nvfp4FmhaLoadThreadCount) {
-        const int row0 = word_idx / kPackedWordsPerKRow;
-        const int k0 = (word_idx - row0 * kPackedWordsPerKRow) * 8;
+      constexpr int kWideWords = 4;
+      static_assert(kPackedWordsPerKRow % kWideWords == 0);
+      constexpr int kWideGroupsPerKRow = kPackedWordsPerKRow / kWideWords;
+      constexpr int kPackedKGroups = kCutlassTileN * kWideGroupsPerKRow;
+      for (int group_idx = load_thread_idx; group_idx < kPackedKGroups;
+           group_idx += kSm120Nvfp4FmhaLoadThreadCount) {
+        const int row0 = group_idx / kWideGroupsPerKRow;
+        const int word0 =
+            (group_idx - row0 * kWideGroupsPerKRow) * kWideWords;
+        const int k0 = word0 * 8;
         auto ref0 = qk_sB(row0, k0, write_stage);
         uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
+        bool wide_ok = (reinterpret_cast<uintptr_t>(dst0) & 15u) == 0u;
+#pragma unroll
+        for (int word = 1; word < kWideWords; ++word) {
+          auto ref = qk_sB(row0, k0 + word * 8, write_stage);
+          uint8_t* dst = cute::recast_ptr<uint8_t>(&ref);
+          wide_ok = wide_ok && (dst == dst0 + word * 4);
+        }
 #if FLASHINFER_SM120_NVFP4_DEBUG_TRAPS
         // K producer requires 4-byte-aligned contiguous dim stride.
         if (((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) ||
@@ -856,12 +868,31 @@ template <int kOutputGroupSpan, bool kUsePagedKv, bool kCausal,
         const int physical_page = storage.physical_page_cache[local_page];
         const int64_t data_page_base = sm120_nvfp4_paged_k_data_page_base(
             paged_kv_params, effective_kv_head, physical_page);
-        const uint32_t* src =
+        const uint32_t* src0 =
             in_bounds ? sm120_nvfp4_paged_k_word_ptr_from_page_base(
                             paged_kv_params, data_page_base, page_offset, dim0)
                       : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
-        cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
-            reinterpret_cast<uint32_t*>(dst0), src, in_bounds);
+        if (wide_ok) {
+          cp_async::pred_load_128b<
+              cp_async::PrefetchMode::kPrefetch,
+              cp_async::SharedMemFillMode::kFillZero>(
+              reinterpret_cast<uint4*>(dst0),
+              reinterpret_cast<const uint4*>(src0), in_bounds);
+        } else {
+#pragma unroll
+          for (int word = 0; word < kWideWords; ++word) {
+            auto ref = qk_sB(row0, k0 + word * 8, write_stage);
+            uint8_t* dst = cute::recast_ptr<uint8_t>(&ref);
+            const uint32_t* src =
+                in_bounds
+                    ? sm120_nvfp4_paged_k_word_ptr_from_page_base(
+                          paged_kv_params, data_page_base, page_offset,
+                          dim0 + word * 8)
+                    : reinterpret_cast<const uint32_t*>(paged_kv_params.k_pages);
+            cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(
+                reinterpret_cast<uint32_t*>(dst), src, in_bounds);
+          }
+        }
       }
 
       cp_async::commit_group();

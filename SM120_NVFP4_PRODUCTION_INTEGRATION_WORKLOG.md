@@ -7792,3 +7792,77 @@ Decision:
 
 - Stop treating the D128 issue as a single hot source line. The NCU source lines are symptoms of the same structural producer problem.
 - The next implementation attempt must target K and V together, or it will leave a measured `~65 ms` K producer floor behind.
+
+## 2026-05-04 22:02 CDT - D128 K Wide Copy Experiment Target
+
+Profiler basis:
+
+- Target cell remains D128/g12 Mistral `q=16384 kv=262144`, paged-PV, causal, no SWA, no softcap.
+- D128 paged-PV NCU profiles at `297.66 ms` with `5,081,321,472` observed global sectors and `1,409,286,144` excessive global sectors.
+- The timing ceiling diagnostic localizes K data staging alone at `42.590 ms` and K data+scale at `64.933 ms`.
+- Removing K+V producer bodies drops the row to `166.032 ms`, so producer data movement is the measured blocker, not wrapper launch overhead or the dense mainloop.
+
+Reference pattern:
+
+- FA2/prefill FP4 loads use 64-bit async copies into an aligned swizzled smem tile:
+  - `include/flashinfer/attention/prefill.cuh:443`: `smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);`
+  - `include/flashinfer/permuted_smem.cuh:177`: `cp_async::pred_load_128b_from_64b<cp_async::PrefetchMode::kPrefetch, fill_mode>(...)`
+- Current SM120 K uses one 32-bit async copy per packed word:
+  - `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d128.cuh:863`: `cp_async::pred_load_32b<cp_async::SharedMemFillMode::kFillZero>(...)`
+- The current K path already has the right semantic shape for a guarded wide copy: K gmem is dim-contiguous under `k_stride_dim3 == 1`, and the CUTLASS B smem invariant is checked per packed word.
+
+Hypothesis:
+
+- A subset of K rows has four adjacent 32-bit packed words landing in 16 contiguous, 16-byte-aligned shared-memory bytes.
+- For that subset, replacing four `pred_load_32b` issues with one `pred_load_128b` should reduce K producer issue count and improve the max-Q rows.
+- If the CUTLASS B layout does not provide enough aligned 16-byte groups, the timing will be neutral and this closes K-wide vectorization without changing public API or smem layout.
+
+Implementation target:
+
+- Add a guarded D128 K data path first: group `k0` in 32-FP4-element chunks, verify the four destination words are contiguous and 16-byte aligned, and issue one `cp_async::pred_load_128b`.
+- Keep the existing 32-bit path for groups that do not satisfy the proven physical-address invariant; this is a performance fallback, not a correctness fallback, and it reuses the already-correct K producer.
+- Do not touch V, scales, public tensor layouts, FFI signatures, or tests in this experiment.
+
+Validation:
+
+- Focused NVFP4 correctness first.
+- Benchmark all three max-Q target cells for paged-PV and paged-linear before deciding whether to keep.
+- Keep only if at least one target row improves materially without regressing another target row; otherwise revert and record the measured alignment/timing result.
+
+## 2026-05-04 22:18 CDT - K Wide Copy Result
+
+Implementation:
+
+- Replaced the paged K producer's per-word loop with a four-word group loop in D128/D256/D512.
+- Each group checks that four adjacent packed K words map to 16 contiguous, 16-byte-aligned shared-memory bytes.
+- Aligned groups issue one `cp_async::pred_load_128b`; non-aligned groups retain the existing four `pred_load_32b` copies.
+- The path is internal to `kUsePagedKv`; public tensor layouts, FFI signatures, spec axes, split scheduling, and tests are unchanged.
+
+Correctness:
+
+- `CUDA_VISIBLE_DEVICES=2 ... pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q`
+- Result: `36 passed in 197.86s`.
+
+Max-Q benchmark result:
+
+| cell | layout | baseline ms | K-wide ms | delta ms | ratio vs baseline |
+|:---|:---|---:|---:|---:|---:|
+| D128/g12 Mistral `q=16384 kv=262144` | PV | `292.599` | `282.721` | `-9.878` | `0.966x` |
+| D128/g12 Mistral `q=16384 kv=262144` | linear | `334.818` | `321.698` | `-13.120` | `0.961x` |
+| D256/g6 Qwen `q=16384 kv=262144` | PV | `199.546` | `192.400` | `-7.146` | `0.964x` |
+| D256/g6 Qwen `q=16384 kv=262144` | linear | `202.745` | `188.376` | `-14.369` | `0.929x` |
+| D512/g8 Gemma `q=16384 kv=262144` | PV | `791.689` | `763.590` | `-28.099` | `0.965x` |
+| D512/g8 Gemma `q=16384 kv=262144` | linear | `845.025` | `816.849` | `-28.176` | `0.967x` |
+
+Post-change profiler check:
+
+- D128/g12 paged-PV NCU report: `/tmp/sm120_d128_mistral_q16384_kv262144_paged_pv_kwide.ncu-rep`.
+- NCU duration moved from the prior `297.66 ms` profile to `285.39 ms`.
+- All-sample `stall_barrier` dropped from `2,987,285` to `737,631`.
+- All-sample `stall_wait` dropped from `1,662,305` to `395,721`.
+- Global excessive sectors remained essentially unchanged at `1,409,286,144`, so this win is from reduced async-copy issue/synchronization pressure, not from fixing the remaining uncoalesced V-scale/global source.
+
+Decision:
+
+- Keep and commit. The change improves all three production max-Q target cells and preserves correctness.
+- This closes the current K data vectorization opportunity. Remaining producer gap is still V data/scale and K/V scale traffic; K-wide alone is intentionally not the final architecture.
