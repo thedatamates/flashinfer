@@ -7680,3 +7680,33 @@ Finding:
   - per-thread register cache: regressed.
   - shared tag skip: neutral/regressed.
 - Do not retry page-cache variants unless the design changes the producer/consumer schedule itself, not just the page-cache storage policy.
+
+## 2026-05-04 21:45 CDT - D128 FA2 Reference NCU Comparison
+
+Profiler setup:
+
+- Cell: D128/g12 Mistral max-Q `q=16384 kv=262144`, causal, no SWA, `logits_soft_cap=0.0`.
+- Reference backend: `bench_nvfp4_fmha_v2_gqa_grouped_attention.py --only grouped-fp4 --fp4-backend fa2 --fp4-v-layout nhd --fp4-v-sf-layout linear`.
+- NSYS report: `/tmp/d128_mistral_nvfp4_fa2_q16384_kv262144.nsys-rep`.
+- NCU report: `/tmp/d128_mistral_nvfp4_fa2_q16384_kv262144.ncu-rep`.
+- FA2 source lineinfo is not present in this build, so the comparison uses kernel-level NCU counters and SM120 lineinfo attribution from `/tmp/sm120_d128_mistral_q16384_kv262144_paged_pv_lineinfo.ncu-rep`.
+
+Finding:
+
+- NSYS identifies the dominant FA2 kernel as `BatchPrefillWithPagedKVCacheKernel<... __nv_fp4x2_e2m1 ...>` with two profiled launches averaging `144.682 ms`.
+- NCU measures the FA2 kernel at `144.42 ms`, matching the benchmark baseline (`nvfp4_fa2` around `148.606 ms`).
+- FA2 has `0` excessive global sectors: `1,905,529,008` global sectors observed and `1,905,529,008` ideal.
+- SM120 D128 paged-PV at the same cell profiles at `290.416 ms` and attributes `1,409,286,144` excessive global sectors to `paged_kv.cuh:904`, the PV V-scale byte load.
+- FA2 has `389,850,298` total excessive shared wavefronts; SM120 D128 paged-PV attributes `2,818,572,288` excessive shared wavefronts to the V operand packed-word store alone.
+- FA2 has `110,255` all-sample barrier stalls and `1,579,149` wait stalls; SM120 D128 paged-PV attributes `2,451,550` barrier samples to the page-cache fill predicate plus `2,935,532` wait samples at the CUTLASS pipeline barrier.
+
+Interpretation:
+
+- The D128 FA2 advantage is not explained by the FP4 reblock arithmetic alone. FA2 avoids the paged producer pathologies that remain in SM120: excessive global sectors, much higher shared wavefront excess, and high page-cache/pipeline barrier attribution.
+- The local source mutations tried so far moved individual symptoms but did not improve the target row: PV-scale word loads, PV-scale loop reorder, direct scale `cp.async`, V shared-store coalescing, split length, and page-cache tag/direct-cache variants are closed by measurement.
+- The remaining gap is structural: SM120 paged mode is still adapting paged software movement into the CUTLASS operand-smem/TMA-oriented scaffold, while FA2 uses an integrated paged producer and smem/register-fragment path.
+
+Decision:
+
+- Stop repeating small mutations of the current D128 paged producer sites unless a new NCU source identifies a different mechanism.
+- The next viable high-risk direction is to map the FA2 paged producer structure onto the SM120 path: an FA2-style paged smem/register-fragment construction for K/V that eliminates the current excessive-sector producer behavior, or a production-side PV writer if that proves cheaper. Any implementation must be profiler-gated and benchmarked on all three max-Q target cells before commit.
