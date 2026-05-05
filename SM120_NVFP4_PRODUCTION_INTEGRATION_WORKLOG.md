@@ -7454,3 +7454,67 @@ Follow-up:
 
 - D128 PV-scale simple variants are now closed: broad word load, D128 loop reorder, and direct `cp.async` all failed either correctness or target timing.
 - Further D128 work should move to a new NCU-attributed source site rather than continuing to mutate the same PV-scale loop by inspection.
+
+## 2026-05-04 20:57 CDT - PV V Shared-Store Coalescing Target
+
+Profiler finding:
+
+- D128 paged-PV at Mistral max-Q still has a paged-only shared-memory source after the PV-scale variants are closed.
+- NCU SourceCounters attributes `2,818,572,288` excessive shared wavefronts to `fmha_nvfp4_sm120_d128.cuh:1069`, the `uint32_t` packed-word store into `pv_sB`.
+- Dense has the same softmax/MMA shared-memory sources, but not this PV V-operand producer store.
+- The current PV data producer maps each 8-lane subgroup so lanes load adjacent dim words from one token row. That fixed global coalescing, but each lane then stores its eight packed output columns as `base + lane * 8 + dim_offset`, so for a fixed store instruction the subgroup writes columns `0, 8, 16, ...`, not contiguous columns.
+
+Hypothesis:
+
+- Keep the current coalesced global loads.
+- Add one register-level subgroup shuffle before the `pv_sB` store so each store iteration writes columns `base + store_group * 8 + lane`.
+- This should reduce the excessive shared wavefronts at the V operand store without reverting to the older uncoalesced global-load mapping.
+
+Implementation target:
+
+- Change the PV-layout V data producer in D128/D256/D512 consistently.
+- Add `subgroup_mask` and `subgroup_base_lane` in the PV branch.
+- Store `__shfl_sync(subgroup_mask, packed_words[subgroup_lane], subgroup_base_lane + store_group)` to `pv_sB(base + store_group * 8 + subgroup_lane, local_k0, stage)`.
+- Do not touch linear-V yet; the NCU source and hypothesis here are PV-specific.
+
+Validation:
+
+- Focused NVFP4 correctness file first.
+- Benchmark all three max-Q/max-KV target rows for paged-PV and paged-linear before any commit.
+- Keep only if paged-PV improves materially without a meaningful paged-linear regression across the three targets.
+- If kept, re-run D128 paged-PV NCU and verify `d128.cuh:1069` excessive shared wavefronts drop.
+
+## 2026-05-04 21:19 CDT - PV V Shared-Store Coalescing Reverted
+
+Implementation attempted:
+
+- First tried a post-accumulation subgroup shuffle that kept coalesced global loads and attempted to remap each lane's existing `packed_words[]` to contiguous-column stores.
+- That mapping was logically wrong: the source lane selected its own `packed_words[subgroup_lane]`, not the destination lane's requested element.
+- Corrected the mapping by moving the subgroup shuffle into the token accumulation loop. Each lane loaded the same coalesced row word as before, gathered the relevant dim from each source lane with `__shfl_sync`, accumulated the contiguous output column it would store, then stored `base + store_group * 8 + lane`.
+- The broad D128/D256/D512 version failed correctness on D256, so the experiment was narrowed to D128 only because the NCU evidence was D128-specific.
+
+Validation result:
+
+- Broad corrected version focused test: `2 failed, 34 passed in 295.18s`.
+  - Failing tests: D256 multi-kv-vs-single-kv and scratch-poison determinism.
+  - Failure mode: small but real output drift, not a trap.
+- D128-only corrected version focused test: `36 passed in 201.39s`.
+
+Measured result:
+
+| cell | baseline paged-PV ms | store-coalesced paged-PV ms | baseline paged-linear ms | store-coalesced paged-linear ms | decision |
+|:---|---:|---:|---:|---:|:---|
+| D128/g12 Mistral `q=16384 kv=262144` | `292.599` | `321.726` | `334.818` | `328.564` | PV regressed; reject |
+| D256/g6 Qwen `q=16384 kv=262144` | `199.546` | `197.139` | `202.745` | `199.825` | code unchanged/noise |
+| D512/g8 Gemma `q=16384 kv=262144` | `791.689` | `782.880` | `845.025` | `828.427` | code unchanged/noise |
+
+Decision:
+
+- Reverted the code completely. The worktree is back to the committed producer baseline; only this append-only worklog entry remains.
+- Do not trade the current PV producer's direct packed-word stores for subgroup-shuffled contiguous stores. The shared-sector source is real, but the shuffle cost is larger than the shared-memory benefit on the D128 target row.
+
+Finding:
+
+- The current PV V producer appears to be on the better side of the global-vs-shared coalescing tradeoff for D128 max-Q.
+- `d128.cuh:1069` remains an NCU-attributed excessive-shared source, but this exact register-transpose/store-coalescing variant is closed.
+- The next D128 hypothesis should not be another V operand store lane remap unless NCU/SASS shows a different mechanism than the one tested here.
