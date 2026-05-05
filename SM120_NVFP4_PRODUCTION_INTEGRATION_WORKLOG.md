@@ -8182,3 +8182,51 @@ Decision:
 - Reverted the code experiment. Matching dense's D256 `M=64` tile shape makes D256 paged materially slower at max-Q.
 - The D256 paged `M=128` override is not the source of the current large-Q gap; it is better for the paged path even though dense uses `M=64`.
 - Do not retest D256 paged `M=64` without a different scheduler/split design. The isolated tile-shape change is closed.
+
+## 2026-05-04 23:51 CDT - D256 PV Nibble-Transpose Target
+
+Profiler finding:
+
+- Dense-vs-paged source delta identifies a paged-only instruction hotspot in the D256 PV V producer, separate from the closed PV-scale and layout experiments.
+- D256 paged-PV extra instructions versus dense:
+  - `d256.cuh:1111`: `1,358,938,368` extra instructions;
+  - `d256.cuh:1112`: `1,384,120,320` extra instructions;
+  - these are the inner-loop `packed_words[dim_offset] |= code << (4 * token_offset)` nibble transpose in the PV-layout V data producer.
+- The current code transposes an `8 token x 8 dim` nibble tile with a fully unrolled nested loop: 8 row-word loads, then 64 extract/shift/or updates.
+
+Hypothesis:
+
+- The same logical transpose can be expressed as four byte-lane gathers plus nibble-compress operations.
+- This should reduce integer instruction count in the paged-only V data producer without changing gmem access pattern, smem layout, public layout, or cache/prep behavior.
+- Apply to D256 PV first because the source attribution is from D256 paged-PV and D256 is the current worst large-Q ratio.
+
+Implementation target:
+
+- Add a small device helper that packs the low nibble from eight byte lanes into one 32-bit word.
+- Add an `8x8` FP4 nibble transpose helper taking eight row words and producing eight packed token-contiguous output words.
+- Replace only the D256 `kPvLayoutV` data producer's nested extract/OR loop with this helper.
+
+Validation:
+
+- Run focused NVFP4 correctness tests.
+- Benchmark all three max-Q target cells for paged-PV and paged-linear.
+- Keep only if D256 paged-PV improves without D256 linear or cross-D regressions.
+
+Result:
+
+- Correctness before benchmark: `tests/attention/test_nvfp4_kv_head_dim_512.py -q` passed, `36 passed in 288.46s`.
+- Benchmark result against commit `45aa136` baseline:
+
+| cell | layout | baseline ms | packed-transpose experiment ms | delta ms | decision |
+|:---|:---|---:|---:|---:|:---|
+| D128/g12 Mistral `q=16384 kv=262144` | PV | `282.433` | `282.212` | `-0.221` | neutral |
+| D128/g12 Mistral `q=16384 kv=262144` | linear | `275.475` | `275.525` | `+0.050` | neutral |
+| D256/g6 Qwen `q=16384 kv=262144` | PV | `192.344` | `193.092` | `+0.748` | revert |
+| D256/g6 Qwen `q=16384 kv=262144` | linear | `188.875` | `188.509` | `-0.366` | not target |
+| D512/g8 Gemma `q=16384 kv=262144` | PV | `760.004` | `757.687` | `-2.317` | D512 code unchanged/noise |
+| D512/g8 Gemma `q=16384 kv=262144` | linear | `714.965` | `721.648` | `+6.683` | D512 code unchanged/noise |
+
+Decision:
+
+- Reverted the helper and D256 PV producer change. The packed byte-lane transpose reduces the visible loop shape but does not improve the D256 paged-PV target; the original nested extract/OR loop is faster at max-Q.
+- Do not retest this helper form unless paired with SASS evidence that the compiler emitted fewer hot instructions in the measured stage kernel.
