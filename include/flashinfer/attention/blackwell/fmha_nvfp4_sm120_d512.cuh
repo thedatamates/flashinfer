@@ -25,8 +25,10 @@
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_covered_smem.cuh>
 #include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh>
 #include <flashinfer/cp_async.cuh>
+#include <flashinfer/frag_layout_swizzle.cuh>
 #include <flashinfer/math.cuh>
 #include <flashinfer/mma.cuh>
+#include <flashinfer/permuted_smem.cuh>
 
 namespace flashinfer::attention::blackwell::sm120_nvfp4::d512 {
 
@@ -137,6 +139,8 @@ using Fp4MmaAtom =
                                                   cutlass::float_ue4m3_t,
                                                   16>;
 
+#include <flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512_controlled_pv.cuh>
+
 using CutlassElementAB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
 using CutlassElementC = void;
 using CutlassElementD = cutlass::bfloat16_t;
@@ -203,6 +207,7 @@ using CutlassCollectiveMainloopK128Stage2 =
         CutlassClusterShape,
         cutlass::gemm::collective::StageCount<2>,
         cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
+
 using CutlassGemmKernelK128Stage2 =
     cutlass::gemm::kernel::GemmUniversal<
         CutlassProblemShape,
@@ -312,6 +317,15 @@ struct Sm120Nvfp4QkvLoadCollectiveStorage {
 
 static_assert(sizeof(Sm120Nvfp4QkvLoadCollectiveStorage) <= (99u << 10),
               "SM120 Q/K/V load collective storage must fit SM120 opt-in shared memory");
+static_assert(
+    sizeof(decltype(((Sm120Nvfp4QkvLoadCollectiveStorage*)nullptr)->v_smem_B)) >=
+        kD512ControlledVStages * kD512ControlledVStageB128 *
+            static_cast<int>(sizeof(flashinfer::b128_t)),
+    "D512 controlled V data tile must fit existing V smem allocation");
+static_assert(
+    sizeof(decltype(((Sm120Nvfp4QkvLoadCollectiveStorage*)nullptr)->v_smem_SFB)) >=
+        kD512ControlledVStages * kD512ControlledVScaleBytesPerStage,
+    "D512 controlled V scale tile must fit existing V scale smem allocation");
 static_assert(
     sizeof(decltype(
         ((typename CutlassCollectiveMainloop::TensorStorage*)nullptr)->smem_B)) >=
@@ -721,6 +735,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   using PvSmemAllocB =
       typename CutlassCollectiveMainloopK128Stage2::SmemAllocTypeB;
   auto pv_sB_ptr = storage.v_smem_B.begin();
+  uint8_t* controlled_v_base = cute::recast_ptr<uint8_t>(pv_sB_ptr);
   ZeroSmemTile<PvSmemAllocB,
                typename CutlassCollectiveMainloopK128Stage2::SmemLayoutB,
                decltype(pv_sB_ptr)>
@@ -729,6 +744,7 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
                     blockDim.x, kCoveredSmemInitBarrier);
   auto pv_sB = pv_sB_covered.tensor();
   auto pv_sSFB_ptr = storage.v_smem_SFB.begin();
+  uint8_t* controlled_v_scale_base = cute::recast_ptr<uint8_t>(pv_sSFB_ptr);
   E4M3OneSmemTile<cutlass::float_ue4m3_t,
                   typename CutlassCollectiveMainloopK128Stage2::SmemLayoutSFB,
                   decltype(pv_sSFB_ptr)>
@@ -906,7 +922,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   auto stage_paged_v_tile = [&](int kv_tile, int effective_out_group_idx,
                                 int write_stage) {
     if constexpr (kUsePagedKv) {
-      cache_paged_physical_pages(kv_tile);
       auto pv_scale_pair_for = [&](int token_group_start, int dim0,
                                    uint8_t& sf0, uint8_t& sf1) {
         float max_abs0 = 0.0f;
@@ -1006,88 +1021,107 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
 
       if constexpr (kPvLayoutV) {
+        if (paged_kv_params.v_linear_data_cache != nullptr) {
+          auto* dst_b128 =
+              reinterpret_cast<flashinfer::b128_t*>(controlled_v_base) +
+              write_stage * kD512ControlledVStageB128;
+          for (int raw_idx = load_thread_idx;
+               raw_idx < kD512ControlledVStageB128;
+               raw_idx += kSm120Nvfp4FmhaLoadThreadCount) {
+            dst_b128[raw_idx] =
+                *sm120_nvfp4_d512_controlled_pv_cache_b128_ptr(
+                    paged_kv_params, batch_idx, effective_kv_head, kv_tile,
+                    effective_out_group_idx, raw_idx);
+          }
+          if (paged_kv_params.v_linear_scale_cache != nullptr) {
+            constexpr int kScaleWords =
+                kD512ControlledVScaleBytesPerStage / 4;
+            auto* dst_scale_words = reinterpret_cast<uint32_t*>(
+                controlled_v_scale_base +
+                write_stage * kD512ControlledVScaleBytesPerStage);
+            for (int raw_word_idx = load_thread_idx; raw_word_idx < kScaleWords;
+                 raw_word_idx += kSm120Nvfp4FmhaLoadThreadCount) {
+              dst_scale_words[raw_word_idx] =
+                  *sm120_nvfp4_d512_controlled_pv_cache_scale_word_ptr(
+                      paged_kv_params, batch_idx, effective_kv_head, kv_tile,
+                      effective_out_group_idx, raw_word_idx);
+            }
+          }
+          return;
+        }
         if (paged_kv_params.v_stride_dim3 != 1) {
           SM120_NVFP4_DEBUG_TRAP();
         }
-        constexpr int kTransposeTokens = 8;
-        constexpr int kTransposeDims = 8;
-        constexpr int kTokenGroups = kCutlassTileN / kTransposeTokens;
-        constexpr int kDimGroups = kCutlassTileN / kTransposeDims;
-        constexpr int kCoalescedDimGroups = 8;
-        static_assert(kDimGroups % kCoalescedDimGroups == 0);
-        constexpr int kDimBlocks = kDimGroups / kCoalescedDimGroups;
-        constexpr int kWarpTransposeGroups = kSm120Nvfp4FmhaLoadThreadCount / 8;
+        constexpr int kTokenQuad = 4;
+        constexpr int kPackedColsPerLaneGroup = 32;
+        constexpr int kTokenQuads = kCutlassTileN / kTokenQuad;
+        constexpr int kPackedCols = kCutlassTileN / 2;
+        constexpr int kDimBlocks = kPackedCols / kPackedColsPerLaneGroup;
+        constexpr int kLoadSubgroups = kSm120Nvfp4FmhaLoadThreadCount / 8;
+        static_assert(kCutlassTileN % kTokenQuad == 0);
+        static_assert(kPackedCols % kPackedColsPerLaneGroup == 0);
         const int load_subgroup = load_thread_idx >> 3;
-        const int subgroup = lane_idx >> 3;
-        const int subgroup_lane = lane_idx & 7;
-        const int subgroup_base_lane = lane_idx & ~7;
-        const unsigned subgroup_mask =
-            static_cast<unsigned>(0xffu << (subgroup * 8));
-        for (int tile = load_subgroup; tile < kTokenGroups * kDimBlocks;
-             tile += kWarpTransposeGroups) {
-          const int token_group = tile % kTokenGroups;
-          const int dim_block = tile / kTokenGroups;
-          const int local_k0 = token_group * kTransposeTokens;
-          const int local_dim_block0 =
-              dim_block * kCoalescedDimGroups * kTransposeDims;
-          const int local_dim0 = local_dim_block0 + subgroup_lane * kTransposeDims;
-          const int dim_base =
-              effective_out_group_idx * kCutlassTileN + local_dim0;
-          uint32_t row_words[kTransposeTokens] = {};
+        const int subgroup_lane = load_thread_idx & 7;
+        for (int tile = load_subgroup; tile < kTokenQuads * kDimBlocks;
+             tile += kLoadSubgroups) {
+          const int token_quad = tile % kTokenQuads;
+          const int dim_block = tile / kTokenQuads;
+          const int local_token_base = token_quad * kTokenQuad;
+          const int token_base = kv_tile * kCutlassTileN + local_token_base;
+          const int packed_col_local =
+              dim_block * kPackedColsPerLaneGroup + subgroup_lane * 4;
+          const int packed_col =
+              effective_out_group_idx * (kCutlassTileN / 2) +
+              packed_col_local;
+
+          uint32_t row_words[kTokenQuad] = {};
+          if (token_base < kv_len_tokens) {
+            const int local_page = local_token_base >> 4;
+            const int page_offset0 = local_token_base & 15;
+            const int physical_page = storage.physical_page_cache[local_page];
+            const int64_t data_page_base =
+                sm120_nvfp4_paged_v_data_page_base(
+                    paged_kv_params, effective_kv_head, physical_page);
 #pragma unroll
-          for (int token_offset = 0; token_offset < kTransposeTokens;
-               ++token_offset) {
-            const int local_token = local_k0 + token_offset;
-            const int token = kv_tile * kCutlassTileN + local_token;
-            if (token < kv_len_tokens) {
-              const int local_page = local_token >> 4;
-              const int page_offset = local_token & 15;
-              const int physical_page = storage.physical_page_cache[local_page];
-              const int64_t data_page_base =
-                  sm120_nvfp4_paged_v_data_page_base(
-                      paged_kv_params, effective_kv_head, physical_page);
-              row_words[token_offset] = sm120_nvfp4_paged_v_word_from_page_base(
-                  paged_kv_params, data_page_base, page_offset,
-                  dim_base >> 1);
+            for (int i = 0; i < kTokenQuad; ++i) {
+              const int token = token_base + i;
+              if (token < kv_len_tokens) {
+                row_words[i] = sm120_nvfp4_paged_v_word_from_page_base(
+                    paged_kv_params, data_page_base, page_offset0 + i,
+                    packed_col);
+              }
             }
           }
 
+          const int k_block = local_token_base >> 6;
+          const int token_quad_in_k_block = (local_token_base & 63) >> 2;
+          const int reg = token_quad_in_k_block >> 3;
+          const int lane_mod4 = (token_quad_in_k_block >> 1) & 3;
+          const int half = token_quad_in_k_block & 1;
+          const int raw_select = subgroup_lane & 3;
+          const int b128_col = packed_col_local >> 4;
+          const int logical_row =
+              k_block * 64 + reg * 32 + raw_select * 8 + lane_mod4 * 2 + half;
+          uint32_t packed_words[4];
 #pragma unroll
-          for (int store_group = 0; store_group < kCoalescedDimGroups;
-               ++store_group) {
+          for (int word_in_b128 = 0; word_in_b128 < 4; ++word_in_b128) {
             uint32_t packed_word = 0;
 #pragma unroll
-            for (int token_offset = 0; token_offset < kTransposeTokens;
-                 ++token_offset) {
-              const uint32_t peer_word =
-                  __shfl_sync(subgroup_mask, row_words[token_offset],
-                              subgroup_base_lane + store_group);
-              const uint8_t code = static_cast<uint8_t>(
-                  (peer_word >> (4 * subgroup_lane)) & 0x0f);
-              packed_word |=
-                  static_cast<uint32_t>(code) << (4 * token_offset);
+            for (int i = 0; i < kTokenQuad; ++i) {
+              const uint8_t pair = static_cast<uint8_t>(
+                  (row_words[i] >> (8 * word_in_b128)) & 0xffu);
+              packed_word |= static_cast<uint32_t>(pair & 0x0f) << (4 * i);
+              packed_word |= static_cast<uint32_t>((pair >> 4) & 0x0f)
+                             << (4 * (i + 4));
             }
-            const int local_col =
-                local_dim_block0 + store_group * kTransposeDims + subgroup_lane;
-            auto ref0 = pv_sB(local_col, local_k0, write_stage);
-            uint8_t* dst0 = cute::recast_ptr<uint8_t>(&ref0);
-            if ((reinterpret_cast<uintptr_t>(dst0) & 3u) != 0u) {
-              SM120_NVFP4_DEBUG_TRAP();
-            }
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-              auto ref = pv_sB(local_col, local_k0 + j, write_stage);
-              auto pair_ref =
-                  pv_sB(local_col, local_k0 + (j ^ 1), write_stage);
-              uint8_t* dst_byte = cute::recast_ptr<uint8_t>(&ref);
-              uint8_t* pair_byte = cute::recast_ptr<uint8_t>(&pair_ref);
-              if (dst_byte < dst0 || dst_byte >= dst0 + 4 ||
-                  pair_byte != dst_byte || int(dst_byte - dst0) != (j >> 1)) {
-                SM120_NVFP4_DEBUG_TRAP();
-              }
-            }
-            *reinterpret_cast<uint32_t*>(dst0) = packed_word;
+            packed_words[word_in_b128] = packed_word;
           }
+          const flashinfer::b128_t packed_b128{
+              packed_words[0], packed_words[1], packed_words[2],
+              packed_words[3]};
+          *sm120_nvfp4_d512_controlled_v_b128_ptr(
+              controlled_v_base, write_stage, logical_row, b128_col) =
+              packed_b128;
         }
       } else {
         if (paged_kv_params.v_stride_dim3 != 1 ||
@@ -1231,24 +1265,48 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       }
 
       if constexpr (kPvLayoutV) {
-        constexpr int kTokenScaleGroups = kCutlassTileN / 16;
-        for (int idx = load_thread_idx; idx < kCutlassTileN * kTokenScaleGroups;
+        constexpr int kScaleGroupsPerKBlock = 4;
+        constexpr int kScaleKBlocks = kCutlassTileN / 64;
+        constexpr int kScaleWordCols = kCutlassTileN / 4;
+        for (int idx = load_thread_idx;
+             idx < kScaleWordCols * kScaleKBlocks;
              idx += kSm120Nvfp4FmhaLoadThreadCount) {
-          const int token_group = idx / kCutlassTileN;
-          const int col = idx - token_group * kCutlassTileN;
-          const int k0 = token_group * 16;
-          const int token = kv_tile * kCutlassTileN + k0;
+          const int k_block = idx / kScaleWordCols;
+          const int col_word = idx - k_block * kScaleWordCols;
+          const int col = col_word * 4;
           const int dim = effective_out_group_idx * kCutlassTileN + col;
-          uint8_t scale = 0x38;
-          if (token < kv_len_tokens) {
-            const int local_page = k0 >> 4;
-            const int physical_page = storage.physical_page_cache[local_page];
-            scale = sm120_nvfp4_paged_v_pv_scale_from_physical_page_static<
-                kHeadDim / 16>(
-                paged_kv_params, effective_kv_head, physical_page, dim);
+          uint32_t scale_words[kScaleGroupsPerKBlock];
+#pragma unroll
+          for (int scale_idx = 0; scale_idx < kScaleGroupsPerKBlock;
+               ++scale_idx) {
+            const int token_group = k_block * kScaleGroupsPerKBlock + scale_idx;
+            const int k0 = token_group * 16;
+            const int token = kv_tile * kCutlassTileN + k0;
+            uint32_t scale_word = 0x38383838u;
+            if (token < kv_len_tokens) {
+              const int local_page = k0 >> 4;
+              const int physical_page = storage.physical_page_cache[local_page];
+              scale_word =
+                  sm120_nvfp4_paged_v_pv_scale_word_from_physical_page_static<
+                  kHeadDim / 16>(
+                  paged_kv_params, effective_kv_head, physical_page, dim);
+            }
+            scale_words[scale_idx] = scale_word;
           }
-          const uint8_t store_scale = token < kv_len_tokens ? scale : 0x38;
-          pv_sSFB(col, k0, write_stage) = make_ue4m3_raw(store_scale);
+#pragma unroll
+          for (int col_offset = 0; col_offset < 4; ++col_offset) {
+            uint32_t consumer_word = 0;
+#pragma unroll
+            for (int scale_idx = 0; scale_idx < kScaleGroupsPerKBlock;
+                 ++scale_idx) {
+              const uint8_t scale = static_cast<uint8_t>(
+                  (scale_words[scale_idx] >> (8 * col_offset)) & 0xffu);
+              consumer_word |= static_cast<uint32_t>(scale) << (8 * scale_idx);
+            }
+            *sm120_nvfp4_d512_controlled_v_scale_word_ptr(
+                controlled_v_scale_base, write_stage, k_block,
+                col + col_offset) = consumer_word;
+          }
         }
       }
     }
@@ -1493,6 +1551,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
   };
 
   auto load_v_group_span = [&](int kv_tile) {
+    if constexpr (kUsePagedKv) {
+      if (is_load) {
+        cache_paged_physical_pages(kv_tile);
+      }
+    }
 #pragma unroll
     for (int group_offset = 0; group_offset < kOutputGroupSpan;
          ++group_offset) {
@@ -1502,6 +1565,11 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
 
   auto load_v_group_range = [&](int kv_tile, int group_begin,
                                 int group_end) {
+    if constexpr (kUsePagedKv) {
+      if (is_load) {
+        cache_paged_physical_pages(kv_tile);
+      }
+    }
 #pragma unroll
     for (int group_offset = group_begin; group_offset < group_end;
          ++group_offset) {
@@ -1765,6 +1833,9 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
     auto pv_tCsSFB = pv_smem_thr_copy_SFB.partition_S(
         cute::as_position_independent_swizzle_tensor(pv_sSFB));
     auto pv_tCrSFB_copy_view = pv_smem_thr_copy_SFB.retile_D(v_scale_frag);
+    auto pv_cC = cute::make_identity_tensor(
+        cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
+    auto pv_tCcC = pv_thread_mma.partition_C(pv_cC);
 
     auto pv_consume_v_stage = [&]() {
       auto pv_K_BLOCK_MAX = cute::size<2>(v_frag);
@@ -1773,16 +1844,20 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       auto pv_tCsSFB_stage = pv_tCsSFB(_, _, _, read_stage);
 
       v_pipeline.consumer_wait(v_pipe_read);
-      cute::for_each(cute::make_int_sequence<pv_K_BLOCK_MAX>{},
-                     [&](auto k_block) {
-        cute::copy(pv_smem_tiled_copy_B, pv_tCsB_stage(_, _, k_block),
-                   pv_tCrB_copy_view(_, _, k_block));
-        using MMAOp =
-            typename CutlassCollectiveMainloopK128Stage2::TiledMma::MMA_Op;
-        fp4_shift_B(MMAOp{}, pv_tCrB_copy_view(_, _, k_block));
-        cute::copy(pv_tCsSFB_stage(_, _, k_block),
-                   pv_tCrSFB_copy_view(_, _, k_block));
-      });
+      if constexpr (kUsePagedKv && kPvLayoutV) {
+        (void)pv_K_BLOCK_MAX;
+      } else {
+        cute::for_each(cute::make_int_sequence<pv_K_BLOCK_MAX>{},
+                       [&](auto k_block) {
+          cute::copy(pv_smem_tiled_copy_B, pv_tCsB_stage(_, _, k_block),
+                     pv_tCrB_copy_view(_, _, k_block));
+          using MMAOp =
+              typename CutlassCollectiveMainloopK128Stage2::TiledMma::MMA_Op;
+          fp4_shift_B(MMAOp{}, pv_tCrB_copy_view(_, _, k_block));
+          cute::copy(pv_tCsSFB_stage(_, _, k_block),
+                     pv_tCrSFB_copy_view(_, _, k_block));
+        });
+      }
 
     };
 
@@ -1840,12 +1915,20 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       auto pv_K_BLOCK_MAX = cute::size<2>(pv_tCrA);
       cute::for_each(cute::make_int_sequence<pv_K_BLOCK_MAX>{},
                      [&](auto k_block) {
-        cute::gemm(pv_tiled_mma,
-                   cute::make_zip_tensor(pv_tCrA(_, _, k_block),
-                                          pv_tCrSFA(_, _, k_block)),
-                   cute::make_zip_tensor(v_frag(_, _, k_block),
-                                          v_scale_frag(_, _, k_block)),
-                   accum);
+        if constexpr (kUsePagedKv && kPvLayoutV) {
+          sm120_nvfp4_d512_pv_gemm_controlled_v(
+              accum, pv_tCrA(_, _, k_block), pv_tCrSFA(_, _, k_block),
+              pv_tCcC, controlled_v_base, controlled_v_scale_base,
+              v_pipe_read.index(), int(k_block),
+              int(cute::get<0>(pv_thread_mma.thr_vmnk_)));
+        } else {
+          cute::gemm(pv_tiled_mma,
+                     cute::make_zip_tensor(pv_tCrA(_, _, k_block),
+                                            pv_tCrSFA(_, _, k_block)),
+                     cute::make_zip_tensor(v_frag(_, _, k_block),
+                                            v_scale_frag(_, _, k_block)),
+                     accum);
+        }
       });
     };
 
@@ -1860,9 +1943,6 @@ void sm120_nvfp4_qkv_online_register_q_stage_kernel(
       pv_gemm_loaded_p(accum, pv_tCrA, pv_tCrSFA);
     };
 
-    auto pv_cC = cute::make_identity_tensor(
-        cute::take<0, 2>(CutlassThreadBlockShapeK128{}));
-    auto pv_tCcC = pv_thread_mma.partition_C(pv_cC);
     static_assert(kCutlassTileN == 128,
                   "D512 MMA-owned softmax currently assumes 128 score columns");
     static_assert(kSoftmaxThreadsPerRow == 1 ||
@@ -2346,6 +2426,9 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
                                                : 1);
   const bool use_linear_v_cache =
       kUsePagedKv && !kPvLayoutV && effective_q_tiles_per_sequence > 1;
+  const bool use_controlled_pv_cache =
+      kUsePagedKv && kPvLayoutV &&
+      effective_q_tiles_per_sequence >= kD512ControlledPVCacheQTileThreshold;
   const size_t linear_scale_cache_offset =
       align_workspace(base_required_workspace_bytes);
   const size_t linear_scale_cache_bytes =
@@ -2360,8 +2443,22 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
           ? sm120_nvfp4_linear_v_data_cache_bytes(batch_size, num_kv_heads,
                                                   head_dim, kv_len)
           : 0;
+  const size_t controlled_pv_scale_cache_offset =
+      align_workspace(linear_data_cache_offset + linear_data_cache_bytes);
+  const size_t controlled_pv_scale_cache_bytes =
+      use_controlled_pv_cache
+          ? sm120_nvfp4_d512_controlled_pv_scale_cache_bytes(
+                batch_size, num_kv_heads, total_kv_tiles)
+          : 0;
+  const size_t controlled_pv_data_cache_offset = align_workspace(
+      controlled_pv_scale_cache_offset + controlled_pv_scale_cache_bytes);
+  const size_t controlled_pv_data_cache_bytes =
+      use_controlled_pv_cache
+          ? sm120_nvfp4_d512_controlled_pv_data_cache_bytes(
+                batch_size, num_kv_heads, total_kv_tiles)
+          : 0;
   const size_t required_workspace_bytes =
-      linear_data_cache_offset + linear_data_cache_bytes;
+      controlled_pv_data_cache_offset + controlled_pv_data_cache_bytes;
   if (workspace_bytes < required_workspace_bytes) {
     return cudaErrorInvalidValue;
   }
@@ -2416,6 +2513,21 @@ cudaError_t sm120_nvfp4_qkv_online_register_q_splitkv_full_grid_raw(
           num_kv_heads, head_dim, kv_len, stream);
       if (data_cache_status != cudaSuccess) {
         return data_cache_status;
+      }
+    }
+  }
+  if constexpr (kUsePagedKv && kPvLayoutV) {
+    if (use_controlled_pv_cache) {
+      uint8_t* controlled_pv_scale_cache = reinterpret_cast<uint8_t*>(
+          workspace_base + controlled_pv_scale_cache_offset);
+      uint8_t* controlled_pv_data_cache = reinterpret_cast<uint8_t*>(
+          workspace_base + controlled_pv_data_cache_offset);
+      auto cache_status = sm120_nvfp4_d512_prepare_controlled_pv_cache(
+          paged_kv_params, controlled_pv_data_cache, controlled_pv_scale_cache,
+          kv_lens, batch_size, num_kv_heads, total_kv_tiles, kv_len_tokens,
+          stream);
+      if (cache_status != cudaSuccess) {
+        return cache_status;
       }
     }
   }

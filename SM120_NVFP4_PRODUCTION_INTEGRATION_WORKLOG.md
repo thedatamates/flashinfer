@@ -8632,3 +8632,1376 @@ Profiler-driven interpretation:
 Decision:
 
 - Commit and push this D512 checkpoint. It satisfies the current D512 done bar: tests pass without tolerance changes and all target cells beat the recorded current D512 architecture.
+
+## 2026-05-05 07:52 CDT - D512 Controlled-Smem Rewrite Start
+
+Checkpoint:
+
+- Resuming from pushed clean checkpoint `542e4253e14d32dd187af7fe8ec4eda77e85e1a8` on `flashinfer-nvfp4-kv-prbranches`.
+- Current D512 architecture is the comparison baseline, not the end state. It still uses CUTLASS operand smem/fragments for PV and the CUTE GEMM consumer path.
+- Baseline D512 target cells recorded at the checkpoint:
+  - `q=512 kv=65536 g=8 softcap=30`: dense `5.177760 ms`, paged-PV `5.508128 ms`, paged-linear `6.331648 ms`.
+  - `q=16384 kv=262144 g=8 softcap=30`: dense `622.200562 ms`, paged-PV `721.551331 ms`, paged-linear `687.420898 ms`.
+
+Reference audit:
+
+- `include/flashinfer/permuted_smem.cuh:60-180` owns the controlled-smem pattern: `smem_t<SwizzleMode::k128B>` computes permuted offsets, exposes `ldmatrix_m8n8x4*`, and provides `load_64b_async` / `load_128b_async` primitives. This is the layout-control piece missing from the current SM120 D512 path.
+- `include/flashinfer/attention/prefill.cuh:1594-1616` owns the controlled V fragment pattern: `make_v_frag_fp4` reads arbitrary `(k, col)` from controlled smem, recomputes/scales values, and packs them with `mma::float8_to_e2m1x8`.
+- `include/flashinfer/attention/prefill.cuh:1670-1695` owns the direct blockscaled MMA issue pattern: build scale registers, build two B fragments, then call `mma::mma_sync_m16n16k64_row_col_f4f4f32` directly rather than routing through a CUTLASS collective operand-smem copy.
+- `csrc/fmha_v2/fmha/fragment.h:1015-1033` shows the same SM120 direct atom structure through `Mma_atom::fma`, using explicit A/B fragment registers and two B-scale halves.
+- `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1700-1818` shows the V producer shape to preserve: PV layout and reblocked layout are separate paths, scale writes happen before data use, and the producer writes into a controlled tile abstraction rather than CUTLASS operand smem.
+
+Implementation target:
+
+- First rewrite slice is D512 PV only. The target seam in `fmha_nvfp4_sm120_d512.cuh` is the PV V consumer path: `pv_sB` / `pv_sSFB` staging, `pv_smem_tiled_copy_B` / `pv_smem_tiled_copy_SFB`, and `pv_gemm_loaded_p`'s `cute::gemm` call.
+- Bring the direct-MMA issue path up first while still feeding current fragments, then move V/V-scale storage from CUTLASS operand smem into controlled smem. This gives a compile/correctness checkpoint before changing both fragment issue and storage at once.
+- Dense TMA and paged cp.async producers stay in scope after the PV fragment path is correct; both must target the same controlled V smem layout so paged and dense use the same consumer.
+
+Done bar:
+
+- D512 correctness passes without tolerance relaxation at each committed milestone.
+- The final D512 rewrite beats the current architecture at both D512 target cells above, especially `q=16384 kv=262144`, where the current paged-PV gap to dense is still about `15.96%`.
+- NCU/NSYS must drive optimization decisions after the first correctness milestone; no hypothesis-only microtuning.
+
+## 2026-05-05 08:00 CDT - D512 Direct Atom Seam Check
+
+Finding:
+
+- Replaced the D512 PV consumer's tiled `cute::gemm` call with an explicit SM120 atom loop over the already-loaded P and V fragments. Storage and fragment-copy paths were unchanged.
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 113.09s`.
+- The seam patch is not independently shippable. It is useful as a development boundary for replacing the V storage/fragment path, but the timing is mixed.
+
+Measurements:
+
+| cell | checkpoint dense | checkpoint paged-PV | direct-atom paged-PV | checkpoint paged-linear | direct-atom paged-linear |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `D512 g8 q512 kv65536 softcap30` | `5.177760 ms` | `5.508128 ms` | `5.534310 ms` | `6.331648 ms` | `6.423507 ms` |
+| `D512 g8 q16384 kv262144 softcap30` | `622.200562 ms` | `721.551331 ms` | `715.708923 ms` | `687.420898 ms` | `695.720540 ms` |
+
+Decision:
+
+- Keep the direct atom loop only as an uncommitted rewrite scaffold while moving V/V-scale storage to a controlled layout. Do not commit this seam patch unless the completed controlled-smem rewrite beats the checkpoint target cells.
+- Next patch target is the paged-PV V storage path: reuse `storage.v_smem_B` / `storage.v_smem_SFB` as controlled storage rather than adding smem. This avoids the D512 smem-budget wall while replacing the CUTLASS operand-layout dependency.
+
+## 2026-05-05 08:18 CDT - D512 Controlled PV Scalar Fragment Result
+
+Finding:
+
+- Implemented the first controlled-smem D512 paged-PV slice using the existing `v_smem_B` allocation as a 64B-row controlled tile. This avoided adding shared memory and removed the load-warp PV transpose into CUTLASS operand layout.
+- Correctness passed after mapping B registers from the actual CUTE SM120 `BLayout`, not the FA2 lane mapping. CUTE layout probe result: lane `0` maps to `n=0,k=0..7,32..39`; lane `1` maps to `n=0,k=8..15,40..47`; etc. The earlier FA2 mapping was wrong for this CUTE atom.
+- The consumer implementation built B fragments with scalar smem reads plus FP32/E2M1 re-encoding. That is correct but catastrophically slow.
+
+Measurement:
+
+| cell | checkpoint paged-PV | controlled scalar-frag paged-PV | checkpoint paged-linear | current paged-linear |
+| --- | ---: | ---: | ---: | ---: |
+| `D512 g8 q512 kv65536 softcap30` | `5.508128 ms` | `175.318475 ms` | `6.331648 ms` | `6.307482 ms` |
+
+Decision:
+
+- Do not commit the scalar-fragment controlled-smem path. It proves correctness and the CUTE BLayout mapping, but it is not the architecture that can beat the checkpoint.
+- The next controlled-smem attempt must use the FA2-style `ldmatrix_m8n8x4_trans*` fragment path from controlled smem, not scalar per-value reads. The performance bug is now specifically the scalar fragment construction, not the producer or smem budget.
+
+## 2026-05-05 08:50 CDT - D512 Lineinfo NCU Scheduling Probe Target
+
+Profiler setup:
+
+- Built the D512 paged-PV and dense Gemma-global spec in an isolated lineinfo cache with `FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_lineinfo_sm120` and `FLASHINFER_EXTRA_CUDAFLAGS=--generate-line-info`.
+- Profiled `D512 g8 q=16384 kv=262144 softcap=30` with NCU `SourceCounters` and `PmSampling_WarpStates`.
+- Paged-PV report: `/tmp/sm120_d512_largeq_paged_pv_lineinfo.ncu-rep`, measured `732.970764 ms` inside the profile.
+- Dense report: `/tmp/sm120_d512_largeq_dense_lineinfo.ncu-rep`, measured `619.505676 ms` inside the profile.
+
+Finding:
+
+- Paged-PV has `268.44 MB` global excessive sectors and `5,036,867,584` shared excessive wavefronts.
+- Dense has `0` global excessive sectors and `3,426,254,848` shared excessive wavefronts.
+- Paged-PV warp stalls are split between barrier and long scoreboard: not-issued barrier `5,681,814`, not-issued long scoreboard `5,639,864`.
+- Dense is dominated by long scoreboard in the MMA/consumer path: not-issued long scoreboard `18,116,395`, not-issued barrier `2,523,961`.
+- The largest D512 paged-only source line is `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512.cuh:1459`, `load_group_sync()` immediately after `v_pipeline.producer_acquire(v_pipe_write)`, with all samples `4,945,109` and not-issued samples `4,316,816`.
+- The hottest D512 producer instructions remaining are not enough to explain the full paged gap by themselves: PV V shuffle/pack lines still appear (`d512.cuh:1063`, `:1066`, `:1068`), but their source samples are much smaller than the V pipeline wait site.
+
+Interpretation:
+
+- The current D512 paged gap is not localized to scalar V data producer code anymore. The top source line is the load role waiting at the V pipeline boundary while the MMA side consumes V stages and performs the CUTE/CUTLASS fragment path.
+- A controlled-smem scalar-fragment rewrite already proved correctness but moved the kernel to `175 ms` at the moderate cell, so fragment replacement without vectorized/ldmatrix construction is the wrong next move.
+- The next low-code, profiler-gated probe is scheduling geometry: `kOutputGroupSpan=4` drains four V stages sequentially per QK tile. If the NCU wait site is caused by V-stage pressure or poor overlap, changing output group span should move the target-cell timing before any deeper rewrite is attempted.
+
+Measurement target:
+
+- Benchmark D512 `output_group_span={1,2,4}` for `q=512 kv=65536` and `q=16384 kv=262144`, both paged-PV and paged-linear, with `g=8 softcap=30`.
+- Keep this as a measurement-only probe first. If `span=1` or `span=2` materially beats the current default `span=4` on the large-Q target without hurting the moderate target, change the D512 default/heuristic and then run correctness.
+- If all spans are neutral or worse, do not tune this knob further; return to NCU source attribution on the controlled-smem vectorized fragment path.
+
+## 2026-05-05 09:08 CDT - D512 Span/Split Probe Result and QK Mask Fast Path Target
+
+Span probe result:
+
+| cell | layout | span 1 min ms | span 2 min ms | span 4 min ms |
+| --- | ---: | ---: | ---: | ---: |
+| `D512 g8 q512 kv65536 softcap30` | paged-PV | `10.538144` | `7.226816` | `5.514368` |
+| `D512 g8 q512 kv65536 softcap30` | paged-linear | `11.521696` | `7.949536` | `6.321888` |
+| `D512 g8 q16384 kv262144 softcap30` | paged-PV | `1380.216431` | `887.424683` | `732.225037` |
+| `D512 g8 q16384 kv262144 softcap30` | paged-linear | `1378.630981` | `865.840393` | `711.380554` |
+
+Decision:
+
+- `kOutputGroupSpan=4` remains the correct D512 geometry. The V pipeline wait site is not fixed by reducing output-group span.
+- Added a D512 compile-time span macro with default `4` to enable this probe. Default production behavior is unchanged.
+
+Split probe result at `D512 g8 q16384 kv262144 softcap30`, span `4`:
+
+| split_kv_len | dense min ms | paged-PV min ms | paged-linear min ms |
+| ---: | ---: | ---: | ---: |
+| `12288` | `630.604309` | `722.352051` | `683.019531` |
+| `24576` | `616.418152` | `714.211487` | `692.277100` |
+| `37504` | `627.074890` | `726.560059` | `704.569092` |
+| `65536` | `638.505127` | `737.268616` | `702.063416` |
+| `131072` | `641.553162` | `751.433655` | `711.817627` |
+| `262144` | `653.461243` | `771.513977` | `721.730042` |
+
+Decision:
+
+- Split length has a real but modest effect; it does not explain the remaining D512 paged gap.
+- `24576` is best for paged-PV in this run, while `12288` is the best paged-linear minimum but noisy. Do not change production split heuristics from this single probe.
+
+Next target:
+
+- NCU source attribution still names `d512.cuh:2132` (`transform_score(qk_accum(i) * qk_scale, row, col, tile)`) as a large QK/logits instruction site.
+- For large-Q causal full-attention, most KV tiles are prefix tiles where every row/column in the score tile is valid. The current path still performs per-element row-to-token divmod, causal/window/bounds checks, and then softcap.
+- Implement a D512-only full-score-tile fast path: precompute whether a QK score tile is fully valid, then bypass `score_is_valid` inside the accumulator loop for those tiles. The fallback path remains unchanged for tail, causal boundary, padding, and sliding-window tiles.
+
+Done criteria:
+
+- D512 correctness passes without tolerance relaxation.
+- Target-cell timing improves or stays neutral for both paged-PV and paged-linear at `q512/kv65536` and `q16384/kv262144`.
+- If timing regresses, revert the fast path and return to NCU source attribution.
+
+Result:
+
+- Correctness passed before timing: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 112.45s`.
+- Timing regressed and the patch was reverted:
+  - `q512 kv65536` paged-PV `5.645376 ms`, paged-linear `6.646880 ms`.
+  - `q16384 kv262144` paged-PV `801.058838 ms`, paged-linear `747.240967 ms`.
+- The fast path likely increased register pressure / branch footprint enough to outweigh removing per-element validity checks.
+
+Decision:
+
+- Do not keep the QK mask fast path.
+- The next D512 target is the PV-vs-linear asymmetry at large Q: the linear-V path uses an internal logical-token V data cache for `q_tiles_per_sequence > 1`, while PV still stages from the paged block table in every CTA.
+
+## 2026-05-05 09:15 CDT - D512 Large-Q PV V Data Cache Target
+
+Finding:
+
+- At `D512 g8 q16384 kv262144 softcap30`, paged-linear is faster than paged-PV despite the linear path having more semantic work:
+  - Default split run: paged-PV `726.560059 ms`, paged-linear `704.569092 ms`.
+  - Checkpoint baseline: paged-PV `721.551331 ms`, paged-linear `687.420898 ms`.
+- The linear path enables `use_linear_v_cache` when `!kPvLayoutV && effective_q_tiles_per_sequence > 1`.
+- That cache materializes V data in logical-token order once per wrapper call, then the stage kernel reads from contiguous workspace instead of walking the paged block table for every Q tile.
+- PV layout does not currently have the equivalent cache path, so every D512 paged-PV CTA still repeats block-table and paged-stride work for V data.
+
+Implementation target:
+
+- Add an internal PV V data cache prepass for D512 large-Q only.
+- Reuse the existing `v_linear_data_cache` pointer/stride fields as a generic logical-token V data cache inside the kernel ABI. No public tensor shape, layout name, or FFI signature changes.
+- Cache threshold: only enable for `kPvLayoutV && effective_q_tiles_per_sequence >= 256`, so the moderate `q512` target stays on the existing direct-paged path and avoids an extra prepass.
+- In the D512 PV producer, if the cache pointer is present, load row words from the logical-token cache and keep the existing transpose/store into CUTLASS operand smem.
+
+Done criteria:
+
+- D512 correctness passes without tolerance relaxation.
+- `q16384 kv262144` paged-PV improves materially.
+- `q512 kv65536` paged-PV/linear stay neutral because the cache threshold should leave them unchanged.
+- If this regresses large-Q or fails correctness, revert and return to controlled-smem vectorized fragment work.
+
+## 2026-05-05 09:26 CDT - Rewrite Plan Correction
+
+Correction:
+
+- The uncommitted PV V data-cache source changes were an incremental producer/cache experiment, not the requested controlled-smem rewrite.
+- Those source changes were removed before commit. The working tree source is back to checkpoint `542e4253e14d32dd187af7fe8ec4eda77e85e1a8`; only append-only worklog entries remain.
+- The useful measurement from that off-plan experiment is not a deliverable for the rewrite plan: a logical-token PV data cache improved D512 max-Q paged-PV (`699.582153 ms` in one run) but still kept the CUTLASS operand-smem and CUTE fragment path. That does not satisfy the architecture requirement.
+
+Rewrite target restated:
+
+- Implement the D512 rewrite path that actually replaces the CUTLASS PV operand-smem dependency:
+  - controlled PV V smem layout owned by this kernel;
+  - vectorized `ldmatrix`/FA2-style fragment construction from that smem;
+  - direct SM120 blockscaled MMA issue;
+  - dense TMA and paged cp.async producers feeding the same controlled layout.
+- Do not commit incremental producer/cache-only changes as the rewrite.
+
+Immediate next step:
+
+- Add D512 controlled-smem scaffolding and a compile-visible, disabled-by-default PV consumer path so the rewrite has real source structure in-tree.
+- Then replace the D512 PV path behind that scaffold with vectorized fragment construction. Scalar fragment construction is already ruled out by the `175.318475 ms` result.
+
+## 2026-05-05 09:29 CDT - D512 Controlled-Smem Implementation Target
+
+Checkpoint:
+
+- Source is at `542e4253e14d32dd187af7fe8ec4eda77e85e1a8` plus append-only worklog entries.
+- No active benchmark/profile/build processes are running.
+- The target baselines remain:
+  - `D512 g8 q512 kv65536 softcap30`: dense `5.177760 ms`, paged-PV `5.508128 ms`, paged-linear `6.331648 ms`.
+  - `D512 g8 q16384 kv262144 softcap30`: dense `622.200562 ms`, paged-PV `721.551331 ms`, paged-linear `687.420898 ms`.
+
+Reference pattern:
+
+- `include/flashinfer/permuted_smem.cuh:60-180` provides the controlled shared-memory primitive: `smem_t<SwizzleMode::k128B>`, `ldmatrix_m8n8x4_trans`, and `load_64b_async/load_128b_async`.
+- `include/flashinfer/attention/prefill.cuh:1765-1800` shows FA2 loading V fragments from owned permuted smem via `ldmatrix_m8n8x4_trans*` instead of CUTLASS `SmemCopyAtomB`.
+- `include/flashinfer/mma.cuh:392-421` and `csrc/fmha_v2/fmha/fragment.h:1015-1033` show direct issue of the SM120 blockscaled FP4 MMA atom.
+- Existing D512 PV insertion points are `fmha_nvfp4_sm120_d512.cuh:1451-1493` for V production and `1769-1850` for V consumption / MMA.
+
+Implementation target:
+
+- Add a real D512 controlled-smem helper header for PV V staging and fragment construction.
+- Use the existing `storage.v_smem_B` backing bytes at first, so the scaffold does not increase the 99 KiB shared-memory budget.
+- Replace the D512 PV V consumer with a controlled-smem path that can load B fragments through `ldmatrix` and issue direct blockscaled MMA, while keeping the old CUTLASS path as the immediate fallback during bring-up.
+- Keep P-side softmax staging, output-group-span reuse, split-KV combine, wrapper, scheduler, and FFI unchanged.
+
+Done criteria:
+
+- The source tree contains a real controlled-smem D512 path with `smem_t<SwizzleMode::k128B>` and `ldmatrix` use; no more worklog-only architecture.
+- D512 correctness passes without tolerance relaxation before any performance claim.
+- The final committed path must beat the checkpoint paged-PV numbers at both target cells before push.
+
+## 2026-05-05 09:55 CDT - D512 Controlled PV Scalar Seam Result
+
+Finding:
+
+- The first controlled-smem D512 PV path is now source-visible in `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_d512_controlled_pv.cuh` and wired into `fmha_nvfp4_sm120_d512.cuh`.
+- The PV V producer writes row-major controlled V data into the existing `storage.v_smem_B` backing bytes, and the PV consumer issues the SM120 blockscaled atom directly instead of calling `cute::gemm`.
+- A failed intermediate version also wrote a flat controlled scale buffer over the same backing storage as `pv_sSFB`; removing that overlapping scale write restored correctness.
+- Correctness gate: `tests/attention/test_nvfp4_kv_head_dim_512.py` passed `36 passed in 135.39s` with no tolerance changes.
+
+Measurement:
+
+- `D512 g8 q512 kv65536 softcap30 paged-PV`, `output_group_span=4`, `split_kv_len=24576`: `106.307744 ms`.
+- Checkpoint same cell paged-PV: `5.508128 ms`.
+
+Decision:
+
+- Keep the scalar controlled path only as the correctness oracle for the rewrite seam.
+- Do not ship this path as-is; it proves the direct atom and controlled staging can be made correct, but scalar B-register reconstruction is roughly `19x` slower than the current CUTLASS path at the moderate target cell.
+- Next step is mandatory: replace the scalar controlled B-register reconstruction with the FA2-style `ldmatrix` fragment path and compare the resulting B registers against the scalar mapping.
+
+## 2026-05-05 10:22 CDT - D512 Controlled PV Ldmatrix Result and Smem Wall
+
+Finding:
+
+- A temporary one-warp probe derived an exact ldmatrix gather formula for the row-major controlled V layout.
+- The formula matched the scalar B-register oracle for all `16` output-dim atoms, both `k_block` values, both B registers, and all `32` lanes.
+- Correctness gate with the ldmatrix gather path: `tests/attention/test_nvfp4_kv_head_dim_512.py` passed `36 passed in 148.57s`.
+
+Measurement:
+
+- `D512 g8 q512 kv65536 softcap30 paged-PV`, `output_group_span=4`, `split_kv_len=24576`: `15.396710 ms`.
+- Scalar controlled path at the same cell: `106.307744 ms`.
+- Checkpoint CUTLASS path at the same cell: `5.508128 ms`.
+
+Interpretation:
+
+- Vectorized ldmatrix construction removes the scalar smem-read cliff but still loses to the current CUTLASS path because the row-major controlled layout needs a cross-lane gather: two transposed ldmatrix loads plus uniform shuffles to assemble the two SM120 B registers.
+- A no-shuffle prelayout was derived: the producer can write complete packed words so `raw[(atom_col0 >> 3) & 3]` is directly the B register.
+- That no-shuffle prelayout needs `192` logical rows per controlled V stage (`12 KiB/stage`, `24 KiB` for two stages), while the existing D512 Q/K/V storage is already at the `99 KiB` opt-in shared-memory ceiling. The variant correctly failed the `sizeof(Sm120Nvfp4QkvLoadCollectiveStorage) <= 99 KiB` static assertion and was backed out.
+
+Decision:
+
+- Keep the correct ldmatrix-gather path as the active rewrite prototype for profiling.
+- Do not pursue the 192-row no-shuffle layout unless another smem region is structurally removed or aliased safely; it is not a legal drop-in replacement inside the current D512 storage budget.
+- Next hypothesis must come from NCU on the ldmatrix-gather path, not from another storage-layout guess.
+
+## 2026-05-05 10:28 CDT - D512 Controlled PV Fragment-Reuse Target
+
+Finding:
+
+- NCU on the D512 controlled ldmatrix path at `q512 kv65536` reports the dominant stalls as barrier and long-scoreboard rather than raw global-memory bandwidth.
+- The active ldmatrix path still reconstructs controlled V B registers inside every `pv_gemm_loaded_p` use, while the original CUTLASS path copies V once in `pv_consume_v_stage` and then reuses `v_frag` across P stages.
+- That means the rewrite is paying ldmatrix plus shuffle gather repeatedly at the GEMM call site instead of preserving the original consumer contract: load V fragments once per V stage, reuse them for each output-group span.
+
+Implementation target:
+
+- Move controlled V B-fragment construction into `pv_consume_v_stage`.
+- Fill the existing `v_frag` register tensor with the ldmatrix-gathered controlled V registers after `v_pipeline.consumer_wait`.
+- Change the controlled direct-MMA helper to consume `v_frag` directly, matching the old CUTLASS fragment lifetime.
+
+Validation:
+
+- First gate is `tests/attention/test_nvfp4_kv_head_dim_512.py` with no tolerance changes.
+- Then bench `D512 g8 q512 kv65536 softcap30 paged-PV` against the controlled ldmatrix baseline `15.396710 ms` and checkpoint `5.508128 ms`.
+- If this improves, profile again before the next structural change; if it regresses or fails correctness, revert only this fragment-reuse edit.
+
+Result:
+
+- Correctness gate passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 136.97s`.
+- Measurement regressed: `D512 g8 q512 kv65536 softcap30 paged-PV` measured `16.331341 ms`.
+- This is slower than the prior controlled ldmatrix path (`15.396710 ms`) and still slower than the checkpoint CUTLASS path (`5.508128 ms`).
+- Decision: revert the fragment-reuse call-site change. The result indicates the old per-use helper is not the dominant source of the controlled-path gap, or that keeping B registers live across the consumer boundary increases register pressure enough to lose more than it saves.
+
+## 2026-05-05 10:52 CDT - D512 Controlled PV 128-Row No-Shuffle Target
+
+Finding:
+
+- The earlier no-shuffle prelayout was recorded as requiring `192` logical rows and therefore failing the D512 shared-memory budget.
+- A direct inverse-map probe of `smem_t<SwizzleMode::k64B>::ldmatrix_m8n8x4_trans` found a tighter 128-row prelayout:
+  - for each B atom, `raw[(atom_col0 >> 3) & 3]` can be made equal to the exact SM120 B register;
+  - the load row is `k_block * 64 + reg * 32 + (lane & 15) + 16 * (lane >> 4)`;
+  - the producer writes each target word at `k_block * 64 + reg * 32 + 8 * raw_select + 2 * (lane & 3) + half`.
+- Temporary CUDA validation for all `16` atoms, both `k_block` values, both B regs, and all `32` lanes reported `errors=0`.
+- Storage audit shows the 128-row no-shuffle layout is `8 KiB/stage`, `16 KiB` for two stages, exactly the current `v_smem_B` allocation. No new shared memory is required.
+
+Implementation target:
+
+- Replace the D512 controlled PV row-major V producer with the 128-row no-shuffle prelayout.
+- Replace the controlled V ldmatrix gather helper with direct `raw[raw_select]` extraction and no cross-lane shuffles.
+- Keep the existing `pv_sSFB` scale staging for this slice so the change isolates V data layout and B-register construction.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 `q512 kv65536` and `q16384 kv262144` paged-PV against the controlled ldmatrix path and checkpoint CUTLASS path.
+- Keep only if correctness passes and target-cell timing improves materially; otherwise revert this no-shuffle slice and keep the mapping probe as a negative/blocked result.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 112.79s`.
+- `D512 g8 q512 kv65536 softcap30 paged-PV`: `10.242912 ms` min.
+- `D512 g8 q16384 kv262144 softcap30 paged-PV`: `918.579834 ms` min.
+- This improves the controlled rewrite versus the row-major ldmatrix-gather path (`15.396710 ms` at q512, `1191.858032 ms` at q16384) but still loses to the current checkpoint CUTLASS architecture (`5.508128 ms` and `721.551331 ms`).
+- Decision: the no-shuffle mapping is correct and removes the explicit shuffle-gather cost, but the rewrite still does not meet the D512 done bar. The next action is NCU on this no-shuffle path to identify whether the remaining loss is producer load shape, direct-MMA issue/local memory, or pipeline/barrier behavior.
+
+## 2026-05-05 10:57 CDT - D512 Controlled PV Producer Load Reshape Target
+
+Finding:
+
+- NCU lineinfo on the D512 controlled no-shuffle path at `q512 kv65536 g8 softcap30` localizes the largest remaining producer-side issue to V data loads, not the controlled ldmatrix consumer.
+- SourceCounters reports `52.43 MB` global excessive sectors; the top source line is `include/flashinfer/attention/blackwell/fmha_nvfp4_sm120_paged_kv.cuh:740` (`return params.v_pages[src];`) with `50,331,648` excessive sectors.
+- That line is reached by the controlled no-shuffle producer's `sm120_nvfp4_paged_v_code_pair_from_page_base` loop at `fmha_nvfp4_sm120_d512.cuh:1059-1069`.
+- The current no-shuffle producer assigns one thread per controlled output word and loads four strided V bytes across four tokens. This is correct, but it destroys the coalesced dim-contiguous load pattern that the previous PV producer had.
+
+Implementation target:
+
+- Keep the 128-row no-shuffle controlled smem layout and the direct ldmatrix consumer.
+- Replace the PV controlled producer loop with an 8-lane subgroup producer:
+  - each subgroup owns one four-token block and one 32-packed-column dim block;
+  - for each token in the four-token block, lanes load adjacent 32-bit dim-contiguous words using `sm120_nvfp4_paged_v_word_from_page_base`;
+  - each lane packs four no-shuffle output words from those row words and writes them to the same controlled smem coordinates the current scalar byte loop writes.
+- This preserves the no-shuffle consumer contract while changing the NCU-hot producer load primitive from four scalar byte loads per output word to coalesced 32-bit row loads.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 `q512 kv65536` and `q16384 kv262144` paged-PV against the no-shuffle baseline (`10.242912 ms`, `918.579834 ms`) and checkpoint CUTLASS baseline (`5.508128 ms`, `721.551331 ms`).
+- If timing improves materially, rerun NCU SourceCounters to confirm the `paged_kv.cuh:740` excessive-sector source drops. If correctness fails or timing regresses, revert only this producer reshape and keep the no-shuffle consumer result as the current rewrite checkpoint.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 112.44s`.
+- The first benchmark launch accidentally overlapped the two target cells and was discarded; the valid sequential measurements are:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `9.126016 ms` min.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `900.843689 ms` min.
+- This is a real improvement over the controlled no-shuffle producer baseline (`10.242912 ms`, `918.579834 ms`) but still misses the checkpoint CUTLASS architecture (`5.508128 ms`, `721.551331 ms`).
+
+Decision:
+
+- Keep this producer reshape as the current controlled rewrite checkpoint because it removes part of the NCU-confirmed scalar byte-load issue and preserves correctness.
+- It is not shippable: the D512 rewrite still has to beat the current architecture at both target cells.
+- Next action is another NCU SourceCounters + WarpStateStats pass on the reshaped path to identify the largest remaining source. Do not add more layout changes by inspection.
+
+## 2026-05-05 11:04 CDT - D512 Controlled PV 128-Bit Store Target
+
+Finding:
+
+- NCU after the coalesced producer reshape confirms the intended global-load fix:
+  - global excessive sectors dropped from approximately `52.43 MB` to approximately `2.10 MB`;
+  - `paged_kv.cuh:740` is no longer the dominant source;
+  - the remaining V data load source is the expected 32-bit row-word path at `paged_kv.cuh:753`.
+- The new top controlled-path shared-memory source is `fmha_nvfp4_sm120_d512.cuh:1088`, the controlled V producer store:
+  - `12,582,912` shared excessive wavefronts are charged to four adjacent 32-bit stores per lane/tile;
+  - the four words are exactly one controlled-smem `b128_t` cell because `word_in_b128 = 0..3` and `b128_col` is fixed.
+
+Implementation target:
+
+- Keep the coalesced row-word global loads and no-shuffle consumer.
+- Pack the four `word_in_b128` outputs into one `flashinfer::b128_t` and issue one 128-bit shared store per lane/tile.
+- This should reduce shared-store instruction count and wavefront waste at the NCU-hot controlled V store line without changing the smem layout or MMA consumer.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 `q512 kv65536` and `q16384 kv262144` paged-PV.
+- If timing improves, rerun NCU to verify the controlled V store line drops; if it regresses, revert only this 128-bit store slice.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 111.86s`.
+- `D512 g8 q512 kv65536 softcap30 paged-PV`: `9.075616 ms` min.
+- `D512 g8 q16384 kv262144 softcap30 paged-PV`: `899.858398 ms` min.
+
+Decision:
+
+- Keep as a small controlled-path cleanup: it is correct and mildly improves both target cells versus the coalesced producer (`9.126016 ms`, `900.843689 ms`).
+- It does not close the architecture gap. The controlled rewrite still loses to checkpoint CUTLASS at both target cells.
+- Next action is another NCU pass after the 128-bit store to identify the remaining dominant source. Do not infer from the prior profile because the top shared-store line changed.
+
+## 2026-05-05 11:11 CDT - D512 No-Shuffle Fragment-Reuse Retry Target
+
+Finding:
+
+- NCU after the 128-bit store shows the shared-store counter did not materially move: `L1 Wavefronts Shared Excessive` remains about `52,515,840`.
+- Global excessive sectors remain low at about `2.10 MB`, so V global load shape is no longer the dominant producer issue.
+- The largest controlled-rewrite-specific instruction source left in the consumer is `fmha_nvfp4_sm120_d512_controlled_pv.cuh:139` (`b[reg] = raw[raw_select]`) with `25,704,704` executed instructions.
+- The earlier fragment-reuse experiment was run before the 128-row no-shuffle layout. At that time B construction still used the row-major ldmatrix gather path. The no-shuffle path has lower B construction overhead and should be retested rather than assuming the old negative result still applies.
+
+Implementation target:
+
+- In the D512 controlled PV path, construct `v_frag` once inside `pv_consume_v_stage` using `sm120_nvfp4_d512_fill_controlled_v_fragment`.
+- Change the direct MMA call to consume the populated `v_frag` through `sm120_nvfp4_d512_pv_gemm_controlled_v_fragment`.
+- Keep the no-shuffle producer and 128-bit controlled V stores unchanged.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 `q512 kv65536` and `q16384 kv262144` paged-PV.
+- Keep only if timing improves; if it regresses again, revert this fragment-reuse retry and treat repeated B construction as not the dominant wall for the no-shuffle path.
+
+Result:
+
+- Initial attempt exposed a rank mismatch in the fragment helper call for the SWA/softcap D512 PV spec; fixing the call to pass the full `v_frag` restored compilation.
+- Correctness then passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 111.71s`.
+- Timing regressed:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `9.262496 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `928.954346 ms`.
+- The previous controlled checkpoint was `9.075616 ms` and `899.858398 ms`.
+
+Decision:
+
+- Reverted the fragment-reuse retry. Reconstructing B registers at the direct-MMA use site is cheaper than keeping the populated `v_frag` live across the consumer boundary for this no-shuffle path.
+- Do not revisit fragment reuse without a new NCU source attribution that specifically changes this conclusion.
+
+## 2026-05-05 11:20 CDT - D512 Controlled PV Direct Page Lookup Target
+
+Finding:
+
+- After the coalesced producer and 128-bit store, the largest not-issued and all-sample stall source is still attributed to `fmha_nvfp4_sm120_d512.cuh:793`, the shared physical-page-cache fill inside `cache_paged_physical_pages`.
+- The controlled PV V producer no longer needs the shared page cache for complicated scalar per-codepoint walks; each V data tile touches one page per four-token block and the PV scale loop touches one page per 16-token scale group.
+- The cache fill uses only eight load threads and then forces the full load warpgroup through a named barrier. NCU says that barrier path is now more suspicious than global V load coalescing.
+
+Implementation target:
+
+- For `kPvLayoutV`, skip `cache_paged_physical_pages(kv_tile)` inside `stage_paged_v_tile`.
+- In the controlled PV V data producer, compute `logical_page = kv_tile * (kCutlassTileN / 16) + local_page` and read `effective_block_table[logical_page]` directly.
+- In the PV V scale loop, use the same direct logical-page lookup.
+- Leave K staging and linear-V staging on the shared page cache. This isolates the experiment to the controlled PV V stage.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 `q512 kv65536` and `q16384 kv262144` paged-PV.
+- Keep only if timing improves; if extra block-table reads beat the barrier in counters but not in wall time, revert.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 111.89s`.
+- Timing regressed slightly:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `9.083872 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `901.921875 ms`.
+- Previous controlled checkpoint: `9.075616 ms` and `899.858398 ms`.
+
+Decision:
+
+- Reverted the direct V-page lookup slice.
+- The NCU attribution to the page-cache barrier is real, but replacing the V-stage shared cache with redundant block-table loads is not a wall-time win. Keep the shared physical-page cache unless a later rewrite removes the barrier without multiplying block-table traffic.
+
+## 2026-05-05 11:28 CDT - D512 Controlled PV k128B Swizzle Target
+
+Finding:
+
+- A checkpoint-vs-controlled NCU comparison on the same q512 PV cell shows global excessive sectors are equal at about `2.10 MB`.
+- The controlled rewrite adds a shared-memory source absent from checkpoint:
+  - controlled: `L1 Wavefronts Shared Excessive = 52,515,840`;
+  - checkpoint: `L1 Wavefronts Shared Excessive = 39,932,928`;
+  - the delta is the controlled V smem store at `fmha_nvfp4_sm120_d512.cuh:1094`, charged with `12,582,912` excessive wavefronts.
+- The controlled V smem wrapper currently uses `smem_t<SwizzleMode::k64B>`.
+- A temporary CUDA validation of the 128-row no-shuffle mapping with `smem_t<SwizzleMode::k128B>` reported `errors=0`; the same logical row/column mapping still reconstructs the exact B registers via `ldmatrix_m8n8x4_trans`.
+
+Implementation target:
+
+- Switch `D512ControlledVSmem` from `SwizzleMode::k64B` to `SwizzleMode::k128B`.
+- Keep the no-shuffle producer coordinates, 128-bit store, and direct ldmatrix consumer unchanged.
+- This isolates the shared-memory swizzle as the variable and directly targets the NCU-only shared wavefront delta versus checkpoint.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 `q512 kv65536` and `q16384 kv262144` paged-PV.
+- If timing improves, rerun NCU and compare the controlled V store wavefront source against the checkpoint profile.
+
+Result:
+
+- The isolated temporary CUDA mapping probe passed with `SwizzleMode::k128B`, but the live D512 kernel failed correctness:
+  - `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `3 failed, 33 passed`;
+  - failures were PV-layout D512 cases with non-finite output.
+- This means the one-warp mapping probe did not cover a live-kernel condition, likely multi-warp write interaction, pipeline-stage aliasing, or another consumer assumption coupled to the `k64B` layout.
+
+Decision:
+
+- Reverted `D512ControlledVSmem` back to `SwizzleMode::k64B`.
+- Do not use `k128B` for the controlled D512 V tile without a stronger diagnostic that dumps live-kernel controlled smem before the ldmatrix read. The probe alone is insufficient evidence.
+
+## 2026-05-05 11:40 CDT - D512 Controlled PV Stmatrix Producer Target
+
+Checkpoint:
+
+- Active source is still an uncommitted D512 controlled-smem PV prototype on top of checkpoint `542e4253e14d32dd187af7fe8ec4eda77e85e1a8`.
+- The current controlled prototype is correct but slower than checkpoint:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: controlled `9.075616 ms` to `9.066880 ms` in recent runs; checkpoint isolated-cache rerun `7.966336 ms` and original worklog checkpoint `5.508128 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: controlled `899.858398 ms`; checkpoint isolated-cache rerun `715.838135 ms` and original worklog checkpoint `721.551331 ms`.
+- Do not commit this controlled state unless the final path beats the checkpoint at both target cells.
+
+Reference audit:
+
+- `include/flashinfer/permuted_smem.cuh:142-149` exposes the controlled-smem matrix-store/load pair:
+  `stmatrix_m8n8x4(offset, R)` writes a warp fragment into owned permuted smem, and `ldmatrix_m8n8x4_trans(offset, raw)` reads the B-side fragment back.
+- `include/flashinfer/attention/prefill.cuh:1765-1800` uses the same controlled-smem contract in the consumer: V fragments are loaded from `smem_t` via `ldmatrix_m8n8x4_trans*`, then consumed by direct MMA issue.
+- A temporary D512 probe at `/tmp/sm120_stmatrix_inverse_test.cu` verified the exact inverse relation for the current `SwizzleMode::k64B` no-shuffle layout: each lane's `stmatrix_m8n8x4` registers are recovered byte-exactly by the current `ldmatrix_m8n8x4_trans` helper.
+
+NCU-driven finding:
+
+- After coalesced global V loads and 128-bit stores, checkpoint and controlled q512 profiles have equal global excessive sectors (`~2.10 MB`).
+- The controlled-only delta is shared-memory traffic:
+  - checkpoint `L1 Wavefronts Shared Excessive = 39,932,928`;
+  - controlled `L1 Wavefronts Shared Excessive = 52,515,840`;
+  - the delta is the controlled V smem materialization line in `fmha_nvfp4_sm120_d512.cuh`.
+- The 128-bit ordinary store did not materially reduce this source. The next structural producer target is therefore the store primitive and fragment layout, not another global-load reshape.
+
+Implementation target:
+
+- Replace the D512 controlled PV producer's manual `b128_t` stores with a warp-level `stmatrix_m8n8x4` producer.
+- For each `(k_block, reg, b128_col)` tile, the warp loads the same coalesced dim-contiguous row words from paged V, uses warp shuffles to assemble each lane's four matrix-store registers, then calls `D512ControlledVSmem::stmatrix_m8n8x4` at the same row/column offset consumed by `ldmatrix_m8n8x4_trans`.
+- Keep the controlled consumer, scale path, pipeline, wrapper, FFI, and public API unchanged. This isolates the NCU-hot controlled V smem materialization.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark `D512 g8 q512 kv65536 softcap30 paged-PV` and `D512 g8 q16384 kv262144 softcap30 paged-PV`.
+- If timing improves materially, rerun NCU and verify the controlled V smem store wavefront source drops. If correctness fails or timing regresses, revert the stmatrix producer and keep this as a negative result.
+
+Result:
+
+- The first stmatrix attempt failed correctness when paired with `ldmatrix_m8n8x4_trans`; `test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x[512-4]` produced finite output but mean PV-vs-linear drift `0.0123` versus the `2e-3` bound.
+- A standalone probe showed the cause: `stmatrix_m8n8x4` is inverse to non-transposed `ldmatrix_m8n8x4`, not `ldmatrix_m8n8x4_trans`.
+- Switching the controlled consumer to non-transposed `ldmatrix_m8n8x4` restored correctness: `tests/attention/test_nvfp4_kv_head_dim_512.py` passed `36 passed in 121.06s`.
+- Timing regressed at both target cells:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `11.069248 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `969.421448 ms`.
+- Previous controlled checkpoint was about `9.07 ms` and `899.86 ms`; checkpoint architecture remains faster.
+
+Decision:
+
+- Reverted the stmatrix producer and non-transposed consumer load.
+- Do not use `stmatrix` for the D512 controlled PV path unless a future NCU/source pass specifically shows that the added warp-shuffle assembly and non-transposed consumer can beat the current b128-store/no-shuffle layout. This attempt made the store primitive more canonical but increased wall time.
+
+## 2026-05-05 11:52 CDT - D512 Controlled PV Half-Ldmatrix Consumer Target
+
+Finding:
+
+- After the stmatrix negative result, the active controlled path is back to the correct no-shuffle `k64B` layout with coalesced row loads and 128-bit stores.
+- NCU on that path still reports a controlled-consumer source at `fmha_nvfp4_sm120_d512_controlled_pv.cuh` where the helper loads four raw B registers with `ldmatrix_m8n8x4_trans` and then uses only one selected register for the current `atom_col0`.
+- FA2's controlled-smem FP4 consumer avoids this shape: `include/flashinfer/attention/prefill.cuh:1765-1768` selects `ldmatrix_m8n8x4_trans_left_half` or `ldmatrix_m8n8x4_trans_right_half` based on the MMA-D parity.
+
+Implementation target:
+
+- Change the D512 controlled PV B-register helper to issue a half ldmatrix load:
+  - `raw_select < 2` uses `ldmatrix_m8n8x4_trans_left_half` and selects `raw[0/1]`;
+  - `raw_select >= 2` uses `ldmatrix_m8n8x4_trans_right_half` and selects `raw[0/1]`.
+- Keep the producer, no-shuffle layout, direct MMA issue, and scale path unchanged.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark the two D512 paged-PV target cells.
+- Keep only if wall time improves; otherwise revert this helper change and record the negative result.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 115.18s`.
+- Timing improved versus the prior controlled checkpoint but still loses to checkpoint D512 architecture:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `8.206400 ms` versus prior controlled `~9.07 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `796.669922 ms` versus prior controlled `899.858398 ms`.
+- Checkpoint architecture remains faster at both target cells (`7.966336 ms` isolated-cache q512 rerun / `715.838135 ms` isolated-cache q16k rerun; original worklog checkpoint `5.508128 ms` / `721.551331 ms`).
+
+Decision:
+
+- Keep the half-ldmatrix helper in the active rewrite prototype because it is a large controlled-path improvement and matches the FA2 fragment-load pattern.
+- This is not commit-ready. The next step is NCU source attribution on the half-ldmatrix controlled path at q512 and q16k to find the remaining controlled-only delta.
+
+## 2026-05-05 12:00 CDT - D512 V Page-Cache Hoist Target
+
+Finding:
+
+- NCU on the half-ldmatrix controlled path at `D512 g8 q512 kv65536 softcap30 paged-PV` reports the largest not-issued stall at `fmha_nvfp4_sm120_d512.cuh:793`, the physical-page-cache fill branch inside `cache_paged_physical_pages`.
+- `stage_paged_v_tile` calls `cache_paged_physical_pages(kv_tile)` for every `effective_out_group_idx`.
+- `load_v_group_span` then calls `load_v_chunk` four times for the same `kv_tile` (`kOutputGroupSpan=4`), so V staging refills the same eight page indices and synchronizes the load group four times per V group span.
+- The previous direct-page-lookup experiment removed the cache but multiplied block-table reads and regressed. This target keeps the cache but hoists it to the shared V group boundary.
+
+Implementation target:
+
+- Remove the page-cache fill from `stage_paged_v_tile`.
+- In D512 `load_v_group_span` and `load_v_group_range`, have load-role threads call `cache_paged_physical_pages(kv_tile)` once before the group loop.
+- Leave `stage_paged_k_tile` unchanged because K still needs its own page cache before K staging.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 q512 and q16k paged-PV. Also spot-check paged-linear because this hoist affects both V layouts.
+- Keep only if correctness passes and target timing improves or remains neutral.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 117.26s`.
+- Timing is a small controlled-path win:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `8.173568 ms` versus half-ldmatrix `8.206400 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `795.646851 ms` versus half-ldmatrix `796.669922 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-linear` spot check: `701.512756 ms`.
+- This confirms the repeated V page-cache barrier was real but not the dominant remaining wall-time gap.
+
+Decision:
+
+- Keep the V page-cache hoist in the active prototype because it is correct and slightly positive.
+- This still does not beat checkpoint. Continue with NCU/source attribution rather than committing.
+
+## 2026-05-05 12:08 CDT - D512 Controlled PV Producer Loop-Unroll Target
+
+Finding:
+
+- Large-Q NCU on the half-ldmatrix + V-page-hoist prototype reports the largest not-issued source at `fmha_nvfp4_sm120_d512.cuh:1036`, the controlled PV producer loop header.
+- For D512 PV, the loop bounds are static: `kTokenQuads * kDimBlocks = 64` and `kLoadSubgroups = 32`, so each load subgroup executes exactly two tiles.
+- Leaving this as `for (int tile = load_subgroup; tile < 64; tile += 32)` creates a hot branch/BSSY source in the producer at the production-weighted q16k cell.
+
+Implementation target:
+
+- Replace the runtime tile loop with `kTilesPerLoadSubgroup = 2` and a fully unrolled fixed-iteration loop.
+- Keep tile ownership and all producer math identical.
+- This isolates loop-control overhead at the current top NCU source.
+
+Validation:
+
+- Run D512 correctness without tolerance changes.
+- Benchmark q512 and q16k paged-PV.
+- Keep only if timing improves or stays neutral.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 115.79s`.
+- Timing did not improve:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `8.196768 ms`, effectively neutral versus `8.173568 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `799.280701 ms`, worse than `795.646851 ms`.
+
+Decision:
+
+- Reverted the fixed two-iteration producer-loop rewrite.
+- The NCU loop-header attribution was a symptom of the producer body/reconvergence, not a loop-control issue that improves with source-level unrolling.
+
+## 2026-05-05 12:16 CDT - D512 Controlled PV Direct Scale Target
+
+Finding:
+
+- Large-Q NCU on the active controlled prototype reports `fmha_nvfp4_sm120_d512.cuh:1256` as a major shared-memory source: `805,306,368` shared excessive wavefronts and about `1.20M` not-issued stall samples.
+- That line writes PV scales into the CUTLASS SFB smem layout even though the D512 controlled PV data path no longer uses CUTLASS B operand smem.
+- The controlled consumer then copies SFB through `pv_smem_tiled_copy_SFB` solely to recover one packed scale register for the direct MMA call.
+
+Implementation target:
+
+- Stage PV V scales into the existing `storage.v_smem_SFB` backing bytes as a flat controlled scale tile: `[stage][token_scale_group][col]`.
+- Skip the CUTLASS SFB smem-to-register copy for `kUsePagedKv && kPvLayoutV`.
+- Pack the B scale register directly inside `sm120_nvfp4_d512_pv_gemm_controlled_v` from the flat controlled scale tile.
+- Keep the non-controlled and linear-V paths on the existing CUTLASS SFB path.
+
+Validation:
+
+- Run D512 correctness without tolerance changes.
+- Benchmark q512 and q16k paged-PV.
+- Keep only if correctness passes and target timing improves.
+
+Result:
+
+- The first direct-scale mapping was wrong and failed correctness: it packed four N-column scales for one K group, producing PV-vs-linear mean drift `0.0033` versus the `2e-3` bound.
+- Corrected mapping packs the four K-scale groups for the lane's B column:
+  - `scale_col = atom_col0 + (mma_lane >> 2)`;
+  - `scale_k_group = k_block * 4 + scale_idx`.
+- Correctness passed with the corrected mapping: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 119.54s`.
+- Timing improved:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `7.975616 ms` versus page-hoist controlled `8.173568 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `766.029724 ms` versus page-hoist controlled `795.646851 ms`.
+- This is the first controlled-scale path that is correct and materially positive, but it still trails the checkpoint architecture (`~7.97 ms` isolated q512, `715.84 ms` isolated q16k; original checkpoint `5.508128 ms`, `721.551331 ms`).
+
+Decision:
+
+- Keep the direct controlled scale path in the active rewrite prototype.
+- Continue profiling; the remaining large-Q gap is now about `50 ms` versus the isolated checkpoint and still must close before commit.
+
+## 2026-05-05 12:24 CDT - D512 Controlled PV Logical-Token Cache Target
+
+Finding:
+
+- The current controlled PV rewrite is correctness-clean but not commit-ready: `D512 g8 q512 kv65536 softcap30 paged-PV`
+  is `7.975616 ms`, and `D512 g8 q16384 kv262144 softcap30 paged-PV` is `766.029724 ms`.
+- The isolated checkpoint architecture remains faster at the large-Q target (`715.838135 ms`), while q512 is effectively
+  tied in this cache/environment (`7.966336 ms` checkpoint versus `7.975616 ms` controlled).
+- NCU after direct controlled scale removed the SFB copy as a major wall, but the largest remaining controlled-only source
+  is V materialization: controlled V b128 stores plus the surrounding V-stage load pipeline dominate the large-Q gap.
+- Large-Q repeats the same logical V cache across many Q tiles. Rewalking `block_table` and physical-page layout inside
+  every V stage is avoidable internal producer work; it is not part of the public API contract.
+
+Reference pattern:
+
+- `fmha_v2` paged loading builds per-row pointers once and then stages rows through a controlled smem tile:
+  `gmem_tile_qkv_packed.h:1280-1302` computes `local_kv_ptr` from the paged block table and then calls
+  `Ldgsts_helper<USE_LDGSTS>::load(...)`.
+- Hopper sparse precomputes page offsets before cooperative gather loads:
+  `sparse_mainloop.cuh:299-333` stores `my_kv_offset[parity]`, then `load_kv_with_gather` shuffles the offset to the
+  load lane and issues vector cp.async.
+- The existing SM120 linear-V cache already proves this wrapper/kernel can spend workspace to canonicalize paged V once
+  per run for large-Q reuse without changing tensor shapes or FFI signatures.
+
+Implementation target:
+
+- Add an internal D512 PV V cache in `fmha_nvfp4_sm120_paged_kv.cuh` that copies paged PV V data from physical-page order
+  into logical-token contiguous order: `[batch][kv_head][token][packed_col]`.
+- Add an internal D512 PV scale cache with logical scale rows: `[batch][kv_head][token_group][dim]`.
+- Enable these caches only for `kUsePagedKv && kPvLayoutV` and large-Q (`effective_q_tiles_per_sequence >= 64`) so q512
+  stays on the direct producer path unless profiling later shows the cache helps it too.
+- Teach the controlled D512 PV producer to read from the logical caches when present, then write the same controlled smem
+  layout and direct scale tile as today.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 paged-PV at q512/kv65536 and q16384/kv262144.
+- Keep only if q16k beats the isolated checkpoint large-Q number without a q512 regression; otherwise revert this cache
+  experiment and continue from the direct-scale controlled path.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 302.92s`.
+- Timing did not meet the keep criterion:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `7.995200 ms`, effectively unchanged versus direct-scale controlled
+    `7.975616 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `763.158752 ms`, only a small improvement versus direct-scale
+    controlled `766.029724 ms` and still behind the isolated checkpoint `715.838135 ms`.
+- NCU report: `/tmp/sm120_d512_controlled_pvcache_q16384_lineinfo.ncu-rep`.
+- NCU still reports the same dominant controlled source: the controlled V b128 materialization line has
+  `1,610,612,736` shared excessive wavefronts. The logical-token cache removes some page-layout work but does not address
+  the smem materialization/write pattern that now dominates.
+
+Decision:
+
+- Revert the PV logical-token cache experiment. It is correct but too small and adds prep work/state without reaching the
+  done bar.
+- Continue from the direct-scale controlled path. The next optimization must target the controlled V materialization/store
+  path or a larger architecture change, not page-cache canonicalization.
+
+## 2026-05-05 12:41 CDT - D512 Controlled PV Scale Word-Store Target
+
+Finding:
+
+- After reverting the logical-token cache experiment, the active controlled path is again direct-scale controlled PV.
+- Current NCU still reports the controlled V b128 data store as the largest controlled-only shared-memory source, but the
+  PV scale producer remains a high instruction/stall source after data materialization:
+  - `fmha_nvfp4_sm120_d512.cuh:1275` carries about `1.5B` executed instructions and `~0.89M` not-issued stall samples in
+    the q16k profile.
+- The direct-scale tile layout is flat `[stage][token_group][col]`, so four adjacent columns are contiguous and
+  4-byte-aligned.
+- PV input scales are also contiguous for four adjacent columns within a scale row when `col % 4 == 0`; D512's scale row
+  length is `32`, so a 4-byte word does not cross scale rows.
+
+Implementation target:
+
+- Add a PV scale-word helper that loads four PV scale bytes from the physical page with one `uint32_t` load.
+- Replace the D512 PV controlled scale producer's byte loop with a word loop over `kCutlassTileN / 4` columns per
+  token-scale group.
+- Store the scale word directly into the controlled scale tile with one 32-bit shared store.
+- Keep the direct controlled scale consumer unchanged so this isolates scale producer traffic.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 paged-PV q512/kv65536 and q16384/kv262144.
+- Keep only if timing improves or remains neutral at q512 and improves large-Q; otherwise revert this word-store slice.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 303.89s`.
+- Timing improved slightly:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `7.938976 ms` versus direct-scale controlled `7.975616 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `760.993530 ms` versus direct-scale controlled `766.029724 ms`.
+- This confirms the scale byte loop was real overhead, but the improvement is small. The controlled rewrite still trails
+  the isolated checkpoint large-Q target (`715.838135 ms`).
+
+Decision:
+
+- Keep the scale word-load/store slice in the active rewrite prototype.
+- Continue profiling. The remaining gap is not in PV scale byte staging anymore; it is still dominated by controlled V
+  data materialization and pipeline stalls.
+
+## 2026-05-05 12:51 CDT - D512 Controlled PV Pack Helper Target
+
+Finding:
+
+- NCU after the scale word-store slice still shows the dominant controlled data materialization source at the b128 store
+  line, but the immediately preceding nibble-pack line is also hot:
+  - `fmha_nvfp4_sm120_d512.cuh:1086` has about `5.9B` executed instructions and `~1.48M` not-issued samples.
+- The current producer builds `uint32_t packed_words[4]` with a nested loop over four b128 words and four token rows,
+  then copies the local array into a `b128_t`.
+- The local array is not part of the layout invariant; it is just a staging artifact. The four packed words can be named
+  registers produced by a force-inlined helper.
+
+Implementation target:
+
+- Add `sm120_nvfp4_d512_pack_token_quad_word(...)` to the controlled D512 helper header.
+- Replace the nested `packed_words[4]` loop with four direct helper calls and construct the `b128_t` from named registers.
+- Keep the no-shuffle controlled layout, global load mapping, and direct MMA consumer unchanged.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 q512/q16k paged-PV.
+- Keep only if timing improves or remains neutral; revert if the explicit helper bloats instructions or hurts scheduling.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 117.99s`.
+- Timing regressed:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `8.062464 ms`, worse than scale-word checkpoint `7.938976 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `769.687195 ms`, worse than scale-word checkpoint `760.993530 ms`.
+
+Decision:
+
+- Revert the explicit pack-helper slice. The original nested loop schedules better despite looking less direct in source.
+- Continue from the scale-word checkpoint.
+
+## 2026-05-05 12:57 CDT - D512 Controlled PV B128 Global Load Broadcast Target
+
+Finding:
+
+- NCU after the scale-word slice still charges the controlled producer for both V data load scoreboard and V data
+  materialization.
+- Within each 8-lane subgroup, for a fixed token row the current producer issues eight adjacent 32-bit global loads
+  (`packed_col = base + lane * 4`).
+- Those eight words are two contiguous 16-byte spans. The alignment invariant is under our control for D512 PV:
+  `packed_col` for owner lanes `0` and `4` is 16-byte aligned and `v_stride_dim3 == 1`.
+
+Implementation target:
+
+- Add a paged V `b128` row-load helper.
+- In the D512 controlled PV producer, have subgroup lanes `0` and `4` load the two 16-byte spans for each token row.
+- Broadcast the four words from each owner lane to the corresponding four lanes with `__shfl_sync`.
+- Keep the controlled smem layout, scale word-store, and direct MMA consumer unchanged.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 q512/q16k paged-PV.
+- Keep only if wall time improves; if shuffle overhead exceeds global-load savings, revert this slice.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 292.06s`.
+- Timing regressed:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `8.676608 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `806.114441 ms`.
+- Previous scale-word checkpoint was `7.938976 ms` and `760.993530 ms`.
+
+Decision:
+
+- Revert the b128 global-load broadcast slice. The owner-lane loads reduce global load instruction count, but the subgroup
+  shuffle fanout is more expensive for this producer.
+- Continue from the scale-word checkpoint.
+
+## 2026-05-05 13:10 CDT - D512 Controlled PV Store-Coalesced Producer Target
+
+Finding:
+
+- The active controlled PV rewrite is correctness-clean at the scale-word checkpoint but still misses the D512 large-Q done
+  bar: `D512 g8 q16384 kv262144 softcap30 paged-PV` is `760.993530 ms` versus the isolated checkpoint architecture at
+  `715.838135 ms`.
+- NCU SourceCounters on `/tmp/sm120_d512_controlled_scaleword_q16384_lineinfo.ncu-rep` still identifies controlled V
+  materialization as the largest rewrite-only shared-memory source:
+  - `fmha_nvfp4_sm120_d512.cuh:1094` (`*sm120_nvfp4_d512_controlled_v_b128_ptr(...) = packed_b128`) reports
+    `1,610,612,736` `L1 Wavefronts Shared Excessive`.
+  - The neighboring pack line remains a top long-scoreboard source, but the explicit pack-helper slice regressed, so the
+    next variable is the store lane mapping rather than the scalar expression shape.
+- The current producer maps each 8-lane subgroup to one token-quad and eight strided controlled-smem destinations. That
+  keeps the source-row load shape simple but writes b128 cells with rows spaced by the ldmatrix-transpose row mapping.
+
+Reference pattern:
+
+- `permuted_smem.cuh:74-82` makes the controlled-smem offset an explicit `(row, b128_col)` function. We can therefore
+  choose a producer lane mapping independent of CUTE's original partition layout as long as the final `(row, b128_col)`
+  contents match the half-ldmatrix consumer.
+- The current half-ldmatrix consumer reads rows
+  `k_block * 64 + 32 * reg + (lane & 15) + 16 * (lane >> 4)` and selects `raw[(atom_col0 >> 3) & 3]`. Inverting the
+  current no-shuffle producer mapping gives a direct row-to-token-quad relation:
+  `row_in_reg = raw_select * 8 + token_quad_in_reg`.
+
+Implementation target:
+
+- Replace the D512 controlled PV producer's 8-lane subgroup store mapping with a warp-level store-coalesced mapping.
+- Each load warp handles one `(row_block_32, b128_col)` group at a time; lane `0..31` writes one contiguous controlled-smem
+  row for that group.
+- For each row, derive `(k_block, reg, raw_select, token_quad)` from the row index, load the same four token rows and four
+  packed-column words as the current producer, and write the same `b128_t` payload to the same controlled-smem cell.
+- Keep the scale word-store, half-ldmatrix consumer, direct MMA helper, and public wrapper/API unchanged.
+
+Validation:
+
+- Run `tests/attention/test_nvfp4_kv_head_dim_512.py` without tolerance changes.
+- Benchmark D512 paged-PV at `q512 kv65536` and `q16384 kv262144`.
+- Keep only if q16k improves materially without a q512 regression; otherwise revert this lane-mapping slice and continue
+  from the scale-word checkpoint.
+
+Result:
+
+- Correctness failed, so no benchmark was run.
+- `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `35 passed, 1 failed in 297.39s`.
+- Failing test: `test_sm120_nvfp4_backend_accepts_normal_v_layout_sm12x[512-4]`.
+- Failure mode: finite output but PV-vs-linear mean drift `0.0097`, above the `2e-3` bound.
+
+Decision:
+
+- Reverted the store-coalesced lane-mapping slice.
+- The row inverse used for the warp-level store is not equivalent to the current half-ldmatrix/transposed consumer mapping
+  under live-kernel fragment coordinates. Do not retry this by inspection; a future attempt needs a live controlled-smem
+  dump or an inverse-mapping probe tied to the actual `pv_tCcC` coordinates.
+- Continue from the scale-word checkpoint.
+
+## 2026-05-05 13:18 CDT - D512 Output-Group Rescale Fusion Target
+
+Finding:
+
+- After V materialization, the next largest source-level long-scoreboard site in
+  `/tmp/sm120_d512_controlled_scaleword_q16384_lineinfo.ncu-rep` is the PV accumulator rescale:
+  - `fmha_nvfp4_sm120_d512.cuh:2232` reports `2,065,605` not-issued samples and `7,153,664,000` instructions.
+  - It is the top `stall_long_sb (Not Issued)` site at `1,875,363` samples.
+- D512/g8 target cells instantiate `kOutputGroupSpan == 4`. The current nonfinal path calls `rescale_pv_accum(...)`
+  separately for `pv_accum0`, `pv_accum1`, `pv_accum2`, and `pv_accum3`.
+- Those four calls walk the same `pv_tCcC` coordinate tensor and read the same `old_scale_stage` row values. The four
+  accumulator multiplications are required, but the coordinate decode and old-scale lookup can be shared.
+
+Implementation target:
+
+- Add a `kOutputGroupSpan == 4` grouped rescale path in `run_pv_tile_group_nonfinal`.
+- For `tile == 0`, clear all four accumulators in one coordinate walk.
+- For `tile > 0`, walk `pv_tCcC` once, cache `old_scale_stage[tile & 1][row]` once per row transition, and multiply all
+  four PV accumulators for that fragment index.
+- Keep final-tile output handling unchanged because each final accumulator has its own epilogue/output pipeline handoff.
+
+Validation:
+
+- Run D512 correctness without tolerance changes.
+- Benchmark D512 paged-PV q512/kv65536 and q16384/kv262144.
+- Keep only if large-Q improves without a q512 regression; otherwise revert the grouped-rescale slice.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 118.12s`.
+- Timing regressed badly:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `9.089920 ms` versus scale-word checkpoint `7.938976 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `981.493225 ms` versus scale-word checkpoint `760.993530 ms`.
+
+Decision:
+
+- Reverted the grouped-rescale slice.
+- The separate per-output-group rescale calls are not just duplicate work; their placement before each `pv_consume_v_stage`
+  preserves pipeline overlap between V-stage readiness and MMA work. Moving all four rescale walks before the first V
+  consume increases wait time enough to dominate the saved coordinate decode.
+- Continue from the scale-word checkpoint.
+
+## 2026-05-05 13:24 CDT - D512 Controlled PV Consumer-Contiguous Scale Tile Target
+
+Finding:
+
+- The scale-word producer slice made PV scale staging cheap, but the controlled direct-MMA helper still consumes scales in
+  the producer-oriented flat layout.
+- NCU on `/tmp/sm120_d512_controlled_scaleword_q16384_lineinfo.ncu-rep` reports
+  `fmha_nvfp4_sm120_d512_controlled_pv.cuh:200` as a large controlled-specific instruction source:
+  - `3,891,142,656` instructions executed.
+  - `253,474` `stall_long_sb (Not Issued)` samples.
+- The current helper loads four scale bytes at fixed `col` and consecutive K-scale groups from addresses separated by the
+  full `kCutlassTileN` row stride, then packs them.
+- The consumer wants `[k_block][col][scale_idx=0..3]` contiguous. The producer can transpose each 4x4 scale block once per
+  V stage while preserving the same global PV scale word loads.
+
+Implementation target:
+
+- Change the controlled PV scale tile physical layout from `[token_group][col]` to `[k_block][col][scale_idx]`.
+- Add a controlled-scale word pointer that returns the four K-scale bytes for `(k_block, col)` as one `uint32_t`.
+- Rewrite the PV scale producer to load four adjacent-column scale words for `scale_idx=0..3`, transpose the 4x4 byte
+  block in registers, and store four consumer-contiguous `uint32_t` words.
+- Replace the direct-MMA helper's four strided byte loads and `pack_e4m3_scale_reg` call with one `uint32_t` load.
+
+Validation:
+
+- Run D512 correctness without tolerance changes.
+- Benchmark D512 paged-PV q512/kv65536 and q16384/kv262144.
+- Keep only if target-cell timing improves or stays neutral; otherwise revert the scale-layout transpose.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 117.78s`.
+- Timing improved:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `7.798560 ms` versus scale-word checkpoint `7.938976 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `732.299622 ms` versus scale-word checkpoint `760.993530 ms`.
+- This closes most of the controlled-rewrite gap but still misses the checkpoint architecture at large-Q:
+  - isolated checkpoint rerun: `715.838135 ms`;
+  - original recorded checkpoint: `721.551331 ms`.
+
+Decision:
+
+- Keep the consumer-contiguous scale tile in the active rewrite prototype.
+- The remaining large-Q gap is now about `16-17 ms`; rerun NCU on the active state before choosing the next code slice,
+  because the controlled scale consumer source should have moved.
+
+## 2026-05-05 13:32 CDT - D512 Controlled PV Inline Token-Quad Pack Target
+
+Finding:
+
+- After the consumer-contiguous scale tile, the controlled scale load site moved; the next controlled producer source still
+  visible in NCU is the token-quad data pack:
+  - `fmha_nvfp4_sm120_d512.cuh:1086` reports `1,341,431` not-issued samples and `1,316,584`
+    `stall_long_sb (Not Issued)` samples in `/tmp/sm120_d512_controlled_scaletrans_q16384_lineinfo.ncu-rep`.
+  - The b128 store remains the largest shared-wavefront source, but the store-coalesced remap failed correctness and the
+    stmatrix/k128B alternatives are already closed.
+- The previous explicit pack-helper slice regressed, so the problem is not just "make a helper." However, the current
+  nested source loop still expresses four token-byte extracts per output word.
+
+Implementation target:
+
+- Keep the current lane ownership, global-load order, controlled-smem row mapping, and b128 store.
+- Replace the inner token loop in the four-word pack with an in-place bit-pack expression:
+  - build one 32-bit `bytes` value from the four row bytes for the current `word_in_b128`;
+  - compress the low nibbles into bits `0..15`;
+  - compress the high nibbles into bits `16..31`.
+- Do not introduce a new helper function; keep this as source-local code shape to avoid repeating the prior helper
+  regression.
+
+Validation:
+
+- Run D512 correctness without tolerance changes.
+- Benchmark D512 paged-PV q512/kv65536 and q16384/kv262144.
+- Keep only if target-cell timing improves or stays neutral; otherwise revert the inline pack expression.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 115.53s`.
+- Timing regressed:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `7.804512 ms` versus consumer-contiguous scale checkpoint `7.798560 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `737.842896 ms` versus consumer-contiguous scale checkpoint
+    `732.299622 ms`.
+
+Decision:
+
+- Reverted the inline token-quad pack expression.
+- The original nested pack loop remains the best measured source shape. The SASS/codegen choice for this expression is
+  load-bearing; do not revisit pack-source reshaping without inspecting the generated instructions directly.
+
+## 2026-05-05 13:40 CDT - D512 Output-Group Rescale Scale-Cache Target
+
+Finding:
+
+- The grouped-rescale slice regressed because it moved all four output groups' accumulator multiplies before the first
+  `pv_consume_v_stage`, reducing pipeline overlap.
+- The original per-output-group placement is therefore load-bearing, but the four calls still repeat the same
+  `pv_tCcC(i)` coordinate decode and `old_scale_stage[tile & 1][row]` shared-memory lookup.
+- NCU after the consumer-contiguous scale tile still reports the rescale multiply as the hottest long-scoreboard source:
+  `fmha_nvfp4_sm120_d512.cuh:2250` has `2,242,343` `stall_long_sb (Not Issued)` samples.
+
+Implementation target:
+
+- For `kOutputGroupSpan == 4`, build a per-fragment `old_scale_cache[i]` once per nonfinal PV tile.
+- Keep each accumulator multiply at its original position immediately before that output group's `pv_consume_v_stage`.
+- Replace the repeated row decode/shared lookup in `rescale_pv_accum(...)` for the group path with cached scale values.
+- Leave the final-tile path unchanged.
+
+Validation:
+
+- Run D512 correctness without tolerance changes.
+- Benchmark D512 paged-PV q512/kv65536 and q16384/kv262144.
+- Keep only if large-Q improves without a q512 regression; otherwise revert the scale-cache slice.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 114.97s`.
+- Timing was mixed and did not meet the keep criterion:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `7.894176 ms`, worse than consumer-contiguous scale checkpoint
+    `7.798560 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `729.852173 ms`, slightly better than the earlier
+    consumer-contiguous scale run (`732.299622 ms`) but still behind same-condition checkpoint `724.268982 ms`.
+
+Decision:
+
+- Reverted the rescale scale-cache slice.
+- The local cache adds enough register/local pressure to hurt q512, and the large-Q gain is too small to justify carrying
+  it while the rewrite still misses the checkpoint architecture.
+
+## 2026-05-05 13:46 CDT - D512 Controlled PV Store-Coalesced Producer Retry Target
+
+Finding:
+
+- The first store-coalesced producer failed correctness, but re-reading the inverse mapping found a concrete arithmetic bug:
+  the retry reconstructed `local_token_base = token_quad_in_k_block * 4` and omitted the `k_block * 64` term.
+- That means controlled rows `64..127` staged token quads from the first half of the V tile. The observed finite
+  PV-vs-linear drift (`0.0097`) is consistent with wrong-but-in-bounds V data, not with a fundamental store-coalescing
+  incompatibility.
+- The NCU target remains valid after the consumer-contiguous scale change:
+  `fmha_nvfp4_sm120_d512.cuh:1094` still reports `1,610,612,736` shared excessive wavefronts in the q16k profile.
+
+Implementation target:
+
+- Retry the warp-level store-coalesced controlled PV producer.
+- Correct inverse mapping:
+  `local_token_base = k_block * 64 + token_quad_in_k_block * 4`.
+- Keep the consumer-contiguous scale tile, half-ldmatrix consumer, and direct MMA helper unchanged.
+
+Validation:
+
+- Run D512 correctness without tolerance changes.
+- Benchmark D512 paged-PV q512/kv65536 and q16384/kv262144.
+- Keep only if correctness passes and target timing improves; otherwise revert this corrected store-coalesced retry.
+
+Result:
+
+- Correctness passed after restoring the missing `k_block * 64` term:
+  `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 115.84s`.
+- Timing regressed:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `7.824512 ms` versus consumer-contiguous scale checkpoint `7.798560 ms`.
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `736.501282 ms` versus consumer-contiguous scale checkpoint
+    `732.299622 ms`.
+
+Decision:
+
+- Reverted the corrected store-coalesced producer.
+- The mapping is now correct, but the more contiguous shared stores are outweighed by worse global-load/order or scheduling
+  effects. The `L1 Wavefronts Shared Excessive` counter at the b128 store is real but not a standalone wall-time win for
+  this lane mapping.
+
+## 2026-05-05 13:54 CDT - D512 Controlled PV Large-Q Cache Target
+
+Checkpoint:
+
+- Current active D512 rewrite state is correctness-clean but not yet a winning architecture at the large-Q target.
+- Active kept slice: controlled PV smem with `smem_t<SwizzleMode::k64B>`, half-`ldmatrix` fragment construction, direct
+  SM120 blockscaled MMA issue, and consumer-contiguous scale tile.
+- Same-condition checkpoint architecture at `D512 g8 q16384 kv262144 softcap30 paged-PV`: `724.268982 ms`.
+- Active controlled rewrite after the consumer-contiguous scale tile: `732.299622 ms` best recorded, with later same-state
+  runs around `737 ms`. It is close, but still loses the beat-current done bar.
+
+Reference audit:
+
+- FA2 paged producer uses controlled smem and 64-bit async row loads, not CUTLASS operand smem:
+  `include/flashinfer/attention/prefill.cuh:417-443`
+  ```
+  smem_t<KTraits::SWIZZLE_MODE_KV> smem(produce_v ? smem_storage->v_smem : smem_storage->k_smem);
+  ...
+  smem.load_64b_async<fill_mode>(*smem_offset, gptr, kv_idx < kv_len);
+  ```
+- FA2 controlled V fragment construction reads arbitrary V coordinates from its smem layout and creates the native FP4
+  MMA B registers explicitly:
+  `include/flashinfer/attention/prefill.cuh:1594-1614`
+  ```
+  const uint32_t n = lane_idx >> 2;
+  const uint32_t k = 16 * (lane_idx & 0x3u) + 8 * reg + i;
+  const uint32_t col = mma_d * 16 + atom_n_offset + n;
+  ...
+  b_frag[reg] = mma::float8_to_e2m1x8(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5],
+                                      vals[6], vals[7]);
+  ```
+- `fmha_v2` paged NVFP4 walks the block table at row granularity and stages row-major data into its owned smem layout:
+  `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1423-1453`
+  ```
+  bool const valid_row =
+      get_nvfp4_row_ptrs(token_row, kv_row_ptr, scale_head_ptr, row_in_page);
+  ...
+  ptrs[ii] = full_vector ? kv_row_ptr + col_in_bytes_ : nullptr;
+  ...
+  smem_tile.store(ptrs, preds_);
+  ```
+- `fmha_v2` PV-layout V keeps the row-major data load separate from scale staging and delegates smem coverage/layout to
+  the controlled smem tile:
+  `csrc/fmha_v2/fmha/gmem_tile_qkv_packed.h:1789-1818`
+  ```
+  load_v_pv_layout_scale_vec16(token_group_start, col, scale_vec);
+  store_v_scale_vec16_bytes<0>(smem_tile, logical_col, scale_group, scale_vec);
+  ...
+  load_nvfp4_row_major_data(smem_tile);
+  ```
+
+Finding:
+
+- The active D512 rewrite has already replaced the CUTLASS PV operand consumer with a controlled-smem/`ldmatrix`/direct-MMA
+  path for paged-PV.
+- The remaining large-Q miss is not a new fragment issue. NCU still charges meaningful samples to the V token-quad
+  materialization loop, and large-Q repeats that materialization for every Q tile even though V is invariant across Q
+  tiles for a wrapper call.
+- Previous row-major logical-token cache work proved the direction can help large-Q, but it cached the wrong shape for the
+  controlled consumer: the stage kernel still had to repack row-major bytes into controlled b128 rows.
+
+Implementation target:
+
+- Add a D512-only internal controlled-PV layout cache for large-Q paged-PV.
+- The prepass writes exactly the controlled b128 layout consumed by `sm120_nvfp4_d512_controlled_v_b_regs_ldmatrix`.
+- The stage producer keeps the direct paged path for small-Q and switches to copying controlled b128 records from the
+  workspace cache when the cache pointer is present.
+- This does not change public tensor shapes, layout names, FFI signatures, or test contracts. The existing internal
+  workspace and `Sm120Nvfp4PagedKvLoadParams` cache fields are reused only for `kPvLayoutV`.
+
+Done criteria:
+
+- Correctness: `tests/attention/test_nvfp4_kv_head_dim_512.py` passes without tolerance changes.
+- Primary target: `D512 g8 q16384 kv262144 softcap30 paged-PV` beats the same-condition checkpoint `724.268982 ms`.
+- Guardrail: `D512 g8 q512 kv65536 softcap30 paged-PV` does not regress by routing through the cache; use a large-Q
+  threshold so small-Q stays on the direct producer path.
+- If the cache beats the checkpoint, keep and continue NCU-driven optimization. If it fails correctness or misses timing,
+  revert the cache slice and record the obstruction.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 118.80s`.
+- Small-Q guardrail stayed on the direct producer path and improved within noise:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `7.666656 ms`.
+  - Previous active controlled direct path was `7.798560 ms`.
+- Large-Q target now beats the same-condition checkpoint:
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `714.227051 ms`.
+  - Same-condition checkpoint architecture was `724.268982 ms`.
+- The kept slice is D512 paged-PV only. Dense still uses the existing CUTLASS TMA producer path, and paged-linear still
+  uses the existing linear reblock/cache path. This is intentionally scoped so the first committed rewrite milestone has a
+  correctness-clean and performance-positive PV target before touching dense TMA or linear-V.
+
+Decision:
+
+- Keep the D512 controlled-PV large-Q cache slice active.
+- Continue profiling the kept rewrite rather than committing immediately. The rewrite now beats current D512 on the primary
+  PV target, but the full plan still requires profiling and deciding whether the next D512-controlled work should target
+  cache overhead, dense TMA integration, or paged-linear.
+
+## 2026-05-05 14:05 CDT - D512 Controlled PV Cache Copy cp.async Target
+
+Finding:
+
+- NCU SourceCounters + warp sampling on the kept large-Q cache rewrite:
+  `/tmp/sm120_d512_controlled_cache_q16384.ncu-rep`.
+- Stage-kernel duration under NCU replay was `771.33 ms`; standalone bench was `714.227051 ms`, so use source ranking, not
+  profiler wall time, for decisions.
+- The cache removed the old per-token V materialization loop from the top producer sites. The new producer bottleneck is
+  the synchronous cache copy:
+  - `fmha_nvfp4_sm120_d512.cuh:1031` reports `1,153,709` `stall_long_sb (Not Issued)` samples.
+  - `fmha_nvfp4_sm120_d512.cuh:1024` and `1519` are the top barrier/not-issued attribution sites because all load threads
+    rendezvous around `stage_paged_v_tile(...)` after those synchronous global loads.
+- This is a controlled-smem layout win but not yet the controlled-smem producer win: the cache gives aligned b128 records,
+  but the stage still uses regular LDG+STS assignment instead of async global-to-smem copy.
+
+Implementation target:
+
+- Replace the D512 controlled-PV cache copy in the stage producer with 128-bit `cp.async`.
+- Data cache: issue one 128-bit async copy per controlled b128 record.
+- Scale cache: issue 128-bit async copies for the consumer-contiguous scale tile as four scale words at a time.
+- Commit and wait the cp.async group inside the cache branch before returning to the existing producer barrier/fence.
+- Keep the cache threshold and direct small-Q path unchanged.
+
+Validation:
+
+- Run D512 correctness without tolerance changes.
+- Benchmark `D512 g8 q512 kv65536 softcap30 paged-PV` to verify the direct small-Q guardrail is unchanged.
+- Benchmark `D512 g8 q16384 kv262144 softcap30 paged-PV`; keep only if it beats the synchronous cache-copy result
+  `714.227051 ms` or is neutral without correctness risk.
+
+Result:
+
+- Correctness passed: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 117.15s`.
+- Small-Q guardrail stayed effectively neutral:
+  - `D512 g8 q512 kv65536 softcap30 paged-PV`: `7.693056 ms`.
+- Large-Q regressed:
+  - `D512 g8 q16384 kv262144 softcap30 paged-PV`: `717.526245 ms`.
+  - Synchronous cache-copy result was `714.227051 ms`.
+
+Decision:
+
+- Reverted the cp.async cache-copy slice.
+- The async copy removed the synchronous LDG/STS source shape but did not improve wall time. The existing load-warp barrier
+  likely hides part of the synchronous copy cost already, while the cp.async group commit/wait adds overhead at this tile
+  size.
+- Continue from the synchronous controlled-PV cache checkpoint.
+
+## 2026-05-05 14:13 CDT - D512 Large-Q Target Status After Controlled PV Cache
+
+Finding:
+
+- The D512 large-Q production target no longer shows the earlier catastrophic paged-vs-dense gap.
+- Measurements at `D512 g8 q16384 kv262144 softcap30`:
+  - Dense: `626.543823 ms`.
+  - Paged-PV controlled cache: `714.227051 ms`.
+  - Paged-linear current path: `704.595886 ms`.
+- Ratios:
+  - Paged-PV / dense: `1.14x`.
+  - Paged-linear / dense: `1.12x`.
+- Paged-linear is now slightly faster than paged-PV at this cell. That means the current D512 production-linear target is
+  not blocked on the PV controlled consumer work; the remaining difference to dense is mostly paged scheduling/split/output
+  overhead plus normal producer overhead, not the old repeated scalar V materialization cliff.
+
+Decision:
+
+- Treat the D512 controlled-PV cache as the first winning rewrite milestone: it beats the same-condition checkpoint
+  (`714.227051 ms` vs `724.268982 ms`) and keeps q512 safe.
+- Do not route D512 linear through the controlled-PV cache in this slice. Linear is already ahead of PV at the large-Q
+  target, so changing it now would be speculative rather than NCU-driven.
+- Before committing, run the full NVFP4 correctness suite and collect a final target-cell delta table for D512 dense,
+  paged-PV, and paged-linear.
+
+## 2026-05-05 14:16 CDT - D512 Controlled PV Rewrite Milestone
+
+What changed:
+
+- Added a D512 controlled PV smem path for paged-PV:
+  - controlled `smem_t<SwizzleMode::k64B>` V operand storage;
+  - half-`ldmatrix` B-fragment construction;
+  - direct `SM120_16x8x64_TN_VS` blockscaled MMA issue;
+  - consumer-contiguous controlled scale tile.
+- Added a large-Q D512 controlled-PV cache:
+  - prepass writes the exact controlled b128 data layout consumed by the stage kernel;
+  - prepass writes the exact consumer-contiguous scale layout consumed by the direct MMA helper;
+  - stage kernel copies controlled records from workspace for large-Q paged-PV instead of rematerializing them per Q tile;
+  - q512 and other small-Q cells stay on the direct producer path via the Q-tile threshold.
+
+Final D512 target measurements:
+
+| Cell | Before/current checkpoint | Final | Delta |
+| --- | ---: | ---: | ---: |
+| `paged-PV q512 kv65536 g8 softcap30` | `7.798560 ms` active controlled direct checkpoint | `7.666656 ms` best cache-threshold run / `7.693056 ms` guardrail rerun | neutral to slightly faster |
+| `paged-PV q16384 kv262144 g8 softcap30` | `724.268982 ms` same-condition checkpoint | `720.440613 ms` final rerun; `714.227051 ms` best kept-cache run | `0.5%` to `1.4%` faster |
+| `paged-linear q16384 kv262144 g8 softcap30` | unchanged by this slice | `704.595886 ms` | production-linear remains faster than PV |
+| `dense q16384 kv262144 g8 softcap30` | unchanged by this slice | `626.543823 ms` | paged-linear is `1.12x` dense, paged-PV is `1.14x` dense |
+
+Validation:
+
+- Final focused correctness pass: `tests/attention/test_nvfp4_kv_head_dim_512.py` reported `36 passed in 116.43s`.
+- No tolerance changes.
+- Failed experiments were reverted and recorded separately:
+  - store-coalesced producer retry;
+  - grouped output rescale;
+  - inline token-quad pack;
+  - output-group rescale scale-cache;
+  - cp.async cache copy.
+
+Decision:
+
+- Commit this as the first D512 controlled-smem rewrite milestone.
+- This does not complete a full dense TMA rewrite. Dense remains on the existing CUTLASS TMA path because the D512
+  large-Q paged targets are now close to dense and the PV milestone already beats the current checkpoint. Rewriting dense
+  TMA next should be a separate NCU-gated milestone, not folded into this positive PV commit.
+- Remaining D512 floor:
+  - dense-vs-paged gap at large-Q is now roughly `12-14%`;
+  - NCU after the cache points at synchronization/softmax/PV-rescale and MMA issue sites, not the original scalar V
+    producer cliff;
+  - further wins likely require schedule/pipeline work rather than more V materialization patches.
