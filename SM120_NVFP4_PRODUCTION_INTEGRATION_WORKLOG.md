@@ -7309,3 +7309,52 @@ Finding:
 
 - D128 linear's uncoalesced cache-load source is real, but simply changing the cache layout increases total runtime. The separate cache-preparation kernels and changed producer access pattern cost more than the reduced sector count saves on the target rows.
 - Future linear-V work should profile both the cache-preparation kernels and the stage kernel, not only the stage kernel source line. The current NCU pass only captured the stage kernel and missed the end-to-end cost shift from cache layout changes.
+
+## 2026-05-04 20:31 CDT - D128 PV-Scale Loop Reorder Target
+
+Profiler finding:
+
+- The D128 paged-PV stage still has the largest excessive global sector source at `paged_kv.cuh:904`, the PV V-scale byte load.
+- The failed word-load experiment is closed because it assumed scale-byte contiguity/alignment too aggressively and broke D256 scratch-poison correctness.
+
+Hypothesis:
+
+- Reorder only the D128 PV-scale staging loop from `col` outer / `token_group` inner to `token_group` outer / `col` inner.
+- This preserves the existing scalar helper and therefore preserves arbitrary `v_scale_stride_dim3`; it does not rely on vectorized or aligned scale loads.
+- Adjacent load threads should now target adjacent columns for the same physical page/token group, which is the coalescing direction NCU says is missing.
+
+Implementation target:
+
+- Change only the D128 `kPvLayoutV` scale loop at `fmha_nvfp4_sm120_d128.cuh:1168-1187`.
+- Leave D256/D512 untouched because the D256 token-major scale reorder was previously measured and reverted as a regression.
+
+Validation:
+
+- Focused NVFP4 test file must pass.
+- Benchmark all three target rows. D256/D512 should be unchanged; D128 paged-PV should improve without D128 paged-linear regression.
+- Revert if D128 target timing regresses or correctness fails.
+
+## 2026-05-04 20:42 CDT - D128 PV-Scale Loop Reorder Reverted
+
+Implementation attempted:
+
+- Changed only D128 PV-layout V-scale staging from `col` outer / `token_group` inner to `token_group` outer / `col` inner.
+- Preserved scalar scale loads and arbitrary stride handling.
+
+Correctness:
+
+- Focused test command: `python -m pytest tests/attention/test_nvfp4_kv_head_dim_512.py -q`.
+- Result: `36 passed in 284.95s`.
+
+Measured result:
+
+| cell | baseline paged-PV ms | reorder paged-PV ms | baseline paged-linear ms | reorder paged-linear ms | decision |
+|:---|---:|---:|---:|---:|:---|
+| D128/g12 Mistral `q=16384 kv=262144` | `292.599` | `298.667` | `334.818` | `338.024` | regressed |
+| D256/g6 Qwen `q=16384 kv=262144` | `199.546` | `201.006` | `202.745` | `203.872` | unchanged/regressed by noise |
+| D512/g8 Gemma `q=16384 kv=262144` | `791.689` | `793.357` | `845.025` | `837.360` | D512 variation only |
+
+Decision:
+
+- Reverted the D128 loop reorder. It directly regressed the target row it was meant to help.
+- The NCU excessive-sector source remains real, but simple loop remapping is not sufficient; it likely worsens scheduling/instruction balance more than it improves sector locality.
